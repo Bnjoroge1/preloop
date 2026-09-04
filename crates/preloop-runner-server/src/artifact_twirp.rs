@@ -132,6 +132,7 @@ fn artifact_v2_job_from_headers(
         .map(Some)
         .ok_or_else(|| ApiError::unauthorized("artifact access requires a valid job token"))
 }
+
 pub(crate) async fn save_artifact_v2_registry(
     shared: &Arc<SharedState>,
 ) -> Result<(), std::io::Error> {

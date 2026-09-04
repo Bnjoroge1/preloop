@@ -192,6 +192,22 @@ pub(crate) async fn require_runner_admin_bearer(
     if manager_token {
         return Ok(next.run(request).await);
     }
+    let manager_token = bearer_token(&request)
+        .and_then(|token| shared.state.verify_local_jwt_claims(token))
+        .and_then(|claims| {
+            claims
+                .get("scp")
+                .and_then(|v| v.as_str())
+                .map(str::to_owned)
+        })
+        .is_some_and(|scope| {
+            scope
+                .split_whitespace()
+                .any(|value| value == "ActionsRuntime.RunnerManage")
+        });
+    if manager_token {
+        return Ok(next.run(request).await);
+    }
     // `resolve_runner_identity` is an outer layer, so the extension is
     // already present here. Reuse it instead of re-deriving the runner from
     // the token: it also resolves mock-flow subjects
