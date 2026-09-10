@@ -440,10 +440,14 @@ pub(crate) async fn purge_runner_identity_guarded(
         purge_runner_identity_locked(&mut inner, &shared.state, agent_id);
         crate::store::StoreSnapshot::from_inner(&inner)
     };
-    shared.state.message_notify.notify_waiters();
+    // Persist before waking pollers: a restart between notify and persist
+    // would let the old snapshot restore the deleted runner. Notify is still
+    // unconditional so waiters observe the in-memory deletion even when the
+    // store write fails.
     if let Err(error) = shared.state.store.store_inner(&snapshot).await {
         tracing::warn!(?error, "failed to persist deleted runner identity");
     }
+    shared.state.message_notify.notify_waiters();
     Ok(())
 }
 
