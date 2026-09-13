@@ -14,135 +14,134 @@ pub(crate) struct StepLogsSignedBlobUrlRequest {
     pub(crate) workflow_run_backend_id: String,
 }
 
+/// Reconcile a runner's step report into that attempt's manifest.
+///
+/// This never decides a job's step *structure* — the manifest seeded from the
+/// job request message owns that. A report whose `external_id` is in the
+/// manifest updates that entry in place; anything else is runner bookkeeping
+/// ("Set up job", `Pre`/`Post` hooks, container lifecycle, "Complete job") and
+/// is appended as a synthetic record, so it owns its logs without shifting the
+/// numbering `--step` reads off the workflow.
 pub(crate) async fn twirp_workflow_steps_update(
     State(shared): State<Arc<SharedState>>,
+    axum::extract::Extension(identity): axum::extract::Extension<crate::auth::ResultsIdentity>,
     Json(payload): Json<serde_json::Value>,
 ) -> Result<Json<serde_json::Value>, ApiError> {
-    let mut inner = shared.state.inner.lock().await;
-
     let plan_id = payload["workflow_run_backend_id"].as_str().unwrap_or("");
     let agent_job_id_str = payload["workflow_job_run_backend_id"]
         .as_str()
         .unwrap_or("");
+    crate::auth::require_results_job(&identity, plan_id, agent_job_id_str)?;
+    let mut inner = shared.state.inner.lock().await;
 
-    if let (Some(plan_uuid), Some(job_uuid)) = (
+    let (Some(plan_uuid), Some(job_uuid)) = (
         uuid::Uuid::parse_str(plan_id).ok(),
         uuid::Uuid::parse_str(agent_job_id_str).ok(),
-    ) {
-        if let Some((_, run_id, job_id)) =
-            resolve_callback_job(&inner, &plan_uuid.to_string(), None, Some(job_uuid))
-        {
-            // Find the step names by external_id and clone them to release the borrow on inner
-            let request_id = inner.agent_job_requests.get(&job_uuid).copied();
-            let step_names: std::collections::HashMap<uuid::Uuid, String> = request_id
-                .and_then(|id| inner.broker_messages.get(&id))
-                .map(|msg| {
-                    msg.steps
-                        .iter()
-                        .map(|s| {
-                            (
-                                s.id,
-                                s.display_name
-                                    .clone()
-                                    .or_else(|| s.name.clone())
-                                    .unwrap_or_default(),
-                            )
-                        })
-                        .collect()
-                })
-                .unwrap_or_default();
+    ) else {
+        return Ok(Json(json!({"ok": true})));
+    };
+    let Some((_, run_id, job_id)) =
+        resolve_callback_job(&inner, &plan_uuid.to_string(), None, Some(job_uuid))
+    else {
+        return Ok(Json(json!({"ok": true})));
+    };
+    let Some(steps) = payload["steps"].as_array().cloned() else {
+        return Ok(Json(json!({"ok": true})));
+    };
 
-            if let Some(run) = inner.runs.get_mut(&run_id) {
-                let job_name = job_id.0.clone();
-                let job_detail =
-                    if let Some(pos) = run.jobs_list.iter().position(|j| j.name == job_name) {
-                        &mut run.jobs_list[pos]
-                    } else {
-                        run.jobs_list.push(JobDetail {
-                            name: job_name,
-                            // A step update means the job started; the run
-                            // record's final conclusion comes from the job
-                            // status map (projected in the runs GET). Default
-                            // to the truthful in-flight state, never "success".
-                            conclusion: "in_progress".to_owned(),
-                            steps: Vec::new(),
-                            annotations: Vec::new(),
-                        });
-                        run.jobs_list.last_mut().unwrap()
-                    };
+    let job_status = inner
+        .runs
+        .get(&run_id)
+        .and_then(|run| run.jobs.get(&job_id).copied());
+    let observed = chrono::Utc::now();
+    let records = inner.job_steps.entry(job_uuid).or_default();
 
-                if let Some(status) = run.jobs.get(&job_id) {
-                    job_detail.conclusion = format!("{:?}", status).to_lowercase();
+    for step in &steps {
+        let external_id = step["external_id"].as_str().unwrap_or("");
+        if external_id.is_empty() {
+            // With no identity there is nothing to reconcile against, and
+            // guessing by display name is exactly what merged two distinct
+            // same-named steps and lost one from the run.
+            tracing::warn!(
+                %run_id, job = %job_id.0,
+                "dropping step report with no external_id"
+            );
+            continue;
+        }
+
+        let conclusion_num = step["conclusion"].as_u64().unwrap_or(0);
+        let status_num = step["status"].as_u64().unwrap_or(0);
+        let terminal = status_num == 6;
+        let conclusion = if terminal {
+            match conclusion_num {
+                2 => "success",
+                3 if job_status == Some(ExecutionStatus::Cancelled) => "cancelled",
+                3 => "failure",
+                7 => "skipped",
+                _ => "success",
+            }
+        } else {
+            "in_progress"
+        };
+        // The runner reports the rendered display name ("Run actions/checkout@v4"),
+        // the same string GitHub's UI shows, so it wins over the message's name:
+        // the server leaves that empty for steps without an explicit `name:`.
+        let reported_name = step["name"].as_str().filter(|name| !name.is_empty());
+        let runner_number = step["number"].as_u64().and_then(|n| u32::try_from(n).ok());
+
+        match StepRecord::find_by_id(records, external_id) {
+            Some(pos) => {
+                let record = &mut records[pos];
+                record.conclusion = conclusion.to_owned();
+                record.runner_number = runner_number.or(record.runner_number);
+                if let Some(name) = reported_name {
+                    record.name = name.to_owned();
                 }
-                if let Some(steps) = payload["steps"].as_array() {
-                    for step in steps {
-                        let external_id_str = step["external_id"].as_str().unwrap_or("");
-                        let step_uuid = uuid::Uuid::parse_str(external_id_str).ok();
-
-                        // The runner reports the rendered display name in the
-                        // update payload ("Run actions/checkout@v4", "Set up
-                        // job") — the same string GitHub's UI shows. Prefer it
-                        // over the broker-message name, which the server
-                        // leaves empty for steps without an explicit `name:`
-                        // (an empty lookup result previously won and steps
-                        // showed as `''` in run records).
-                        let name = step["name"]
-                            .as_str()
-                            .filter(|name| !name.is_empty())
-                            .map(str::to_owned)
-                            .or_else(|| step_uuid.and_then(|suuid| step_names.get(&suuid).cloned()))
-                            .unwrap_or_default();
-
-                        let conclusion_num = step["conclusion"].as_u64().unwrap_or(0);
-                        let status_num = step["status"].as_u64().unwrap_or(0);
-
-                        let job_status = run.jobs.get(&job_id).copied();
-                        let conclusion_str = if status_num == 6 {
-                            match conclusion_num {
-                                2 => "success",
-                                3 => {
-                                    if job_status == Some(ExecutionStatus::Cancelled) {
-                                        "cancelled"
-                                    } else {
-                                        "failure"
-                                    }
-                                }
-                                7 => "skipped",
-                                _ => "success",
-                            }
-                        } else {
-                            "in_progress"
-                        };
-                        let terminal = status_num == 6;
-                        let observed = chrono::Utc::now();
-
-                        if let Some(pos) = job_detail.steps.iter().position(|s| s.name == name) {
-                            job_detail.steps[pos].conclusion = conclusion_str.to_owned();
-                            // First non-terminal sighting is the start signal.
-                            if !terminal && job_detail.steps[pos].started_at.is_none() {
-                                job_detail.steps[pos].started_at = Some(observed);
-                            }
-                            if terminal && job_detail.steps[pos].finished_at.is_none() {
-                                job_detail.steps[pos].finished_at = Some(observed);
-                            }
-                        } else {
-                            // First time we hear about this step:
-                            // - in_progress → record started_at only
-                            // - already terminal → record finished_at only
-                            //   (do not invent started_at == finished_at, which
-                            //   forces duration 0 for fast steps that complete
-                            //   before any in-progress update is processed)
-                            job_detail.steps.push(StepRecord {
-                                name,
-                                conclusion: conclusion_str.to_owned(),
-                                started_at: (!terminal).then_some(observed),
-                                finished_at: terminal.then_some(observed),
-                            });
-                        }
-                    }
+                // First non-terminal sighting is the start signal.
+                if !terminal && record.started_at.is_none() {
+                    record.started_at = Some(observed);
+                }
+                if terminal && record.finished_at.is_none() {
+                    record.finished_at = Some(observed);
                 }
             }
+            None => records.push(StepRecord {
+                id: external_id.to_owned(),
+                kind: StepKind::Synthetic,
+                workflow_index: None,
+                runner_number,
+                context_name: None,
+                name: reported_name.unwrap_or_default().to_owned(),
+                conclusion: conclusion.to_owned(),
+                // Do not invent `started_at == finished_at`, which forces
+                // duration 0 for a step that completed before any in-progress
+                // update was processed.
+                started_at: (!terminal).then_some(observed),
+                finished_at: terminal.then_some(observed),
+            }),
         }
+    }
+
+    // Persist the attempt that changed, after releasing the lock: without this
+    // a restart before job completion loses every step conclusion the runner
+    // reported. Best-effort, like the rest of the store — in-memory state is
+    // authoritative and a failed write must not fail the runner's callback.
+    let records = records.clone();
+    // Bumped under the same lock that mutated the manifest, so the write
+    // carries a revision strictly newer than any snapshot taken before it.
+    let revision = {
+        let counter = inner.job_steps_revision.entry(job_uuid).or_insert(0);
+        *counter += 1;
+        *counter
+    };
+    drop(inner);
+    if let Err(error) = shared
+        .state
+        .store
+        .store_job_steps(run_id, job_uuid, &records, revision)
+        .await
+    {
+        tracing::warn!(?error, %run_id, "failed to persist step records");
     }
 
     Ok(Json(json!({"ok": true})))
@@ -150,73 +149,69 @@ pub(crate) async fn twirp_workflow_steps_update(
 
 pub(crate) async fn twirp_get_job_logs_signed_blob_url(
     State(shared): State<Arc<SharedState>>,
-    headers: axum::http::HeaderMap,
+    axum::extract::Extension(identity): axum::extract::Extension<crate::auth::ResultsIdentity>,
     Json(request): Json<JobLogsSignedBlobUrlRequest>,
 ) -> Result<Json<serde_json::Value>, ApiError> {
     // The signed URL is the upload credential for `/replay/results/*` — a
     // bearerless route reachable from inside every runner VM. Only mint for
     // the plan/job the caller's token actually names, or workflow code could
     // ask for another job's URL and overwrite its logs.
-    if !crate::auth::results_token_binds_job(
-        &shared.state,
-        crate::auth::bearer_from_headers(&headers),
+    let job_id = crate::auth::require_canonical_results_job_id(
+        &identity,
         &request.workflow_run_backend_id,
         &request.workflow_job_run_backend_id,
-    ) {
-        return Err(ApiError::forbidden(
-            "replay blob URL minting requires a token for that job",
-        ));
-    }
+    )?;
     let path = format!(
         "/replay/results/{}/{}/job-logs.txt",
-        request.workflow_run_backend_id, request.workflow_job_run_backend_id
+        request.workflow_run_backend_id, job_id
     );
-    let sig = crate::auth::sign_replay_upload_ticket(&shared.state, &path);
+    let expires_at = crate::auth::replay_ticket_expiry();
+    let sig = crate::auth::sign_replay_upload_ticket(&shared.state, &path, expires_at);
     Ok(Json(json!({
         "blob_storage_type": "BLOB_STORAGE_TYPE_AZURE",
         "logs_url": format!(
-            "{}{}?sv=2021-08-06&se=2028-01-01T00%3A00%3A00Z&sr=c&sp=rw&sig={sig}",
+            "{}{}?sv=2021-08-06&se={expires_at}&sr=c&sp=rw&sig={sig}",
             runner_base_url(), path
         )
     })))
 }
 
 pub(crate) async fn twirp_get_job_diag_logs_signed_blob_url(
-    Json(_request): Json<JobLogsSignedBlobUrlRequest>,
-) -> Json<serde_json::Value> {
+    axum::extract::Extension(identity): axum::extract::Extension<crate::auth::ResultsIdentity>,
+    Json(request): Json<JobLogsSignedBlobUrlRequest>,
+) -> Result<Json<serde_json::Value>, ApiError> {
+    crate::auth::require_results_job(
+        &identity,
+        &request.workflow_run_backend_id,
+        &request.workflow_job_run_backend_id,
+    )?;
     let token = uuid::Uuid::new_v4();
-    Json(json!({
+    Ok(Json(json!({
         "blob_storage_type": "BLOB_STORAGE_TYPE_AZURE",
         "diag_logs_url": format!("{}/twirp-blob/diag/{token}?sv=2021-08-06&se=2028-01-01T00%3A00%3A00Z&sr=c&sp=rw&sig=dummy", runner_base_url()),
-    }))
+    })))
 }
 
 pub(crate) async fn twirp_get_step_logs_signed_blob_url(
     State(shared): State<Arc<SharedState>>,
-    headers: axum::http::HeaderMap,
+    axum::extract::Extension(identity): axum::extract::Extension<crate::auth::ResultsIdentity>,
     Json(request): Json<StepLogsSignedBlobUrlRequest>,
 ) -> Result<Json<serde_json::Value>, ApiError> {
-    if !crate::auth::results_token_binds_job(
-        &shared.state,
-        crate::auth::bearer_from_headers(&headers),
+    let job_id = crate::auth::require_canonical_results_job_id(
+        &identity,
         &request.workflow_run_backend_id,
         &request.workflow_job_run_backend_id,
-    ) {
-        return Err(ApiError::forbidden(
-            "replay blob URL minting requires a token for that job",
-        ));
-    }
+    )?;
     let path = format!(
         "/replay/results/{}/{}/step-{}.txt",
-        request.workflow_run_backend_id,
-        request.workflow_job_run_backend_id,
-        request.step_backend_id
+        request.workflow_run_backend_id, job_id, request.step_backend_id
     );
-    let sig = crate::auth::sign_replay_upload_ticket(&shared.state, &path);
+    let expires_at = crate::auth::replay_ticket_expiry();
+    let sig = crate::auth::sign_replay_upload_ticket(&shared.state, &path, expires_at);
     Ok(Json(json!({
         "blob_storage_type": "BLOB_STORAGE_TYPE_AZURE",
         "logs_url": format!(
-            "{}{}?sv=2021-08-06&se=2028-01-01T00%3A00%3A00Z&sr=c&sp=rw&sig={sig}",
+            "{}{}?sv=2021-08-06&se={expires_at}&sr=c&sp=rw&sig={sig}",
             runner_base_url(), path
         ),
         "soft_size_limit": "1048576"
@@ -232,45 +227,57 @@ pub(crate) struct StepSummarySignedBlobUrlRequest {
 
 pub(crate) async fn twirp_get_step_summary_signed_blob_url(
     State(shared): State<Arc<SharedState>>,
-    headers: axum::http::HeaderMap,
+    axum::extract::Extension(identity): axum::extract::Extension<crate::auth::ResultsIdentity>,
     Json(request): Json<StepSummarySignedBlobUrlRequest>,
 ) -> Result<Json<serde_json::Value>, ApiError> {
-    if !crate::auth::results_token_binds_job(
-        &shared.state,
-        crate::auth::bearer_from_headers(&headers),
+    let job_id = crate::auth::require_canonical_results_job_id(
+        &identity,
         &request.workflow_run_backend_id,
         &request.workflow_job_run_backend_id,
-    ) {
-        return Err(ApiError::forbidden(
-            "replay blob URL minting requires a token for that job",
-        ));
-    }
+    )?;
     let path = format!(
         "/replay/results/{}/{}/step-{}-summary.md",
-        request.workflow_run_backend_id,
-        request.workflow_job_run_backend_id,
-        request.step_backend_id
+        request.workflow_run_backend_id, job_id, request.step_backend_id
     );
-    let sig = crate::auth::sign_replay_upload_ticket(&shared.state, &path);
+    let expires_at = crate::auth::replay_ticket_expiry();
+    let sig = crate::auth::sign_replay_upload_ticket(&shared.state, &path, expires_at);
     Ok(Json(json!({
         "blob_storage_type": "BLOB_STORAGE_TYPE_AZURE",
         "summary_url": format!(
-            "{}{}?sv=2021-08-06&se=2028-01-01T00%3A00%3A00Z&sr=c&sp=rw&sig={sig}",
+            "{}{}?sv=2021-08-06&se={expires_at}&sr=c&sp=rw&sig={sig}",
             runner_base_url(), path
         ),
         "soft_size_limit": "1048576"
     })))
 }
 
+/// Results metadata keys are scoped to the authenticated plan/job whenever
+/// those identifiers are present. Step ids are minted by the runner for
+/// setup/cleanup records before the first step report arrives, so ownership
+/// cannot be inferred from the manifest at metadata-ingest time.
+fn results_metadata_key(
+    kind: &str,
+    plan_id: Option<&str>,
+    job_id: Option<&str>,
+    resource_id: Option<&str>,
+) -> String {
+    if let (Some(plan_id), Some(job_id)) = (plan_id, job_id) {
+        return match resource_id {
+            Some(resource_id) => format!("results:{plan_id}:{job_id}:{kind}:{resource_id}"),
+            None => format!("results:{plan_id}:{job_id}:{kind}"),
+        };
+    }
+    match resource_id {
+        Some(resource_id) => format!("{kind}:{resource_id}"),
+        None => kind.to_owned(),
+    }
+}
+
 #[derive(Debug, Deserialize)]
 pub(crate) struct StepSummaryMetadataRequest {
-    // serde: metadata is accepted for protocol compatibility; this identifies the summary.
+    // The backend identifiers identify the target job for Results authorization.
     pub(crate) step_backend_id: String,
-    // serde: metadata is accepted for protocol compatibility; field is not inspected.
-    #[allow(dead_code)]
     pub(crate) workflow_job_run_backend_id: String,
-    // serde: metadata is accepted for protocol compatibility; field is not inspected.
-    #[allow(dead_code)]
     pub(crate) workflow_run_backend_id: String,
     // serde: metadata is accepted for protocol compatibility; this records the summary size.
     pub(crate) size: Option<u64>,
@@ -281,12 +288,23 @@ pub(crate) struct StepSummaryMetadataRequest {
 
 pub(crate) async fn twirp_create_step_summary_metadata(
     State(shared): State<Arc<SharedState>>,
+    axum::extract::Extension(identity): axum::extract::Extension<crate::auth::ResultsIdentity>,
     Json(request): Json<StepSummaryMetadataRequest>,
-) -> Json<serde_json::Value> {
+) -> Result<Json<serde_json::Value>, ApiError> {
+    let job_id = crate::auth::require_canonical_results_job_id(
+        &identity,
+        &request.workflow_run_backend_id,
+        &request.workflow_job_run_backend_id,
+    )?;
     let byte_count = request.size.unwrap_or_default().min(usize::MAX as u64) as usize;
     let mut inner = shared.state.inner.lock().await;
     inner.log_metadata.insert(
-        format!("summary:{}", request.step_backend_id),
+        results_metadata_key(
+            "summary",
+            Some(&request.workflow_run_backend_id),
+            Some(job_id.as_str()),
+            Some(&request.step_backend_id),
+        ),
         LogMetadata {
             byte_count,
             line_count: 0,
@@ -297,18 +315,14 @@ pub(crate) async fn twirp_create_step_summary_metadata(
         tracing::warn!(?error, "failed to persist step summary metadata");
     }
 
-    Json(json!({"ok": true}))
+    Ok(Json(json!({"ok": true})))
 }
 
 #[derive(Debug, Deserialize)]
 pub(crate) struct StepLogsMetadataRequest {
-    // serde: metadata is accepted for protocol compatibility; this identifies the step.
-    pub(crate) step_backend_id: Option<String>,
-    // serde: metadata is accepted for protocol compatibility; field is not inspected.
-    #[allow(dead_code)]
+    // The backend identifiers identify the target job for Results authorization.
+    pub(crate) step_backend_id: String,
     pub(crate) workflow_job_run_backend_id: Option<String>,
-    // serde: metadata is accepted for protocol compatibility; field is not inspected.
-    #[allow(dead_code)]
     pub(crate) workflow_run_backend_id: Option<String>,
     // serde: metadata is accepted for protocol compatibility; field is not inspected.
     #[allow(dead_code)]
@@ -320,35 +334,44 @@ pub(crate) struct StepLogsMetadataRequest {
 /// POST CreateStepLogsMetadata — runner calls this after uploading step logs.
 pub(crate) async fn twirp_create_step_logs_metadata(
     State(shared): State<Arc<SharedState>>,
+    axum::extract::Extension(identity): axum::extract::Extension<crate::auth::ResultsIdentity>,
     Json(request): Json<StepLogsMetadataRequest>,
-) -> Json<serde_json::Value> {
-    if let Some(step_backend_id) = request.step_backend_id {
-        let line_count = request.line_count.unwrap_or_default();
-        let line_count_usize = line_count.min(usize::MAX as u64) as usize;
-        let byte_count = line_count.saturating_mul(80).min(usize::MAX as u64) as usize;
-        let mut inner = shared.state.inner.lock().await;
-        inner.log_metadata.insert(
-            format!("step:{step_backend_id}"),
-            LogMetadata {
-                byte_count,
-                line_count: line_count_usize,
-            },
-        );
-        let meta = crate::store::build_meta_snapshot(&inner);
-        if let Err(error) = shared.state.store.store_meta_only(&meta).await {
-            tracing::warn!(?error, "failed to persist step log metadata");
-        }
+) -> Result<Json<serde_json::Value>, ApiError> {
+    let (Some(plan_id), Some(raw_job_id)) = (
+        request.workflow_run_backend_id.as_deref(),
+        request.workflow_job_run_backend_id.as_deref(),
+    ) else {
+        return Ok(Json(json!({"ok": true})));
+    };
+    let job_id = crate::auth::require_canonical_results_job_id(&identity, plan_id, raw_job_id)?;
+    let line_count = request.line_count.unwrap_or_default();
+    let line_count_usize = line_count.min(usize::MAX as u64) as usize;
+    let byte_count = line_count.saturating_mul(80).min(usize::MAX as u64) as usize;
+    let mut inner = shared.state.inner.lock().await;
+    inner.log_metadata.insert(
+        results_metadata_key(
+            "step",
+            Some(plan_id),
+            Some(job_id.as_str()),
+            Some(&request.step_backend_id),
+        ),
+        LogMetadata {
+            byte_count,
+            line_count: line_count_usize,
+        },
+    );
+    let meta = crate::store::build_meta_snapshot(&inner);
+    if let Err(error) = shared.state.store.store_meta_only(&meta).await {
+        tracing::warn!(?error, "failed to persist step log metadata");
     }
 
-    Json(json!({"ok": true}))
+    Ok(Json(json!({"ok": true})))
 }
 
 #[derive(Debug, Deserialize)]
 pub(crate) struct JobLogsMetadataRequest {
-    // serde: metadata is accepted for protocol compatibility; this identifies the job.
+    // Job-log metadata is job-scoped and intentionally has no step_backend_id.
     pub(crate) workflow_job_run_backend_id: Option<String>,
-    // serde: metadata is accepted for protocol compatibility; field is not inspected.
-    #[allow(dead_code)]
     pub(crate) workflow_run_backend_id: Option<String>,
     // serde: metadata is accepted for protocol compatibility; field is not inspected.
     #[allow(dead_code)]
@@ -357,30 +380,40 @@ pub(crate) struct JobLogsMetadataRequest {
     pub(crate) line_count: Option<u64>,
 }
 
-/// POST CreateJobLogsMetadata — runner calls this after uploading job logs.
 pub(crate) async fn twirp_create_job_logs_metadata(
     State(shared): State<Arc<SharedState>>,
+    axum::extract::Extension(identity): axum::extract::Extension<crate::auth::ResultsIdentity>,
     Json(request): Json<JobLogsMetadataRequest>,
-) -> Json<serde_json::Value> {
-    if let Some(workflow_job_run_backend_id) = request.workflow_job_run_backend_id {
-        let line_count = request.line_count.unwrap_or_default();
-        let line_count_usize = line_count.min(usize::MAX as u64) as usize;
-        let byte_count = line_count.saturating_mul(80).min(usize::MAX as u64) as usize;
-        let mut inner = shared.state.inner.lock().await;
-        inner.log_metadata.insert(
-            format!("job:{workflow_job_run_backend_id}"),
-            LogMetadata {
-                byte_count,
-                line_count: line_count_usize,
-            },
-        );
-        let meta = crate::store::build_meta_snapshot(&inner);
-        if let Err(error) = shared.state.store.store_meta_only(&meta).await {
-            tracing::warn!(?error, "failed to persist job log metadata");
-        }
+) -> Result<Json<serde_json::Value>, ApiError> {
+    let Some(raw_job_id) = request.workflow_job_run_backend_id else {
+        return Ok(Json(json!({"ok": true})));
+    };
+    let Some(plan_id) = request.workflow_run_backend_id.as_deref() else {
+        return Ok(Json(json!({"ok": true})));
+    };
+    let job_id = crate::auth::require_canonical_results_job_id(&identity, plan_id, &raw_job_id)?;
+    let line_count = request.line_count.unwrap_or_default();
+    let line_count_usize = line_count.min(usize::MAX as u64) as usize;
+    let byte_count = line_count.saturating_mul(80).min(usize::MAX as u64) as usize;
+    let mut inner = shared.state.inner.lock().await;
+    inner.log_metadata.insert(
+        results_metadata_key(
+            "job",
+            Some(plan_id),
+            Some(job_id.as_str()),
+            Some(job_id.as_str()),
+        ),
+        LogMetadata {
+            byte_count,
+            line_count: line_count_usize,
+        },
+    );
+    let meta = crate::store::build_meta_snapshot(&inner);
+    if let Err(error) = shared.state.store.store_meta_only(&meta).await {
+        tracing::warn!(?error, "failed to persist job log metadata");
     }
 
-    Json(json!({"ok": true}))
+    Ok(Json(json!({"ok": true})))
 }
 
 // ─── Cache v2 Twirp (github.actions.results.api.v1.CacheService) ─────────────
@@ -390,6 +423,18 @@ pub(crate) fn scoped_cache_key(key: &str, scope: Option<&str>, repository: Optio
         "{}:{}\0{key}",
         repository.unwrap_or("default"),
         scope.unwrap_or("default")
+    )
+}
+
+/// SHA-256 digest of a scoped cache key + version. The cache key is
+/// workflow-controlled content; log the digest (plus `version_len`) instead
+/// of the raw key/version so entries correlate across the create/finalize
+/// log records while leaking nothing.
+fn cache_id_digest(key: &str, version: &str) -> String {
+    use sha2::Digest;
+    format!(
+        "{:x}",
+        sha2::Sha256::digest(format!("{key}\u{0}{version}").as_bytes())
     )
 }
 
@@ -673,6 +718,7 @@ pub(crate) async fn twirp_cache_v2_create(
         .map_err(|e| ApiError::internal(format!("failed to create cache stage dir: {e}")))?;
     let already_reserved = {
         let mut inner = shared.state.inner.lock().await;
+        let job_backend_id = job_backend_id_from_bearer(&shared.state, &headers);
         if inner
             .cache_v2_pending
             .values()
@@ -680,11 +726,45 @@ pub(crate) async fn twirp_cache_v2_create(
         {
             true
         } else {
+            // F7: a runner is capped at MAX_PENDING_PER_JOB in-flight cache
+            // uploads. The job comes from the signed token scope, not the
+            // request body. A refusal is a plain `ok: false`, the same
+            // non-fatal shape actions/cache already handles for a miss.
+            if let Some(job_id) = &job_backend_id {
+                let pending = inner
+                    .cache_v2_pending
+                    .values()
+                    .filter(|pending| &pending.job_backend_id == job_id)
+                    .count();
+                if pending >= MAX_PENDING_PER_JOB {
+                    // Drop the stage dir we just created — the pending map never
+                    // learns this token, so the sweeper can't find it.
+                    let dir = stage_dir.clone();
+                    drop(inner);
+                    let _ = tokio::fs::remove_dir_all(&dir).await;
+                    return Ok(pb_or_json(
+                        &headers,
+                        PbCreateCacheEntryResponse {
+                            ok: false,
+                            signed_upload_url: String::new(),
+                        },
+                        json!({
+                            "ok": false,
+                            "signed_upload_url": "",
+                            "message": format!(
+                                "job has {pending} pending cache uploads (cap {MAX_PENDING_PER_JOB})"
+                            )
+                        }),
+                    ));
+                }
+            }
             inner.cache_v2_pending.insert(
                 token.clone(),
                 CacheV2Pending {
                     key: storage_key.clone(),
                     version: version.clone(),
+                    job_backend_id: job_backend_id.unwrap_or_default(),
+                    created_unix: now_unix(),
                 },
             );
             let meta = crate::store::build_meta_snapshot(&inner);
@@ -710,9 +790,13 @@ pub(crate) async fn twirp_cache_v2_create(
         ));
     }
     let upload_url = format!("{}/twirp-blob/cache/{token}", runner_base_url());
+    // The cache key is workflow-controlled content; never log it or the
+    // version verbatim. A SHA-256 digest identifies the entry well enough to
+    // correlate with the finalize/restore logs while leaking nothing.
+    let cache_id = cache_id_digest(&storage_key, &version);
     info!(
-        key = %storage_key,
-        version = %version,
+        cache_id = %cache_id,
+        version_len = version.len(),
         "cache v2 create entry"
     );
     Ok(pb_or_json(
@@ -820,9 +904,12 @@ pub(crate) async fn twirp_cache_v2_finalize(
     .await;
 
     let total_ms = t0.elapsed().as_millis();
+    // Match the create record: log the digest + length, never the raw
+    // workflow-controlled key/version.
+    let cache_id = cache_id_digest(&key, &version);
     tracing::info!(
-        key,
-        version,
+        cache_id = %cache_id,
+        version_len = version.len(),
         size = bytes.len(),
         read_ms,
         total_ms,
@@ -901,6 +988,14 @@ pub(crate) async fn twirp_cache_v2_get_dl_url(
         inner
             .cache_v2_dl_tokens
             .insert(dl_token.clone(), (entry.key.clone(), entry.version.clone()));
+        // F7: bound the minted-token map; the oldest tokens are evicted
+        // first. A token that a runner has not yet fetched still works, so a
+        // real workflow's few concurrent downloads are never affected.
+        inner.cache_v2_dl_tokens_order.push_back(dl_token.clone());
+        inner
+            .cache_v2_dl_tokens_created
+            .insert(dl_token.clone(), now_unix());
+        trim_cache_dl_tokens(&mut inner);
     }
     let download_url = format!("{}/twirp-blob/cache/{dl_token}", runner_base_url());
     let matched_key = entry

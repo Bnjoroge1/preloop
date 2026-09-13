@@ -459,6 +459,12 @@ pub struct JobPlan {
     /// Executing reusable workflow reference, when this job came from one.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub oidc_job_workflow_ref: Option<String>,
+    /// Raw deployment environment configuration (`environment:`), if any.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub environment: Option<serde_json::Value>,
+    /// TemplateToken-encoded defaults (workflow and job level).
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub defaults: Vec<serde_json::Value>,
     /// Raw job-level concurrency group expression/string (server-evaluated).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub concurrency_group: Option<String>,
@@ -567,6 +573,9 @@ pub struct StepPlan {
     /// Working directory for `run` steps.
     #[serde(default)]
     pub working_directory: Option<String>,
+    /// Optional timeout in minutes for this step.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub timeout_in_minutes: Option<u32>,
     /// Shell override for `run` steps.
     #[serde(default)]
     pub shell: Option<String>,
@@ -696,6 +705,15 @@ pub struct JobCompletion {
     pub run_id: RunId,
     /// Job id.
     pub job_id: JobId,
+    /// The attempt this completion belongs to, when the caller resolved one.
+    ///
+    /// A job can be dispatched more than once, and each dispatch mints its own
+    /// step ids. `(run_id, job_id)` names the logical job, not the attempt, so
+    /// it cannot decide which attempt's step records a report belongs to.
+    /// Callers that already hold the request record supply this; the server
+    /// falls back to the newest attempt when it is absent.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub agent_job_id: Option<uuid::Uuid>,
     /// Final status.
     pub status: ExecutionStatus,
     /// Outputs captured by the runner.
@@ -788,7 +806,7 @@ fn mask_annotation_strings(value: serde_json::Value, secrets: &[&str]) -> serde_
 }
 
 /// Machine-readable event emitted as NDJSON.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(tag = "type", rename_all = "snake_case")]
 pub enum NdjsonEvent {
     /// Run was accepted.
@@ -913,7 +931,7 @@ impl NdjsonEvent {
 }
 
 /// Annotation severity.
-#[derive(Debug, Clone, Copy, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum AnnotationLevel {
     /// Notice.

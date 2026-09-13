@@ -1,12 +1,115 @@
 use super::*;
 use std::collections::BTreeSet;
 
-pub(crate) async fn healthz(State(shared): State<Arc<SharedState>>) -> Json<serde_json::Value> {
-    Json(json!({
-        "ok": true,
+/// A heartbeat or sampler snapshot older than this is stale: three sampler
+/// intervals of 5s. Single source so `/readyz` and `/api/v1/status` cannot
+/// disagree when the interval changes.
+pub(crate) const STALENESS_THRESHOLD: Duration = Duration::from_secs(15);
+
+pub(crate) async fn healthz(State(shared): State<Arc<SharedState>>) -> impl IntoResponse {
+    let shutdown = shared.shutdown.is_cancelled();
+    let body = json!({
+        "ok": !shutdown,
         "protocol_version": PROTOCOL_VERSION,
-        "shutdown_requested": shared.shutdown.is_cancelled(),
-    }))
+        "shutdown_requested": shutdown,
+    });
+    if shutdown {
+        (StatusCode::SERVICE_UNAVAILABLE, Json(body)).into_response()
+    } else {
+        (StatusCode::OK, Json(body)).into_response()
+    }
+}
+
+pub(crate) async fn readyz(State(shared): State<Arc<SharedState>>) -> impl IntoResponse {
+    if shared.shutdown.is_cancelled() {
+        let body = json!({ "ready": false, "reason": "shutting_down" });
+        return (StatusCode::SERVICE_UNAVAILABLE, Json(body)).into_response();
+    }
+    if let Some(stale) = shared
+        .state
+        .observability
+        .heartbeat()
+        .any_critical_stale(STALENESS_THRESHOLD)
+    {
+        let body = json!({ "ready": false, "reason": format!("task_stale:{}", stale) });
+        return (StatusCode::SERVICE_UNAVAILABLE, Json(body)).into_response();
+    }
+    // The snapshot is only refreshed by the `state_sampler` task. An app
+    // built through `routes::app` without one (tests, embedded harnesses)
+    // never promises snapshot freshness, so its `observed_at` age must not
+    // turn /readyz into a permanent 503. Once a sampler has started (and
+    // registered its critical heartbeat), a stale snapshot is a real
+    // outage and is reported as such.
+    let sampler_running = shared
+        .state
+        .observability
+        .heartbeat()
+        .snapshot()
+        .iter()
+        .any(|task| task.name == "state_sampler");
+    if sampler_running {
+        let age_secs = {
+            let snap = shared.state.status_snapshot.read();
+            let now = chrono::Utc::now();
+            (now - snap.observed_at).num_milliseconds() as f64 / 1000.0
+        };
+        if age_secs > STALENESS_THRESHOLD.as_secs_f64() {
+            let body = json!({ "ready": false, "reason": "state_sampler_stale" });
+            return (StatusCode::SERVICE_UNAVAILABLE, Json(body)).into_response();
+        }
+    }
+    let body = json!({ "ready": true, "reason": serde_json::Value::Null });
+    (StatusCode::OK, Json(body)).into_response()
+}
+
+pub(crate) async fn status(State(shared): State<Arc<SharedState>>) -> impl IntoResponse {
+    // Fail-open, no InnerState lock — clone cached snapshot and update age.
+    let mut snap = shared.state.status_snapshot.read().clone();
+    let now = chrono::Utc::now();
+    let age = (now - snap.observed_at).num_milliseconds() as f64 / 1000.0;
+    snap.snapshot_age_seconds = if age.is_finite() && age >= 0.0 {
+        age
+    } else {
+        0.0
+    };
+    // Also surface current heartbeat tasks without holding InnerState
+    // (best-effort: caller sees last sampler's tasks plus live heartbeat snapshot)
+    // We keep sampler's tasks but also append live task snapshot if empty.
+    if snap.tasks.is_empty() {
+        snap.tasks = shared
+            .state
+            .observability
+            .heartbeat()
+            .snapshot()
+            .into_iter()
+            .map(|t| preloop_observability::status::TaskEntry {
+                name: t.name.to_string(),
+                critical: t.critical == preloop_observability::Criticality::Critical,
+                heartbeat_age_seconds: t.heartbeat_age.as_secs_f64(),
+                panicked: t.panicked,
+                state: if t.panicked {
+                    "failed".to_string()
+                } else if t.heartbeat_age > STALENESS_THRESHOLD {
+                    "stale".to_string()
+                } else {
+                    "running".to_string()
+                },
+            })
+            .collect();
+    }
+    Json(snap).into_response()
+}
+
+pub(crate) async fn metrics(State(shared): State<Arc<SharedState>>) -> impl IntoResponse {
+    let body = shared.state.observability.render_metrics();
+    (
+        [(
+            header::CONTENT_TYPE,
+            "text/plain; version=0.0.4; charset=utf-8",
+        )],
+        body,
+    )
+        .into_response()
 }
 
 /// GitHub's `system.orchestrationId`: `{planId}.{jobId}.{suffix}` where the
@@ -16,10 +119,49 @@ pub(crate) async fn healthz(State(shared): State<Arc<SharedState>>) -> Json<serd
 /// the job display name ("Run tests with system wide configuration") would
 /// crash the worker with `FormatException`.
 fn orchestration_id(plan_id: &str, job_id: &str, matrix_index: Option<usize>) -> String {
+    // The official runner emits this value as a User-Agent product token
+    // (`ProductInfoHeaderValue("OrchestrationId", ...)`), so the whole string
+    // must be token-safe. Reusable-call job ids contain '/' ("ci/build"),
+    // which .NET rejects with FormatException. GitHub's own ids never carry
+    // those characters; map everything outside the token alphabet to '-'.
+    let job_id = sanitize_job_id_token(job_id);
     match matrix_index {
         Some(index) => format!("{plan_id}.{job_id}._{index}"),
         None => format!("{plan_id}.{job_id}.__default"),
     }
+}
+
+/// Replace every character that is not an RFC product-token character with
+/// '-' so the value passes .NET's `HeaderUtilities.CheckValidToken`.
+fn sanitize_job_id_token(job_id: &str) -> String {
+    job_id
+        .chars()
+        .map(|c| {
+            if c.is_ascii_alphanumeric()
+                || matches!(
+                    c,
+                    '!' | '#'
+                        | '$'
+                        | '%'
+                        | '&'
+                        | '\''
+                        | '*'
+                        | '+'
+                        | '-'
+                        | '.'
+                        | '^'
+                        | '_'
+                        | '`'
+                        | '|'
+                        | '~'
+                )
+            {
+                c
+            } else {
+                '-'
+            }
+        })
+        .collect()
 }
 
 /// Interpolate `${{ ... }}` expressions in a workflow run name.
@@ -236,10 +378,57 @@ pub(crate) async fn submit_run_inner(
     } else {
         changed_paths_from_payload(&submission.payload)
     };
+    // The reason names the axis; this names the flag that changes it, because
+    // "does not match" without a next action is the whole complaint being
+    // fixed here.
+    fn trigger_mismatch_hint(reason: &preloop_gha_parser::TriggerMismatch) -> String {
+        use preloop_gha_parser::TriggerMismatch as M;
+        match reason {
+            M::EventNotDeclared { declared } if !declared.is_empty() => {
+                let list = declared
+                    .iter()
+                    .map(|event| format!("`--event {event}`"))
+                    .collect::<Vec<_>>()
+                    .join(" or ");
+                format!(" Pass {list}.")
+            }
+            M::EventNotDeclared { .. } => String::new(),
+            M::ActivityTypeMissing { accepted } | M::ActivityTypeRejected { accepted, .. } => {
+                if accepted.is_empty() {
+                    " The workflow declares an empty `types` list and accepts no activity types for this event.".to_owned()
+                } else {
+                    let first = accepted.first().map(String::as_str).unwrap_or("opened");
+                    format!(
+                        " Supply one with `--payload` containing {{\"action\": \"{first}\"}}, or pick \
+                         an activity type the workflow accepts."
+                    )
+                }
+            }
+            M::RefFiltered { .. } => " Check out a matching branch or tag, or pass `--base <REF>` \
+                 for pull_request events (the branch filter applies to the PR's target branch)."
+                .to_owned(),
+            M::PathsUnmatched { .. } | M::PathsAllIgnored { .. } => {
+                " Change a file the filter selects, or pass `--base <REF>` to diff against a \
+                 different base."
+                    .to_owned()
+            }
+            M::UpstreamWorkflowUnmatched { .. } => {
+                " A `workflow_run` trigger needs the upstream workflow's display name; supply it \
+                 with `--payload` containing {\"workflow_run\": {\"name\": \"<NAME>\"}}."
+                    .to_owned()
+            }
+        }
+    }
+
     if !changed_paths_known && workflow.on.has_path_filters(&submission.event) {
-        return Err(ApiError::bad_request(
-            "workflow path filters require a complete changed-file list".to_owned(),
-        ));
+        return Err(ApiError::bad_request(format!(
+            "`on.{}` filters by path, so the run needs the complete list of changed files and \
+             none was supplied. `preloop run` derives it from git, so this usually means the \
+             workspace is not a git repository or no base ref could be resolved — pass `--base \
+             <REF>` (for example `--base main`). An API caller must send `changed_paths` with \
+             `changed_paths_known: true`, or a payload carrying `paths` or `commits`.",
+            submission.event
+        )));
     }
     // Activity type from explicit field (set by dispatcher) or payload.action fallback.
     let activity_owned: Option<String> = submission.activity_type.clone().or_else(|| {
@@ -250,23 +439,42 @@ pub(crate) async fn submit_run_inner(
             .map(str::to_owned)
     });
     let activity_type = activity_owned.as_deref();
-    if !workflow.on.matches_with_context(
+    let mut upstream_names = submission.workflow_run_upstream_names.clone();
+    if upstream_names.is_empty() {
+        if let Some(name) = submission
+            .payload
+            .get("workflow_run")
+            .and_then(|wr| wr.get("name"))
+            .and_then(|v| v.as_str())
+        {
+            upstream_names.push(name.to_owned());
+        }
+    }
+    if let Err(reason) = workflow.on.match_event(
         &submission.event,
         branch.as_deref(),
         tag.as_deref(),
         &changed_paths,
         activity_type,
-        &submission.workflow_run_upstream_names,
+        &upstream_names,
     ) {
         return Err(ApiError::trigger_mismatch(format!(
-            "workflow does not match event `{}`",
-            submission.event
+            "workflow does not run for event `{}`: {reason}.{}",
+            submission.event,
+            trigger_mismatch_hint(&reason)
         )));
     }
-    let expanded = preloop_gha_parser::expand_jobs_with_reusables_and_shas(
+    let dispatch_inputs_for_expand: BTreeMap<String, serde_json::Value> = submission
+        .dispatch_inputs
+        .iter()
+        .map(|(k, v)| (k.clone(), v.clone()))
+        .collect();
+    let expanded = preloop_gha_parser::expand_jobs_with_reusables_and_shas_and_inputs_and_event(
         &workflow,
         &submission.reusable_workflows,
         &submission.reusable_workflow_shas,
+        (!dispatch_inputs_for_expand.is_empty()).then_some(&dispatch_inputs_for_expand),
+        Some(submission.event.as_str()),
     )?;
     let mut jobs = expanded.jobs;
     let reusable_calls = expanded.reusable_calls;
@@ -976,6 +1184,22 @@ pub(crate) async fn submit_run_inner(
                 inner
                     .timeline_requests
                     .insert(job_request.timeline_id, pb.request_id);
+                // Seed the attempt's step manifest before the runner can
+                // report anything, so step identity and order come from the
+                // message we just built rather than from whatever order the
+                // runner's log blobs happen to land in.
+                //
+                // Not persisted here. Rows are written by a runner report, a
+                // job completion, or a full snapshot that happens to flush
+                // them; none of those has necessarily run when a dispatched
+                // attempt is interrupted, so its manifest is rebuilt at startup
+                // from the persisted request message — the same source it was
+                // built from — and a restart in that window keeps its declared
+                // steps.
+                inner.job_steps.insert(
+                    job_request.agent_job_id,
+                    StepRecord::manifest(&agent_msg.steps),
+                );
                 inner.job_requests.insert(pb.request_id, job_request);
                 if let Some(request) = pb.github_token_request {
                     inner.github_token_requests.insert(pb.request_id, request);
@@ -999,12 +1223,17 @@ pub(crate) async fn submit_run_inner(
                 run_id,
                 job_id: job.id.clone(),
                 base_id: job.base_id.clone(),
+                // Stamped when the job actually enters the ready queue (the
+                // promotion sites in runtime_scheduling), never at build
+                // time: dependency/concurrency delay is not queue wait.
+                enqueued_at_unix_nanos: 0,
                 needs: job.needs.clone(),
                 if_condition: job.if_condition.clone(),
                 condition_context: pb.condition_context,
                 max_parallel: job.max_parallel,
                 runs_on: job.runs_on.clone(),
                 runner_group: job.runner_group.clone(),
+                environment: job.environment.clone(),
                 message: agent_msg,
                 concurrency: concurrency::concurrency_from_plan_fields(
                     job.concurrency_group.as_deref(),
@@ -1035,13 +1264,31 @@ pub(crate) async fn submit_run_inner(
                 *queue,
             ) {
                 Ok(true) => {
+                    shared
+                        .state
+                        .observability
+                        .metrics()
+                        .lifecycle
+                        .record_concurrency_decision("workflow", "accept");
                     inner.run_concurrency.insert(run_id, raw.clone());
                 }
                 Ok(false) => {
+                    shared
+                        .state
+                        .observability
+                        .metrics()
+                        .lifecycle
+                        .record_concurrency_decision("workflow", "pending");
                     hold_entire_run = true;
                     inner.run_concurrency.insert(run_id, raw.clone());
                 }
                 Err(e) if e == "concurrency_queue_overflow" => {
+                    shared
+                        .state
+                        .observability
+                        .metrics()
+                        .lifecycle
+                        .record_concurrency_decision("workflow", "reject");
                     // Cancel this run immediately — all jobs Cancelled.
                     for job in &built_jobs {
                         statuses.insert(job.job_id.clone(), ExecutionStatus::Cancelled);
@@ -1081,6 +1328,21 @@ pub(crate) async fn submit_run_inner(
                             snapshot_timing: None,
                         },
                     );
+                    // The run died on arrival: nothing will ever dispatch,
+                    // so the expandable nodes' minted request correlation has
+                    // to be settled here (MC-3), exactly like a cancellation.
+                    for job in &built_jobs {
+                        if job.deferred_matrix.is_some() || job.reusable_call.is_some() {
+                            runtime_scheduling::retire_node_requests(
+                                &mut inner,
+                                run_id,
+                                &job.job_id,
+                                runtime_scheduling::RequestRetirement::Settle(
+                                    ExecutionStatus::Cancelled,
+                                ),
+                            );
+                        }
+                    }
                     drop(inner);
                     shared
                         .state
@@ -1104,6 +1366,12 @@ pub(crate) async fn submit_run_inner(
                     });
                 }
                 Err(e) => {
+                    shared
+                        .state
+                        .observability
+                        .metrics()
+                        .lifecycle
+                        .record_concurrency_decision("workflow", "reject");
                     return Err(ApiError::bad_request(e));
                 }
             }
@@ -1276,13 +1544,31 @@ pub(crate) async fn submit_run_inner(
                     &mut statuses,
                 ) {
                     Ok(true) => {
+                        shared
+                            .state
+                            .observability
+                            .metrics()
+                            .lifecycle
+                            .record_concurrency_decision("job", "accept");
                         *ready_by_base.entry(base_id).or_default() += 1;
                         ready_jobs += 1;
                     }
                     Ok(false) => {
+                        shared
+                            .state
+                            .observability
+                            .metrics()
+                            .lifecycle
+                            .record_concurrency_decision("job", "pending");
                         // parked pending
                     }
                     Err(_) => {
+                        shared
+                            .state
+                            .observability
+                            .metrics()
+                            .lifecycle
+                            .record_concurrency_decision("job", "reject");
                         // cancelled by queue overflow or eval failure already marked
                     }
                 }
@@ -1890,6 +2176,7 @@ pub(crate) fn build_job_artifacts(
         timeline_id: agent_msg.timeline.id,
         result: None,
         locked_until: agent_request_locked_until(),
+        owner_runner_id: None,
         started_at: None,
         last_renewed_at: None,
         timeout_triggered: false,
@@ -1916,33 +2203,54 @@ pub(crate) fn build_job_artifacts(
     })
 }
 
-pub(crate) async fn get_run(
-    State(shared): State<Arc<SharedState>>,
-    Path(run_id): Path<RunId>,
-) -> Result<Json<RunRecord>, ApiError> {
-    let inner = shared.state.inner.lock().await;
-    let mut run = inner
-        .runs
-        .get(&run_id)
-        .cloned()
-        .ok_or_else(|| ApiError::not_found("run not found"))?;
+/// The step records of a job's most recent attempt.
+///
+/// Attempts are ordered by `request_id`, which is a monotonic allocation, so
+/// the highest one is the newest dispatch. `None` when the job was never
+/// dispatched (skipped or cancelled before a request was built).
+pub(crate) fn latest_attempt_steps(
+    inner: &crate::state::InnerState,
+    run_id: RunId,
+    job_id: &JobId,
+) -> Option<Vec<StepRecord>> {
+    let agent_job_id = inner
+        .job_requests
+        .values()
+        .filter(|request| request.run_id == run_id && request.job_id == *job_id)
+        .max_by_key(|request| request.request_id)
+        .map(|request| request.agent_job_id)?;
+    let mut steps = inner.job_steps.get(&agent_job_id).cloned()?;
+    // The stored vector is seeded-then-appended, so it is not execution order.
+    StepRecord::sort_execution_order(&mut steps);
+    Some(steps)
+}
+
+/// Project a stored run into its API shape.
+///
+/// Shared by the single-run and list endpoints. Step records live in the
+/// attempt-scoped manifest rather than in the stored run, so a caller that
+/// clones `inner.runs` directly returns empty step arrays — which is exactly
+/// what the list endpoint did.
+pub(crate) fn project_run(inner: &crate::state::InnerState, mut run: RunRecord) -> RunRecord {
+    let run_id = run.run_id;
 
     // GitHub's run record shows a gate-passed reusable caller only as its
     // callee jobs: once the subtree is materialized, the caller entry leaves
     // the visible job set. Gate-failed callers never materialize and stay as
     // exactly one (skipped) entry.
-    let expanded_callers: std::collections::BTreeSet<&str> = run
+    let expanded_callers: std::collections::BTreeSet<String> = run
         .reusable_calls
         .iter()
         .filter(|(_, call)| !call.inner_job_ids.is_empty())
-        .map(|(caller_id, _)| caller_id.as_str())
+        .map(|(caller_id, _)| caller_id.clone())
         .collect();
     run.jobs
-        .retain(|job_id, _| !expanded_callers.contains(job_id.0.as_str()));
+        .retain(|job_id, _| !expanded_callers.contains(&job_id.0));
 
     // Project with GitHub display names (evaluated `name:`, `caller / callee`
-    // separator). Results/timeline updates only create details for dispatched
-    // jobs; jobs skipped or cancelled before dispatch get an empty step list.
+    // separator), and hydrate each job's steps from its latest attempt's
+    // manifest. A job skipped or cancelled before dispatch never got a
+    // request message, so it has no manifest and shows an empty step list.
     let existing = std::mem::take(&mut run.jobs_list);
     run.jobs_list = run
         .jobs
@@ -1955,23 +2263,42 @@ pub(crate) async fn get_run(
                 .unwrap_or_else(|| job_id.0.clone());
             let mut detail = existing
                 .iter()
-                .find(|detail| detail.name == job_id.0 || detail.name == name)
+                .find(|detail| detail.job_id == job_id.0)
                 .cloned()
                 .unwrap_or(JobDetail {
+                    job_id: job_id.0.clone(),
                     name: name.clone(),
                     conclusion: status_string(*status),
                     steps: Vec::new(),
                     annotations: Vec::new(),
                 });
+            detail.job_id = job_id.0.clone();
             detail.name = name;
-            if let Some(stored) = run.jobs.get(job_id) {
-                detail.conclusion = status_string(*stored);
+            detail.conclusion = status_string(*status);
+            // Steps live in the attempt-scoped manifest, so the run record
+            // shows the newest attempt: a retry supersedes what the previous
+            // dispatch reported.
+            if let Some(manifest) = latest_attempt_steps(inner, run_id, job_id) {
+                detail.steps = manifest;
             }
             detail
         })
         .collect();
 
-    Ok(Json(run))
+    run
+}
+
+pub(crate) async fn get_run(
+    State(shared): State<Arc<SharedState>>,
+    Path(run_id): Path<RunId>,
+) -> Result<Json<RunRecord>, ApiError> {
+    let inner = shared.state.inner.lock().await;
+    let run = inner
+        .runs
+        .get(&run_id)
+        .cloned()
+        .ok_or_else(|| ApiError::not_found("run not found"))?;
+    Ok(Json(project_run(&inner, run)))
 }
 
 /// Browser-safe status page linked from GitHub Check Runs.
@@ -2056,10 +2383,9 @@ pub(crate) async fn list_runs(
     let inner = shared.state.inner.lock().await;
     let limit = query.limit.unwrap_or(50).min(200);
 
-    let runs: Vec<RunRecord> = inner
+    let mut runs: Vec<RunRecord> = inner
         .runs
         .values()
-        .rev()
         .filter(|run| {
             if let Some(workflow) = &query.workflow {
                 if !run.workflow_path_str.contains(workflow) {
@@ -2082,16 +2408,280 @@ pub(crate) async fn list_runs(
             }
             true
         })
-        .take(limit)
         .cloned()
+        .collect();
+    runs.sort_by(|a, b| {
+        a.status
+            .is_terminal()
+            .cmp(&b.status.is_terminal())
+            .then_with(|| {
+                let a_time = a.completed_at.or(a.started_at).unwrap_or(a.created_at);
+                let b_time = b.completed_at.or(b.started_at).unwrap_or(b.created_at);
+                b_time.cmp(&a_time)
+            })
+    });
+    runs.truncate(limit);
+    let runs = runs
+        .into_iter()
+        // Same projection as the single-run endpoint: steps live in the
+        // attempt manifest, so cloning the stored run alone returns empty
+        // step arrays.
+        .map(|run| project_run(&inner, run))
         .collect();
 
     Ok(Json(runs))
 }
 
+/// Optional filters for `GET /api/v1/runs/:run_id/logs`.
+///
+/// Both are absent for the historical whole-run behavior, so an unfiltered
+/// request still returns every job's log merged in request order.
+#[derive(Debug, Default, Deserialize)]
+pub(crate) struct RunLogsQuery {
+    /// Workflow job key (`job_id`) or the agent job UUID. Matched exactly as
+    /// the live-log feed matches it, so the same value works for both.
+    #[serde(default)]
+    job: Option<String>,
+    /// 1-based index into the job's step logs, in execution order. Mirrors
+    /// `preloop debug --from`, which also counts user-visible steps from 1.
+    #[serde(default)]
+    step: Option<usize>,
+}
+
+/// Files uploaded for one job's individual steps.
+///
+/// `all` is every uploaded step blob, for an unfiltered whole-job read.
+/// `workflow` is the manifest's declared steps in workflow order, each mapped
+/// to its blob (`None` when that step produced no log). Synthetic runner steps
+/// appear in `all` but never in `workflow`, which is what keeps "Set up job"
+/// and `Post <action>` out of `--step` numbering.
+struct StepLogs {
+    all: Vec<std::path::PathBuf>,
+    workflow: Option<Vec<Option<std::path::PathBuf>>>,
+}
+
+/// One job's log material, in execution order.
+///
+/// The variants are the three tiers `get_run_logs` already resolved inline;
+/// naming them is what lets `?step=` reject the one tier that cannot answer
+/// it instead of silently returning the whole job.
+enum JobLogs {
+    /// The runner uploaded one merged log. Step boundaries are not recoverable
+    /// from it, so `?step=` cannot be honored.
+    Merged(Vec<u8>),
+    /// Per-step log files, with a workflow-order view for `?step=`.
+    Steps(StepLogs),
+    /// Nothing on disk yet: in-memory console blocks for a job still running,
+    /// already ordered by numeric console log id (one per step).
+    Live(Vec<Vec<u8>>),
+}
+
+/// Resolve one job's logs through the tier fallback.
+///
+/// Unfiltered requests prefer the merged upload because it is the runner's
+/// authoritative whole-job representation. A step-filtered request prefers
+/// individual step blobs when both are present; the merged upload has no
+/// recoverable boundaries and is only used to produce the explicit 409.
+///
+/// `workflow_step_ids` is the attempt's declared-step order, taken from the
+/// manifest built out of the job request message. There is deliberately no
+/// filesystem fallback: modification time records when a blob landed, not when
+/// a step ran, so ordering by it returned the wrong step for out-of-order or
+/// same-timestamp uploads.
+async fn resolve_job_logs(
+    results_dir: &std::path::Path,
+    fallback_blocks: Vec<Vec<u8>>,
+    workflow_step_ids: Option<&[String]>,
+    // Every id the attempt's manifest knows, in execution order, used only to
+    // order the whole-job concatenation.
+    execution_step_ids: Option<&[String]>,
+    prefer_steps: bool,
+) -> Result<JobLogs, ApiError> {
+    let merged = match tokio::fs::read(results_dir.join("job-logs.txt")).await {
+        Ok(contents) => Some(contents),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => None,
+        Err(error) => {
+            return Err(ApiError::internal(format!(
+                "failed to read run log `{}`: {error}",
+                results_dir.join("job-logs.txt").display()
+            )));
+        }
+    };
+    if !prefer_steps {
+        if let Some(contents) = merged {
+            return Ok(JobLogs::Merged(contents));
+        }
+    }
+
+    let mut step_files: Vec<(String, std::path::PathBuf)> = Vec::new();
+    match tokio::fs::read_dir(results_dir).await {
+        Ok(mut entries) => {
+            while let Some(entry) = entries.next_entry().await.map_err(|error| {
+                ApiError::internal(format!(
+                    "failed to enumerate result logs `{}`: {error}",
+                    results_dir.display()
+                ))
+            })? {
+                let name = entry.file_name();
+                let name = name.to_string_lossy();
+                let Some(step_id) = name
+                    .strip_prefix("step-")
+                    .and_then(|name| name.strip_suffix(".txt"))
+                else {
+                    continue;
+                };
+                let step_id = step_id.to_owned();
+                let metadata = entry.metadata().await.map_err(|error| {
+                    ApiError::internal(format!(
+                        "failed to inspect result log `{}`: {error}",
+                        entry.path().display()
+                    ))
+                })?;
+                if !metadata.is_file() {
+                    continue;
+                }
+                step_files.push((step_id, entry.path()));
+            }
+        }
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+        Err(error) => {
+            return Err(ApiError::internal(format!(
+                "failed to enumerate result logs `{}`: {error}",
+                results_dir.display()
+            )));
+        }
+    }
+    // Concatenation order comes from the manifest, which knows what ran when.
+    // A step id is a v4 UUID, so sorting by it emitted the whole-job log in
+    // random order; blobs the manifest does not know keep a stable tail.
+    let position = |id: &str| {
+        execution_step_ids
+            .and_then(|ids| ids.iter().position(|known| known == id))
+            .unwrap_or(usize::MAX)
+    };
+    step_files.sort_by(|left, right| {
+        position(&left.0)
+            .cmp(&position(&right.0))
+            .then_with(|| left.0.cmp(&right.0))
+    });
+
+    if !step_files.is_empty() {
+        let workflow = workflow_step_ids.filter(|ids| !ids.is_empty()).map(|ids| {
+            ids.iter()
+                .map(|id| {
+                    step_files
+                        .iter()
+                        .find(|(file_id, _)| file_id == id)
+                        .map(|(_, path)| path.clone())
+                })
+                .collect()
+        });
+        return Ok(JobLogs::Steps(StepLogs {
+            all: step_files.into_iter().map(|(_, path)| path).collect(),
+            workflow,
+        }));
+    }
+
+    // A step query with only a merged upload must be rejected by append_step;
+    // do not silently turn it into a whole-job response.
+    if let Some(contents) = merged {
+        return Ok(JobLogs::Merged(contents));
+    }
+    Ok(JobLogs::Live(fallback_blocks))
+}
+
+/// Append every step of a job, in upload/execution order.
+async fn append_all(logs: JobLogs, merged: &mut Vec<u8>) -> Result<(), ApiError> {
+    match logs {
+        JobLogs::Merged(contents) => merged.extend_from_slice(&contents),
+        JobLogs::Steps(step_logs) => {
+            for path in step_logs.all {
+                let contents = tokio::fs::read(&path).await.map_err(|error| {
+                    ApiError::internal(format!(
+                        "failed to read result log `{}`: {error}",
+                        path.display()
+                    ))
+                })?;
+                merged.extend_from_slice(&contents);
+            }
+        }
+        JobLogs::Live(blocks) => {
+            for block in blocks {
+                merged.extend_from_slice(&block);
+            }
+        }
+    }
+    Ok(())
+}
+
+/// Append exactly the `step`th (1-based) workflow step of a job.
+async fn append_step(
+    logs: JobLogs,
+    step: usize,
+    job_label: &str,
+    merged: &mut Vec<u8>,
+) -> Result<(), ApiError> {
+    if step == 0 {
+        return Err(ApiError::bad_request(
+            "step is 1-based; use `--step 1` for the first step",
+        ));
+    }
+    let index = step - 1;
+    match logs {
+        // Refusing beats guessing: the merged upload has no step boundaries,
+        // so any answer here would be the whole job wearing a step's name.
+        JobLogs::Merged(_) => Err(ApiError::conflict(format!(
+            "job `{job_label}` reported one merged log, which carries no step \
+             boundaries; re-request without `step` for the whole job log"
+        ))),
+        JobLogs::Steps(step_logs) => {
+            // No manifest means no declared-step order to index. The uploads
+            // on disk are not a substitute: they include synthetic runner
+            // steps and arrive in upload order, so indexing them returned a
+            // neighbouring step's log under the requested step's name.
+            let Some(workflow) = step_logs.workflow else {
+                return Err(ApiError::conflict(format!(
+                    "job `{job_label}` has no recorded workflow-step order, so step \
+                     {step} cannot be identified; re-request without `step` for the \
+                     whole job log"
+                )));
+            };
+            let total = workflow.len();
+            let path = workflow.get(index).cloned().flatten();
+            let Some(path) = path else {
+                if index < total {
+                    // A valid workflow step is allowed to have no log blob.
+                    return Ok(());
+                }
+                return Err(ApiError::not_found(format!(
+                    "job `{job_label}` has {total} steps; step {step} is out of range"
+                )));
+            };
+            let contents = tokio::fs::read(&path).await.map_err(|error| {
+                ApiError::internal(format!(
+                    "failed to read result log `{}`: {error}",
+                    path.display()
+                ))
+            })?;
+            merged.extend_from_slice(&contents);
+            Ok(())
+        }
+        // In-memory console blocks are keyed by the runner's numeric log id,
+        // which counts every record it opened — `Set up job` included — so
+        // indexing them returns setup output for `--step 1`. That is the
+        // numbering error this whole path exists to remove, so refuse instead
+        // of reproducing it for a job whose blobs have not landed yet.
+        JobLogs::Live(_) => Err(ApiError::conflict(format!(
+            "job `{job_label}` has not uploaded per-step logs yet, so step {step} cannot be \
+             identified; re-request without `step` for the output so far"
+        ))),
+    }
+}
+
 pub(crate) async fn get_run_logs(
     State(shared): State<Arc<SharedState>>,
     Path(run_id): Path<RunId>,
+    Query(query): Query<RunLogsQuery>,
 ) -> Result<Response, ApiError> {
     let (state_dir, sources) = {
         let inner = shared.state.inner.lock().await;
@@ -2105,6 +2695,32 @@ pub(crate) async fn get_run_logs(
             .filter(|request| request.run_id == run_id)
             .collect();
         requests.sort_by_key(|request| request.request_id);
+
+        if let Some(job) = &query.job {
+            // Same matching rule as the live-log feed: workflow job key or
+            // agent job UUID, so one value works across both surfaces.
+            requests.retain(|request| {
+                request.job_id.0 == *job || request.agent_job_id.to_string() == *job
+            });
+            if requests.is_empty() {
+                return Err(ApiError::not_found(format!(
+                    "job `{job}` not found in this run"
+                )));
+            }
+        } else if query.step.is_some() && requests.len() > 1 {
+            // Numbering restarts per job, so an unqualified step in a
+            // multi-job run names more than one thing.
+            let jobs: Vec<&str> = requests
+                .iter()
+                .map(|request| request.job_id.0.as_str())
+                .collect();
+            return Err(ApiError::bad_request(format!(
+                "`step` needs `job` when a run has {} jobs: {}",
+                jobs.len(),
+                jobs.join(", ")
+            )));
+        }
+
         let sources = requests
             .into_iter()
             .map(|request| {
@@ -2125,13 +2741,42 @@ pub(crate) async fn get_run_logs(
                         (Err(_), Err(_)) => left.cmp(right),
                     }
                 });
+                // The attempt's own manifest, keyed by the agent job id that
+                // also names this request's results directory. The broker
+                // message is deliberately not consulted — it is broker
+                // delivery state that a restart or a retirement can drop,
+                // while the manifest is run state.
+                //
+                // Two views: declared steps in workflow order decide `--step`,
+                // because a synthetic "Set up job" record must not occupy a
+                // slot; every id in execution order decides the whole-job
+                // concatenation, where synthetic output belongs in place.
+                let manifest = inner.job_steps.get(&request.agent_job_id);
+                let workflow_step_ids = manifest
+                    .map(|records| {
+                        StepRecord::workflow_steps(records)
+                            .into_iter()
+                            .map(|step| step.id.clone())
+                            .collect::<Vec<_>>()
+                    })
+                    .filter(|ids| !ids.is_empty());
+                let execution_step_ids = manifest
+                    .map(|records| {
+                        let mut ordered = records.clone();
+                        StepRecord::sort_execution_order(&mut ordered);
+                        ordered.into_iter().map(|step| step.id).collect::<Vec<_>>()
+                    })
+                    .filter(|ids| !ids.is_empty());
                 (
                     request.plan_id.clone(),
                     request.agent_job_id.to_string(),
+                    request.job_id.0.clone(),
                     blocks
                         .into_iter()
                         .map(|(_, block)| block.to_vec())
                         .collect::<Vec<_>>(),
+                    workflow_step_ids,
+                    execution_step_ids,
                 )
             })
             .collect::<Vec<_>>();
@@ -2139,75 +2784,31 @@ pub(crate) async fn get_run_logs(
     };
 
     let mut merged = Vec::new();
-    for (plan_id, agent_job_id, fallback_blocks) in sources {
+    for (
+        plan_id,
+        agent_job_id,
+        job_label,
+        fallback_blocks,
+        workflow_step_ids,
+        execution_step_ids,
+    ) in sources
+    {
         let results_dir = state_dir
             .join("replay")
             .join("results")
             .join(plan_id)
             .join(agent_job_id);
-        let results_log = results_dir.join("job-logs.txt");
-        match tokio::fs::read(&results_log).await {
-            Ok(contents) => merged.extend_from_slice(&contents),
-            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
-                let mut step_logs = Vec::new();
-                match tokio::fs::read_dir(&results_dir).await {
-                    Ok(mut entries) => {
-                        while let Some(entry) = entries.next_entry().await.map_err(|error| {
-                            ApiError::internal(format!(
-                                "failed to enumerate result logs `{}`: {error}",
-                                results_dir.display()
-                            ))
-                        })? {
-                            let name = entry.file_name();
-                            let name = name.to_string_lossy();
-                            if !name.starts_with("step-") || !name.ends_with(".txt") {
-                                continue;
-                            }
-                            let metadata = entry.metadata().await.map_err(|error| {
-                                ApiError::internal(format!(
-                                    "failed to inspect result log `{}`: {error}",
-                                    entry.path().display()
-                                ))
-                            })?;
-                            if !metadata.is_file() {
-                                continue;
-                            }
-                            let modified = metadata.modified().unwrap_or(std::time::UNIX_EPOCH);
-                            step_logs.push((modified, name.into_owned(), entry.path()));
-                        }
-                    }
-                    Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
-                    Err(error) => {
-                        return Err(ApiError::internal(format!(
-                            "failed to enumerate result logs `{}`: {error}",
-                            results_dir.display()
-                        )));
-                    }
-                }
-                step_logs
-                    .sort_by(|left, right| left.0.cmp(&right.0).then_with(|| left.1.cmp(&right.1)));
-                if step_logs.is_empty() {
-                    for block in fallback_blocks {
-                        merged.extend_from_slice(&block);
-                    }
-                } else {
-                    for (_, _, path) in step_logs {
-                        let contents = tokio::fs::read(&path).await.map_err(|error| {
-                            ApiError::internal(format!(
-                                "failed to read result log `{}`: {error}",
-                                path.display()
-                            ))
-                        })?;
-                        merged.extend_from_slice(&contents);
-                    }
-                }
-            }
-            Err(error) => {
-                return Err(ApiError::internal(format!(
-                    "failed to read run log `{}`: {error}",
-                    results_log.display()
-                )));
-            }
+        let logs = resolve_job_logs(
+            &results_dir,
+            fallback_blocks,
+            workflow_step_ids.as_deref(),
+            execution_step_ids.as_deref(),
+            query.step.is_some(),
+        )
+        .await?;
+        match query.step {
+            Some(step) => append_step(logs, step, &job_label, &mut merged).await?,
+            None => append_all(logs, &mut merged).await?,
         }
     }
 

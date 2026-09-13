@@ -44,8 +44,93 @@ pub(crate) struct ArtifactV2DeleteRequest {
     pub(crate) name: String,
 }
 
-pub(crate) fn artifact_v2_registry_key(run_id: &str, job_id: &str, name: &str) -> String {
-    format!("{run_id}/{job_id}/{name}")
+pub(crate) fn artifact_v2_registry_key(run_id: &str, name: &str) -> String {
+    format!("{run_id}/{name}")
+}
+
+/// Resolve the run-scoped registry namespace for an artifact request.
+///
+/// The official runner addresses artifacts with
+/// `workflow_run_backend_id = plan_id`, and preloop mints one plan id per job
+/// (the job builder defaults `plan.plan_id` to the job's own id). A build job
+/// and a consumer job of the same run therefore present different plan ids —
+/// scoping the registry by the raw request value would make the build job's
+/// uploads invisible to the consumer (found via scenario 206). Map the plan id
+/// to the recorded run id when it is known; fall back to the request value for
+/// unknown plans (control-plane callers, tests).
+pub(crate) fn canonical_artifact_scope(
+    inner: &InnerState,
+    plan_id: &str,
+    fallback: &str,
+) -> String {
+    if let Some(request_id) = inner.plan_requests.get(plan_id) {
+        if let Some(record) = inner.job_requests.get(request_id) {
+            return record.run_id.to_string();
+        }
+    }
+    fallback.to_owned()
+}
+
+/// Resolve *and authorize* the run-scoped artifact namespace for an
+/// artifact-v2 request.
+///
+/// Every artifact-v2 request type carries `workflow_run_backend_id` and
+/// `workflow_job_run_backend_id` in its body, and the handlers key the
+/// registry off them. The results-service bearer guard parses the bearer into
+/// a typed plan/job identity, so trusting those body fields would let a
+/// workflow step list, re-point, sign a URL for, or delete another run's
+/// artifacts just by sending different ids (SEC-02). The owning run is
+/// therefore taken from the caller's signed runtime token and the body ids
+/// only survive if they canonicalize to it.
+///
+/// The boundary is the **run**, not the job, on purpose: GitHub artifacts are
+/// run-scoped, and `actions/download-artifact` in a `needs:` job legitimately
+/// reads (and `DeleteArtifact` legitimately removes) artifacts uploaded by a
+/// sibling job of the same run. Binding to the token's job — the stricter
+/// rule [`crate::auth::results_identity_binds_job`] applies to log/summary
+/// blob URLs, which really are per-job — would break artifact hand-off
+/// jobs. `workflow_job_run_backend_id` is consequently *not* an authorization
+/// input here; it is recorded as attribution only.
+fn artifact_v2_canonical_run_scope(
+    inner: &InnerState,
+    workflow_run_backend_id: &str,
+    job: Option<uuid::Uuid>,
+) -> Result<String, ApiError> {
+    let canonical_run =
+        canonical_artifact_scope(inner, workflow_run_backend_id, workflow_run_backend_id);
+    let Some(job) = job else {
+        return Ok(canonical_run);
+    };
+    let forbidden =
+        || ApiError::forbidden("artifact access requires a token for that workflow run");
+    let request_id = inner
+        .agent_job_requests
+        .get(&job)
+        .copied()
+        .ok_or_else(forbidden)?;
+    let record = inner.job_requests.get(&request_id).ok_or_else(forbidden)?;
+    if record.run_id.to_string() != canonical_run {
+        return Err(forbidden());
+    }
+    Ok(canonical_run)
+}
+
+fn artifact_v2_job_from_headers(
+    state: &AppState,
+    headers: &HeaderMap,
+) -> Result<Option<uuid::Uuid>, ApiError> {
+    let Some(token) = crate::auth::bearer_from_headers(headers) else {
+        return Err(ApiError::unauthorized(
+            "artifact access requires a bearer token",
+        ));
+    };
+    if token == state.system_token {
+        return Ok(None);
+    }
+    state
+        .job_uuid_from_token(token)
+        .map(Some)
+        .ok_or_else(|| ApiError::unauthorized("artifact access requires a valid job token"))
 }
 
 pub(crate) async fn save_artifact_v2_registry(
@@ -59,18 +144,27 @@ pub(crate) async fn save_artifact_v2_registry(
     tokio::fs::write(&registry_path, serialized.as_bytes()).await?;
     Ok(())
 }
+
 pub(crate) async fn twirp_artifact_v2_create(
     State(shared): State<Arc<SharedState>>,
+    headers: HeaderMap,
     Json(request): Json<ArtifactV2CreateRequest>,
 ) -> Result<Json<serde_json::Value>, ApiError> {
+    // Validate the JWT signature and claims before taking the global state lock.
+    let job = artifact_v2_job_from_headers(&shared.state, &headers)?;
+    let canonical_run = {
+        let inner = shared.state.inner.lock().await;
+        artifact_v2_canonical_run_scope(&inner, &request.workflow_run_backend_id, job)?
+    };
     validate_artifact_name(&request.name)
         .map_err(|error| ApiError::bad_request(error.to_string()))?;
     let token = uuid::Uuid::new_v4().to_string();
-    let registry_key = artifact_v2_registry_key(
-        &request.workflow_run_backend_id,
-        &request.workflow_job_run_backend_id,
-        &request.name,
-    );
+    let registry_key = artifact_v2_registry_key(&canonical_run, &request.name);
+    // F7: the job is taken from the signed runtime token scope, not the
+    // request body, so a runner cannot evade its per-job pending cap by
+    // inventing other job ids. Control-plane callers (no job token) reserve
+    // without a per-job budget; the TTL sweep still bounds them by age.
+    let job_backend_id = job_backend_id_from_bearer(&shared.state, &headers);
     let stage_dir = shared
         .state
         .state_dir
@@ -82,9 +176,48 @@ pub(crate) async fn twirp_artifact_v2_create(
         .map_err(|e| ApiError::internal(format!("failed to create artifact stage dir: {e}")))?;
     {
         let mut inner = shared.state.inner.lock().await;
-        inner
+        if inner.artifact_v2_registry.contains_key(&registry_key) {
+            let _ = tokio::fs::remove_dir_all(&stage_dir).await;
+            return Err(ApiError::conflict(format!(
+                "Artifact name '{}' already exists in this workflow run. Artifacts are immutable once uploaded.",
+                request.name
+            )));
+        }
+        if inner
             .artifact_v2_pending
-            .insert(token.clone(), ArtifactV2Pending { registry_key });
+            .values()
+            .any(|p| p.registry_key == registry_key)
+        {
+            let _ = tokio::fs::remove_dir_all(&stage_dir).await;
+            return Err(ApiError::conflict(format!(
+                "An upload for artifact name '{}' is already in progress in this workflow run.",
+                request.name
+            )));
+        }
+
+        if let Some(job_id) = &job_backend_id {
+            let pending = inner
+                .artifact_v2_pending
+                .values()
+                .filter(|pending| &pending.job_backend_id == job_id)
+                .count();
+            if pending >= MAX_PENDING_PER_JOB {
+                // Clean up the directory we just created — the TTL sweep has no
+                // token to find it otherwise, so it would leak forever.
+                let _ = tokio::fs::remove_dir_all(&stage_dir).await;
+                return Err(ApiError::conflict(format!(
+                    "job has {pending} pending artifact uploads (cap {MAX_PENDING_PER_JOB})"
+                )));
+            }
+        }
+        inner.artifact_v2_pending.insert(
+            token.clone(),
+            ArtifactV2Pending {
+                registry_key,
+                job_backend_id: job_backend_id.unwrap_or_default(),
+                created_unix: now_unix(),
+            },
+        );
         let meta = crate::store::build_meta_snapshot(&inner);
         if let Err(error) = shared.state.store.store_meta_only(&meta).await {
             tracing::warn!(?error, "failed to persist artifact v2 reservation");
@@ -102,19 +235,27 @@ pub(crate) async fn twirp_artifact_v2_create(
 
 pub(crate) async fn twirp_artifact_v2_finalize(
     State(shared): State<Arc<SharedState>>,
+    headers: HeaderMap,
     Json(request): Json<ArtifactV2FinalizeRequest>,
 ) -> Result<Json<serde_json::Value>, ApiError> {
-    let registry_key = artifact_v2_registry_key(
-        &request.workflow_run_backend_id,
-        &request.workflow_job_run_backend_id,
-        &request.name,
-    );
+    let job = artifact_v2_job_from_headers(&shared.state, &headers)?;
+    let canonical_run = {
+        let inner = shared.state.inner.lock().await;
+        artifact_v2_canonical_run_scope(&inner, &request.workflow_run_backend_id, job)?
+    };
+    let registry_key = artifact_v2_registry_key(&canonical_run, &request.name);
     let token = {
+        let caller_job_str = job.map(|j| j.to_string());
         let inner = shared.state.inner.lock().await;
         inner
             .artifact_v2_pending
             .iter()
-            .find(|(_, p)| p.registry_key == registry_key)
+            .find(|(_, p)| {
+                p.registry_key == registry_key
+                    && caller_job_str
+                        .as_deref()
+                        .is_none_or(|job_id| p.job_backend_id == job_id)
+            })
             .map(|(k, _)| k.clone())
     }
     .ok_or_else(|| ApiError::not_found("no pending artifact upload for this name/run/job"))?;
@@ -139,18 +280,21 @@ pub(crate) async fn twirp_artifact_v2_finalize(
     let artifact_id;
     {
         let mut inner = shared.state.inner.lock().await;
-        inner.artifact_v2_pending.remove(&token);
+        inner
+            .artifact_v2_pending
+            .remove(&token)
+            .ok_or_else(|| ApiError::not_found("artifact upload already finalized"))?;
         inner.next_artifact_v2_id += 1;
         artifact_id = inner.next_artifact_v2_id;
         let digest = request.hash.and_then(|v| match v {
             serde_json::Value::String(s) => Some(s),
-            serde_json::Value::Object(ref obj) => obj
+            serde_json::Value::Object(obj) => obj
                 .get("value")
                 .and_then(|val| val.as_str().map(|s| s.to_owned())),
             _ => None,
         });
         inner.artifact_v2_registry.insert(
-            registry_key,
+            registry_key.clone(),
             ArtifactV2Entry {
                 id: artifact_id,
                 workflow_run_backend_id: request.workflow_run_backend_id,
@@ -162,6 +306,11 @@ pub(crate) async fn twirp_artifact_v2_finalize(
                 blob_token: token,
             },
         );
+        // Track finalization order for FIFO eviction.
+        inner.artifact_registry_order.push_back(registry_key);
+        // F7: keep the registry bounded per run (500) and globally (10k);
+        // oldest entries are evicted first.
+        trim_artifact_registry(&mut inner);
         let meta = crate::store::build_meta_snapshot(&inner);
         if let Err(error) = shared.state.store.store_meta_only(&meta).await {
             tracing::warn!(?error, "failed to persist artifact v2 finalization");
@@ -181,13 +330,17 @@ pub(crate) async fn twirp_artifact_v2_finalize(
 
 pub(crate) async fn twirp_artifact_v2_list(
     State(shared): State<Arc<SharedState>>,
+    headers: HeaderMap,
     Json(request): Json<ArtifactV2ListRequest>,
-) -> Json<serde_json::Value> {
+) -> Result<Json<serde_json::Value>, ApiError> {
+    let job = artifact_v2_job_from_headers(&shared.state, &headers)?;
     let inner = shared.state.inner.lock().await;
+    let canonical_run =
+        artifact_v2_canonical_run_scope(&inner, &request.workflow_run_backend_id, job)?;
 
     let name_filter: Option<String> = request.name_filter.and_then(|v| match v {
         serde_json::Value::String(s) => Some(s),
-        serde_json::Value::Object(ref obj) => obj
+        serde_json::Value::Object(obj) => obj
             .get("value")
             .and_then(|val| val.as_str().map(|s| s.to_owned())),
         _ => None,
@@ -195,7 +348,7 @@ pub(crate) async fn twirp_artifact_v2_list(
     let id_filter: Option<u64> = request.id_filter.and_then(|v| match v {
         serde_json::Value::String(s) => s.parse::<u64>().ok(),
         serde_json::Value::Number(n) => n.as_u64(),
-        serde_json::Value::Object(ref obj) => obj.get("value").and_then(|val| match val {
+        serde_json::Value::Object(obj) => obj.get("value").and_then(|val| match val {
             serde_json::Value::String(s) => s.parse::<u64>().ok(),
             serde_json::Value::Number(n) => n.as_u64(),
             _ => None,
@@ -207,8 +360,11 @@ pub(crate) async fn twirp_artifact_v2_list(
         .artifact_v2_registry
         .values()
         .filter(|e| {
-            e.workflow_run_backend_id == request.workflow_run_backend_id
-                && e.workflow_job_run_backend_id == request.workflow_job_run_backend_id
+            canonical_artifact_scope(
+                &inner,
+                &e.workflow_run_backend_id,
+                &e.workflow_run_backend_id,
+            ) == canonical_run
         })
         .filter(|e| name_filter.as_deref().map(|f| e.name == f).unwrap_or(true))
         .filter(|e| id_filter.map(|id| e.id == id).unwrap_or(true))
@@ -224,18 +380,20 @@ pub(crate) async fn twirp_artifact_v2_list(
             })
         })
         .collect();
-    Json(json!({ "artifacts": artifacts }))
+    Ok(Json(json!({ "artifacts": artifacts })))
 }
 
 pub(crate) async fn twirp_artifact_v2_get_signed_url(
     State(shared): State<Arc<SharedState>>,
+    headers: HeaderMap,
     Json(request): Json<ArtifactV2GetSignedUrlRequest>,
 ) -> Result<Json<serde_json::Value>, ApiError> {
-    let registry_key = artifact_v2_registry_key(
-        &request.workflow_run_backend_id,
-        &request.workflow_job_run_backend_id,
-        &request.name,
-    );
+    let job = artifact_v2_job_from_headers(&shared.state, &headers)?;
+    let canonical_run = {
+        let inner = shared.state.inner.lock().await;
+        artifact_v2_canonical_run_scope(&inner, &request.workflow_run_backend_id, job)?
+    };
+    let registry_key = artifact_v2_registry_key(&canonical_run, &request.name);
     let blob_token = {
         let inner = shared.state.inner.lock().await;
         inner
@@ -252,13 +410,15 @@ pub(crate) async fn twirp_artifact_v2_get_signed_url(
 
 pub(crate) async fn twirp_artifact_v2_delete(
     State(shared): State<Arc<SharedState>>,
+    headers: HeaderMap,
     Json(request): Json<ArtifactV2DeleteRequest>,
-) -> Json<serde_json::Value> {
-    let registry_key = artifact_v2_registry_key(
-        &request.workflow_run_backend_id,
-        &request.workflow_job_run_backend_id,
-        &request.name,
-    );
+) -> Result<Json<serde_json::Value>, ApiError> {
+    let job = artifact_v2_job_from_headers(&shared.state, &headers)?;
+    let canonical_run = {
+        let inner = shared.state.inner.lock().await;
+        artifact_v2_canonical_run_scope(&inner, &request.workflow_run_backend_id, job)?
+    };
+    let registry_key = artifact_v2_registry_key(&canonical_run, &request.name);
     let removed = {
         let mut inner = shared.state.inner.lock().await;
         inner.artifact_v2_registry.remove(&registry_key)
@@ -279,8 +439,8 @@ pub(crate) async fn twirp_artifact_v2_delete(
             .join("artifact")
             .join(&e.blob_token);
         let _ = tokio::fs::remove_dir_all(blob_dir).await;
-        Json(json!({ "ok": true, "artifact_id": e.id.to_string() }))
+        Ok(Json(json!({ "ok": true, "artifact_id": e.id.to_string() })))
     } else {
-        Json(json!({ "ok": false, "artifact_id": "0" }))
+        Ok(Json(json!({ "ok": false, "artifact_id": "0" })))
     }
 }

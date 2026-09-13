@@ -124,18 +124,6 @@ impl AppState {
         mac.verify_slice(&provided).is_ok()
     }
 
-    pub(crate) fn verify_local_jwt_scope(&self, token: &str, expected_scope: &str) -> bool {
-        self.verify_local_jwt_claims(token)
-            .and_then(|payload| {
-                payload
-                    .get("scp")
-                    .and_then(|value| value.as_str())
-                    .map(str::to_owned)
-            })
-            .as_deref()
-            == Some(expected_scope)
-    }
-
     pub(crate) fn runner_id_from_token(&self, token: &str) -> Option<i64> {
         let payload = self.verify_local_jwt_claims(token)?;
         let scope = payload.get("scp")?.as_str()?;
@@ -153,31 +141,59 @@ impl AppState {
             .ok()
     }
 
-    /// Agent job UUID a runtime token was minted for.
+    /// Parsed identity of a verified Results runtime-token payload.
     ///
-    /// The counterpart to [`Self::runner_id_from_token`]: a job runtime token
-    /// names exactly one job, so any surface a worker calls can authorize
-    /// against the job rather than merely against token validity.
-    pub(crate) fn job_uuid_from_token(&self, token: &str) -> Option<uuid::Uuid> {
-        let payload = self.verify_local_jwt_claims(token)?;
-        // `scp` is `Actions.Results:{plan_id}:{job_id}`; `sub` is the job on
-        // its own. Require both to agree so a token minted for a different
-        // surface cannot be replayed here.
+    /// Pure so every consumer — route auth, signed-URL binding, quota
+    /// accounting, and fork-tier resolution — parses mounted claims one way.
+    /// In particular the scope must contain exactly one `:` separating a
+    /// non-empty plan id from the job id; a suffix-only split would accept
+    /// extra components the other callsites reject.
+    pub(crate) fn results_job_from_payload(
+        payload: &serde_json::Value,
+    ) -> Option<(String, uuid::Uuid)> {
         let subject_job = payload
             .get("sub")?
             .as_str()?
             .strip_prefix("preloop-job-")?
             .parse::<uuid::Uuid>()
             .ok()?;
-        let scope_job = payload
+        let scope = payload
             .get("scp")?
             .as_str()?
-            .strip_prefix("Actions.Results:")?
-            .rsplit(':')
-            .next()?
-            .parse::<uuid::Uuid>()
-            .ok()?;
-        (subject_job == scope_job).then_some(subject_job)
+            .strip_prefix("Actions.Results:")?;
+        let (plan_id, scope_job) = scope.split_once(':')?;
+        if plan_id.is_empty() {
+            return None;
+        }
+        let scope_job = scope_job.parse::<uuid::Uuid>().ok()?;
+        (subject_job == scope_job).then(|| (plan_id.to_owned(), subject_job))
+    }
+
+    /// Parsed identity of an authenticated Results runtime token.
+    ///
+    /// The `sub` claim and the job component of the exact
+    /// `Actions.Results:{plan_id}:{job_id}` scope must name the same job.
+    /// Returning the plan and job together keeps Results authorization and
+    /// quota accounting on one parser.
+    pub(crate) fn results_job_from_token(&self, token: &str) -> Option<(String, uuid::Uuid)> {
+        let payload = self.verify_local_jwt_claims(token)?;
+        Self::results_job_from_payload(&payload)
+    }
+
+    /// Agent job UUID a runtime token was minted for.
+    ///
+    /// The counterpart to [`Self::runner_id_from_token`]: a job runtime token
+    /// names exactly one job, so any surface a worker calls can authorize
+    /// against the job rather than merely against token validity.
+    pub(crate) fn job_uuid_from_token(&self, token: &str) -> Option<uuid::Uuid> {
+        self.results_job_from_token(token).map(|(_, job)| job)
+    }
+    pub(crate) fn job_runtime_claims_from_token(
+        &self,
+        token: &str,
+    ) -> Option<crate::auth::JobRuntimeClaims> {
+        let (plan_id, job_id) = self.results_job_from_token(token)?;
+        Some(crate::auth::JobRuntimeClaims { plan_id, job_id })
     }
 
     /// Agent job UUID a debug-worker token was minted for.
@@ -243,15 +259,28 @@ pub struct SharedState {
     pub shutdown: CancellationToken,
 }
 
+#[cfg(test)]
+impl AppState {
+    /// Wrap this state in a `SharedState` for tests that call handlers taking
+    /// `&Arc<SharedState>` directly. Each call makes a fresh token; tests that
+    /// need shutdown coordination build the struct explicitly.
+    pub(crate) fn shared(&self) -> std::sync::Arc<SharedState> {
+        std::sync::Arc::new(SharedState {
+            state: self.clone(),
+            shutdown: CancellationToken::new(),
+        })
+    }
+}
+
 /// Who may register a runner with the control plane.
 ///
 /// `Strict` is the default and the only safe choice for a deployment reachable
 /// over a network: it accepts exactly the system credential. `Permissive`
-/// accepts any non-empty credential — matching what GitHub itself cannot do
-/// for us (validate third-party registration tokens) but recreating the
-/// original "anyone who can reach the port can register a runner" hole, so it
-/// exists only for the conformance harness, which replays real GitHub-issued
-/// registration tokens this control plane could never have minted.
+/// accepts any non-empty credential on the TCP registration endpoint —
+/// matching what GitHub itself cannot do for us (validate third-party
+/// registration tokens) but recreating the original "anyone who can reach the
+/// port can register a runner" hole. The mounted socket remains strict even
+/// in permissive mode, so workflow code cannot mint a new runner identity.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum RegistrationPolicy {
     /// Only the system credential may register a runner.
@@ -364,10 +393,41 @@ pub struct AppState {
     /// lock.  Monotonically increases; the inner counter is no longer the
     /// source of truth once this is in use.
     pub(crate) next_request_id: Arc<std::sync::atomic::AtomicI64>,
+    /// Observability handle (cloneable, holds heartbeat & limit registries).
+    pub(crate) observability: preloop_observability::Observability,
+    /// Cached operational snapshot, updated every 5s by the sampler without holding `inner`.
+    pub status_snapshot:
+        Arc<parking_lot::RwLock<preloop_observability::status::OperationalSnapshot>>,
+    /// (run, job) pairs whose terminal transition has already been recorded
+    /// (`preloop.job.completed` metric + terminal log). Seeded from the
+    /// restored run record at startup; guards `emit` so a replayed terminal
+    /// `JobStatus` (repeated timeline PATCH after completion) is recorded
+    /// exactly once per job.
+    pub(crate) terminal_jobs_recorded: Arc<std::sync::Mutex<BTreeSet<(RunId, JobId)>>>,
+    /// Consolidated pool handle replacing the four ad-hoc Option<Arc<…>> fields.
+    pub pool_status: Arc<preloop_observability::status::PoolStatus>,
+    /// When this AppState was created (for uptime).
+    pub(crate) started_at: std::time::Instant,
     /// Jobs accepted and still waiting for a runner, refreshed whenever one
     /// is claimed. A supervising runner pool reads it to decide whether the
     /// work already queued outruns the runners it has left.
     pub queue_depth: Arc<std::sync::atomic::AtomicUsize>,
+    /// Plan 000 step 4 probe — broker job-lifecycle calls (`renewjob`,
+    /// `completejob`) that authenticated with the bare runner *listen* token
+    /// instead of the job runtime token.
+    ///
+    /// Plan 004's fencing carrier mints the claim generation into the job
+    /// runtime token, so it only works if the worker never drives those two
+    /// routes with the listener credential. This counter is the gate: it must
+    /// stay at zero across a full official-runner dogfood. Per instance, not
+    /// process-global — a test binary or a multi-server host would otherwise
+    /// aggregate unrelated servers into one meaningless number.
+    pub(crate) listener_token_lifecycle_calls: Arc<std::sync::atomic::AtomicU64>,
+    /// Companion baseline: `acquirejob` calls on the listen token. The
+    /// Listener process owns that call and holds no job token yet, so this is
+    /// the *expected* credential there and is counted separately so it can
+    /// never mask [`Self::listener_token_lifecycle_calls`].
+    pub(crate) listener_token_acquire_calls: Arc<std::sync::atomic::AtomicU64>,
     /// Raised while a co-hosted runner pool is still preparing its machine
     /// image and cannot register a runner yet; see [`ServerConfig`]. The
     /// starvation sweep pauses the queued-job grace clock while it is set.
@@ -445,6 +505,10 @@ pub struct AppState {
     /// global `inner` mutex, and never acquire `inner` while holding it —
     /// the secrets handlers touch neither ordering partner.
     pub(crate) secret_mutation: Arc<Mutex<()>>,
+    /// Serializes full-state snapshots with the snapshot capture. A snapshot
+    /// taken before another request mutates `inner` must not be allowed to
+    /// overwrite that newer mutation after an async store write completes.
+    pub(crate) store_mutation: Arc<Mutex<()>>,
     /// The config file this engine is pinned to, resolved once at startup.
     ///
     /// Every engine-side read and write of configuration goes through this
@@ -552,6 +616,96 @@ pub(crate) enum JobSetAdmissionResult {
     Blocked,
 }
 
+/// Bounded conclusion label for a terminal execution status.
+fn execution_conclusion(status: preloop_gha_protocol::ExecutionStatus) -> &'static str {
+    use preloop_gha_protocol::ExecutionStatus as S;
+    match status {
+        S::Success => "success",
+        S::Failure => "failure",
+        S::Cancelled => "cancelled",
+        S::Skipped => "skipped",
+        // Non-terminal statuses never reach here; the guard filters them.
+        _ => "unrecognized",
+    }
+}
+
+/// Classify a termination reason into a bounded code.
+///
+/// The control plane's `reason` is not a code — several paths build a prose
+/// sentence that interpolates the job's `runs-on` labels (see the starvation
+/// sweep in `bootstrap.rs`). Those values are user-controlled, so the raw
+/// string must never reach a metric label: it would both explode cardinality
+/// and export workflow content. Classify by the stable prefix each path
+/// writes, and fall back to `unrecognized` rather than passing prose through.
+///
+/// The full message is still available on the structured log record; only the
+/// metric dimension is bounded.
+fn bounded_termination_reason(value: &str) -> &'static str {
+    // Exact codes first — these come from `concurrency::*_reason()`.
+    match value {
+        "concurrency_pending" => return "concurrency_pending",
+        "concurrency_cancelled" => return "concurrency_cancelled",
+        "timeout" => return "timeout",
+        "no_runner" => return "no_runner",
+        "lease_expired" => return "lease_expired",
+        "deaf_runner" => return "deaf_runner",
+        "startup_orphan" => return "startup_orphan",
+        _ => {}
+    }
+    // Prose paths — match on the invariant phrase, never the whole string, so
+    // an interpolated label or platform cannot change the classification.
+    //
+    // Two distinct never-claimable conditions, and conflating them would hide
+    // the difference between "wait or add capacity" and "this will never work
+    // until you register that platform":
+    //   - the starvation sweep, which fires after a grace window;
+    //   - the external-host check, where the server has no runner of that
+    //     platform class at all (`no {platform} runner is registered with
+    //     this server, so `runs-on: …` cannot be scheduled`).
+    // The starvation prose interpolates workflow-controlled `runs-on`
+    // labels, so the anchored prefix MUST be checked before the substring:
+    // a crafted label containing the platform phrase must not flip a
+    // starvation reason into `no_platform_runner`.
+    if value.starts_with("no runner is registered for") {
+        return "no_runner";
+    }
+    if value.contains("runner is registered with this server") {
+        return "no_platform_runner";
+    }
+    if value.starts_with("job exceeded its timeout")
+        || value.starts_with("timed out")
+        || value.contains("timeout-minutes")
+    {
+        return "timeout";
+    }
+    if value.starts_with("runner stopped polling") || value.contains("deaf") {
+        return "deaf_runner";
+    }
+    if value.contains("lease expired") {
+        return "lease_expired";
+    }
+    "unrecognized"
+}
+
+/// Bound free-form reason prose for export as a telemetry attribute. The
+/// prose interpolates workflow input (e.g. `runs-on` labels), so one job
+/// must not emit an arbitrarily large attribute. Truncation cuts on a
+/// character boundary — byte slicing panics on multi-byte input.
+fn bounded_reason_detail(detail: &str) -> String {
+    const DETAIL_MAX: usize = 512;
+    let mut detail = detail.to_string();
+    if detail.len() > DETAIL_MAX {
+        let cut = detail
+            .char_indices()
+            .map(|(i, _)| i)
+            .take_while(|&i| i <= DETAIL_MAX)
+            .last()
+            .unwrap_or(0);
+        detail.truncate(cut);
+    }
+    detail
+}
+
 impl AppState {
     pub async fn new(state_dir: PathBuf) -> anyhow::Result<Self> {
         let config_path = crate::config::config_path();
@@ -598,8 +752,22 @@ impl AppState {
         let (keypair_result, oidc_result) = tokio::join!(keypair_handle, oidc_handle);
         let keypair = keypair_result??;
         let oidc_keypair = oidc_result??;
-        let system_token = env::var("PRELOOP_SYSTEM_TOKEN")
-            .unwrap_or_else(|_| DEFAULT_PRELOOP_SYSTEM_TOKEN.to_owned());
+        let token_dir = crate::credential_store::engine_token_dir(&state_dir);
+        let configured_token = env::var("PRELOOP_SYSTEM_TOKEN").ok();
+        #[cfg(test)]
+        let system_token = {
+            let configured_token =
+                configured_token.or_else(|| Some(DEFAULT_PRELOOP_SYSTEM_TOKEN.to_owned()));
+            let store = crate::credential_store::MemoryCredentialStore::default();
+            crate::credential_store::resolve_engine_token_with_store(
+                &token_dir,
+                configured_token,
+                &store,
+            )?
+        };
+        #[cfg(not(test))]
+        let system_token =
+            crate::credential_store::resolve_engine_token(&token_dir, configured_token)?;
         #[cfg(test)]
         let local_jwt_key = TEST_LOCAL_JWT_KEY.to_vec();
         #[cfg(not(test))]
@@ -610,7 +778,16 @@ impl AppState {
                 if let Ok(map) = serde_json::from_str::<BTreeMap<String, ArtifactV2Entry>>(&content)
                 {
                     let max_id = map.values().map(|e| e.id).max().unwrap_or(0);
-                    (map, max_id)
+                    let mut migrated = BTreeMap::new();
+                    for (k, v) in map {
+                        let parts: Vec<&str> = k.split('/').collect();
+                        if parts.len() >= 3 {
+                            migrated.insert(format!("{}/{}", parts[0], parts[2..].join("/")), v);
+                        } else {
+                            migrated.insert(k, v);
+                        }
+                    }
+                    (migrated, max_id)
                 } else {
                     (BTreeMap::new(), 0)
                 }
@@ -637,6 +814,49 @@ impl AppState {
         let store = crate::store::open_store(store_url, &state_dir, &local_jwt_key).await?;
         let mut recovered = inner;
         store.load_into(&mut recovered).await?;
+        // An attempt dispatched but not yet reported has no persisted step
+        // rows: seeding happens in memory, and only a runner report writes
+        // them. The request message it was built from *is* persisted, so
+        // rebuild from that rather than leaving the run with no declared steps
+        // and `--step` answering 409 for logs that are on disk.
+        //
+        // Two homes, depending on how far the job got: `broker_messages` once
+        // a runner claimed it, and the queue row's own copy before that.
+        let rebuilt: Vec<(uuid::Uuid, Vec<crate::models::StepRecord>)> = recovered
+            .job_requests
+            .values()
+            .filter(|record| !recovered.job_steps.contains_key(&record.agent_job_id))
+            .filter_map(|record| {
+                let steps = recovered
+                    .broker_messages
+                    .get(&record.request_id)
+                    .map(|message| message.steps.as_slice())
+                    .or_else(|| {
+                        recovered
+                            .queue
+                            .iter()
+                            .chain(recovered.pending_jobs.iter())
+                            .chain(recovered.concurrency_blocked.iter())
+                            // Keyed by request id, not by (run, job): a
+                            // re-dispatch leaves several requests for one
+                            // logical job, and matching the pair attaches the
+                            // newest queued message to an older attempt —
+                            // rebuilding it with the wrong `TaskStep` ids, so
+                            // its `step-<id>.txt` blobs stop resolving.
+                            .find(|job| job.message.request_id == record.request_id)
+                            .map(|job| job.message.steps.as_slice())
+                    })?;
+                let manifest = crate::models::StepRecord::manifest(steps);
+                (!manifest.is_empty()).then_some((record.agent_job_id, manifest))
+            })
+            .collect();
+        if !rebuilt.is_empty() {
+            tracing::info!(
+                attempts = rebuilt.len(),
+                "rebuilt step manifests from persisted job request messages"
+            );
+        }
+        recovered.job_steps.extend(rebuilt);
         let next_request_id = recovered
             .job_requests
             .keys()
@@ -645,6 +865,21 @@ impl AppState {
             .unwrap_or(0)
             .saturating_add(1);
         let inner = recovered;
+        // Seed the terminal-transition marker from the restored run record so
+        // a replayed terminal `JobStatus` after a restart cannot double-record
+        // `preloop.job.completed` for a job that already completed.
+        let terminal_jobs_recorded = Arc::new(std::sync::Mutex::new(
+            inner
+                .runs
+                .iter()
+                .flat_map(|(run_id, run)| {
+                    run.jobs
+                        .iter()
+                        .filter(|(_, status)| status.is_terminal())
+                        .map(move |(job_id, _)| (*run_id, job_id.clone()))
+                })
+                .collect::<BTreeSet<(RunId, JobId)>>(),
+        ));
         // Capture queue length before moving `inner` into the Mutex so the
         // `queue_depth` atomic is set to the recovered ready-queue size.
         let recovered_queue_len = inner.queue.len();
@@ -681,16 +916,22 @@ impl AppState {
             .or_else(|| {
                 config
                     .github
-                    .webhook_secret
-                    .clone()
+                    .webhook_secret()
                     .filter(|secret| !secret.is_empty())
+                    .map(str::to_owned)
             });
         // Env wins over the config file, matching every other `PRELOOP_GITHUB_*`
         // override. An empty value in either source counts as unset.
         let github_pat = env::var("PRELOOP_GITHUB_TOKEN")
             .ok()
             .filter(|pat| !pat.is_empty())
-            .or_else(|| config.github.pat.clone().filter(|pat| !pat.is_empty()))
+            .or_else(|| {
+                config
+                    .github
+                    .pat()
+                    .filter(|pat| !pat.is_empty())
+                    .map(str::to_owned)
+            })
             .map(preloop_gha_protocol::SecretString::new);
         // Env wins over the config file, matching every other `PRELOOP_GITHUB_*`
         // override; an empty value in either source counts as unset.
@@ -786,10 +1027,19 @@ impl AppState {
             events,
             message_notify: Arc::new(Notify::new()),
             next_request_id: Arc::new(std::sync::atomic::AtomicI64::new(next_request_id)),
+            observability: preloop_observability::Observability::noop(),
+            status_snapshot: Arc::new(parking_lot::RwLock::new(
+                preloop_observability::status::OperationalSnapshot::default(),
+            )),
+            terminal_jobs_recorded,
+            pool_status: Arc::new(preloop_observability::status::PoolStatus::default()),
+            started_at: std::time::Instant::now(),
             // Mirror the recovered ready-queue size so an on-demand runner
             // pool spawns against the right workload after restart.
             queue_depth: Arc::new(std::sync::atomic::AtomicUsize::new(recovered_queue_len)),
             pool_preparing: None,
+            listener_token_lifecycle_calls: Arc::new(std::sync::atomic::AtomicU64::new(0)),
+            listener_token_acquire_calls: Arc::new(std::sync::atomic::AtomicU64::new(0)),
             next_job_runs_on: Arc::new(std::sync::RwLock::new(Vec::new())),
             cache,
             artifacts,
@@ -803,6 +1053,7 @@ impl AppState {
             scheduler: None,
             secrets,
             secret_mutation: Arc::new(Mutex::new(())),
+            store_mutation: Arc::new(Mutex::new(())),
             github_app,
             github_apps,
             dispatch_token_cache: Arc::new(crate::dispatch_auth::InstallationTokenCache::default()),
@@ -826,6 +1077,93 @@ impl AppState {
             _ => None,
         };
         let has_run_projection = run_id.is_some();
+        if let NdjsonEvent::RunAccepted { queued_jobs, .. } = &event {
+            self.observability.export_log(
+                "INFO",
+                "run.accepted",
+                vec![
+                    ("event.name".to_string(), "run.accepted".to_string()),
+                    ("queued_jobs".to_string(), queued_jobs.to_string()),
+                ],
+            );
+        }
+        // Record job terminal transitions exactly once per job. `is_terminal`
+        // alone is not enough: repeated timeline PATCHes (and replayed
+        // completions) can re-deliver a terminal `JobStatus` after the job
+        // already completed, and every delivery would inflate
+        // `preloop.job.completed` and duplicate the terminal log record.
+        // The first terminal event for a job wins; the marker is seeded from
+        // the restored run record at startup so a post-restart replay cannot
+        // double-record either. Recording here rather than at the state
+        // mutation avoids double-counting on duplicate `store_run_event`
+        // emits. A duplicate event is still a duplicate — drop it entirely
+        // (side effects, persistence and broadcast) rather than re-append the
+        // same terminal record to the timeline.
+        match &event {
+            NdjsonEvent::JobStatus {
+                run_id,
+                job_id,
+                status,
+                reason,
+                ..
+            } if status.is_terminal() => {
+                let first_terminal = self
+                    .terminal_jobs_recorded
+                    .lock()
+                    .unwrap_or_else(|poisoned| poisoned.into_inner())
+                    .insert((*run_id, job_id.clone()));
+                if !first_terminal {
+                    return;
+                }
+                let conclusion = execution_conclusion(*status);
+                // `reason: None` is the common case (most terminal transitions
+                // carry none) and means "no reason supplied" — not
+                // "unrecognized". Only a value outside the emitted set is
+                // `unrecognized`, which keeps the label bounded without
+                // mislabelling the majority.
+                let bounded_reason = match reason.as_deref() {
+                    None => "unspecified",
+                    Some(value) => bounded_termination_reason(value),
+                };
+                self.observability
+                    .metrics()
+                    .lifecycle
+                    .record_job_completed(conclusion, bounded_reason);
+                self.observability.export_log(
+                    if *status == preloop_gha_protocol::ExecutionStatus::Success {
+                        "INFO"
+                    } else {
+                        "WARN"
+                    },
+                    // A terminal JobStatus is a status transition, not the
+                    // separate JobCompleted event; naming both `job.completed`
+                    // conflated two distinct records in the log stream.
+                    "job.status.terminal",
+                    {
+                        let mut attributes = vec![
+                            ("event.name".to_string(), "job.status.terminal".to_string()),
+                            ("conclusion".to_string(), conclusion.to_string()),
+                            ("reason".to_string(), bounded_reason.to_string()),
+                        ];
+                        // The bounded code is the metric dimension; the prose
+                        // is what an operator actually needs to act. Logs may
+                        // carry it (they are not a label space), and without
+                        // it an `unrecognized` classification is a dead end —
+                        // you cannot tell which path produced it.
+                        if let Some(detail) = reason.as_deref() {
+                            attributes
+                                .push(("reason.detail".to_string(), bounded_reason_detail(detail)));
+                        }
+                        attributes
+                    },
+                );
+            }
+            // `NdjsonEvent::JobCompleted` has no constructor anywhere in the
+            // workspace — the terminal transition is reported as a terminal
+            // `JobStatus`, which the arm above records. Keeping a counter
+            // call here would make the record look double-sourced.
+            _ => {}
+        }
         // Capture the projection under the lock, then persist after releasing
         // it: a slow or unavailable backend must not stall the control plane
         // (runner polling, heartbeats, other state mutations).
@@ -1065,6 +1403,8 @@ impl InnerState {
 
 #[derive(Default)]
 pub(crate) struct InnerState {
+    /// Snapshot sequence allocated while the state mutex is held; restored from metadata.
+    pub(crate) metadata_revision: std::sync::atomic::AtomicU64,
     pub(crate) runs: BTreeMap<RunId, RunRecord>,
     pub(crate) workflow_run_counters: BTreeMap<String, u64>,
     pub(crate) queue: VecDeque<QueuedJob>,
@@ -1158,6 +1498,10 @@ pub(crate) struct InnerState {
     pub(crate) artifacts: BTreeMap<String, ArtifactRecord>,
     pub(crate) logs: BTreeMap<String, Vec<u8>>,
     pub(crate) log_metadata: BTreeMap<String, LogMetadata>,
+    /// Sum of all retained in-memory log byte lengths (`logs` values). Kept
+    /// incrementally so `trim_plan_logs` can early-return in the common case
+    /// without rescanning the whole map on every append.
+    pub(crate) log_bytes_total: usize,
     pub(crate) timeline_events: BTreeMap<RunId, Vec<NdjsonEvent>>,
     /// Per-timeline changeId counter for timeline PATCH versioning.
     pub(crate) timeline_change_ids: BTreeMap<String, i32>,
@@ -1166,8 +1510,31 @@ pub(crate) struct InnerState {
     pub(crate) timeline_records: BTreeMap<String, BTreeMap<uuid::Uuid, azdo::TimelineRecord>>,
     pub(crate) live_log_lines: BTreeMap<String, Arc<tokio::sync::Mutex<LiveLogBuffer>>>,
     pub(crate) live_log_tx: BTreeMap<String, broadcast::Sender<LiveLogFeedLinesWrapper>>,
+    /// Live-log keys whose job has reached a terminal state. A follower that
+    /// connects at or after completion serves the retained snapshot and then
+    /// ends, instead of subscribing to a channel that will never speak again.
+    /// Cleared if the same key ingests fresh lines (a retry reusing the job).
+    pub(crate) live_log_closed: std::collections::BTreeSet<String>,
     pub(crate) inflight_requests: BTreeMap<i64, (RunId, JobId)>,
     pub(crate) job_requests: BTreeMap<i64, TaskAgentJobRequestRecord>,
+    /// Step records per job attempt, keyed by `agent_job_id`.
+    ///
+    /// Authoritative for both the run record's step projection and `--step`
+    /// log selection. Keyed by attempt, not by job: a re-dispatch mints fresh
+    /// `TaskStep` ids, so a job-scoped map would overwrite the mapping the
+    /// previous attempt's `step-<id>.txt` blobs are still named after.
+    ///
+    /// Seeded from the job request message at dispatch (every declared step,
+    /// in workflow order); runner reports only reconcile into it.
+    pub(crate) job_steps: BTreeMap<uuid::Uuid, Vec<crate::models::StepRecord>>,
+    /// Monotonic revision per attempt, bumped whenever `job_steps` changes.
+    ///
+    /// Reconciliation snapshots a manifest under this lock and writes it after
+    /// releasing it, so two reports for one attempt can commit out of order.
+    /// The revision travels with the write and the upsert refuses to move a
+    /// row backwards, so an older snapshot cannot overwrite newer conclusions.
+    /// In memory only: the persisted column is what it guards.
+    pub(crate) job_steps_revision: BTreeMap<uuid::Uuid, u64>,
     pub(crate) plan_requests: BTreeMap<String, i64>,
     pub(crate) agent_job_requests: BTreeMap<uuid::Uuid, i64>,
     pub(crate) timeline_requests: BTreeMap<uuid::Uuid, i64>,
@@ -1187,6 +1554,23 @@ pub(crate) struct InnerState {
     pub(crate) cache_v2_pending: BTreeMap<String, CacheV2Pending>,
     /// Cache v2 download tokens: dl_token → (key, version).
     pub(crate) cache_v2_dl_tokens: BTreeMap<String, (String, String)>,
+    /// Cache v2 download-token mint order (FIFO eviction). In-memory only:
+    /// restored tokens have no entry and are evicted only when the cap is
+    /// exceeded, never by age.
+    pub(crate) cache_v2_dl_tokens_order: VecDeque<String>,
+    /// Cache v2 download-token mint time (unix seconds), for the TTL sweep.
+    /// In-memory only, like `cache_v2_dl_tokens_order`.
+    pub(crate) cache_v2_dl_tokens_created: BTreeMap<String, i64>,
+    /// Insertion order for timeline keys (`{plan}/{timeline}`) — FIFO for
+    /// global eviction. In-memory only.
+    pub(crate) timeline_records_order: VecDeque<String>,
+    /// Insertion order for run event buckets — FIFO for global eviction.
+    pub(crate) timeline_events_order: VecDeque<RunId>,
+    /// Finalization order for artifact registry — FIFO for global and
+    /// per-run eviction. In-memory only.
+    pub(crate) artifact_registry_order: VecDeque<String>,
+    /// Insertion order for log keys — FIFO for global log eviction.
+    pub(crate) log_order: VecDeque<String>,
     /// Artifact v2 Twirp pending uploads: upload_token → registry_key.
     pub(crate) artifact_v2_pending: BTreeMap<String, ArtifactV2Pending>,
     /// Artifact v2 finalized registry: registry_key → metadata.
@@ -1270,5 +1654,128 @@ mod tests {
             !state.verify_action_ticket("acme", "repo\nv1", "x", expires_at, &signature),
             "a ticket for one action must not validate for a newline-split twin"
         );
+    }
+    /// The fork-tier resolver used to take the scope's last `:` component,
+    /// so `Actions.Results:{plan}:extra:{job}` parsed where the canonical
+    /// parser rejects. Both must agree: extra components are malformed.
+    #[test]
+    fn results_job_from_payload_rejects_extra_scope_components() {
+        let job = uuid::Uuid::new_v4();
+        let payload = serde_json::json!({
+            "sub": format!("preloop-job-{job}"),
+            "scp": format!("Actions.Results:plan:extra:{job}"),
+        });
+        assert_eq!(AppState::results_job_from_payload(&payload), None);
+        let payload = serde_json::json!({
+            "sub": format!("preloop-job-{job}"),
+            "scp": format!("Actions.Results:plan:{job}"),
+        });
+        assert_eq!(
+            AppState::results_job_from_payload(&payload),
+            Some(("plan".to_owned(), job))
+        );
+    }
+}
+
+#[cfg(test)]
+mod termination_reason_tests {
+    use super::bounded_termination_reason;
+
+    #[test]
+    fn exact_codes_pass_through() {
+        assert_eq!(
+            bounded_termination_reason("concurrency_cancelled"),
+            "concurrency_cancelled"
+        );
+        assert_eq!(bounded_termination_reason("timeout"), "timeout");
+    }
+
+    #[test]
+    fn starvation_prose_classifies_to_no_runner() {
+        // The starvation sweep builds this sentence with the job's runs-on
+        // labels interpolated. It must classify, not pass through.
+        let prose = "no runner is registered for `runs-on: self-hosted, Linux, ARM64` and none \
+                     appeared within 120s, so the job cannot be scheduled";
+        assert_eq!(bounded_termination_reason(prose), "no_runner");
+    }
+
+    #[test]
+    fn user_controlled_labels_never_become_the_label() {
+        // A hostile or merely unusual `runs-on` must not reach the metric.
+        let prose = "no runner is registered for `runs-on: attacker-controlled-\u{1F4A5}-label` \
+                     and none appeared within 120s, so the job cannot be scheduled";
+        let bounded = bounded_termination_reason(prose);
+        assert_eq!(bounded, "no_runner");
+        assert!(!bounded.contains("attacker"));
+    }
+
+    #[test]
+    fn external_host_prose_is_its_own_code() {
+        // `{platform}` is interpolated, so match the invariant phrase.
+        for platform in ["windows", "macos", "freebsd-13"] {
+            let prose = format!(
+                "no {platform} runner is registered with this server, so \
+                 `runs-on: {platform}-latest` cannot be scheduled"
+            );
+            assert_eq!(
+                bounded_termination_reason(&prose),
+                "no_platform_runner",
+                "{platform} must classify distinctly from the starvation sweep"
+            );
+        }
+    }
+
+    #[test]
+    fn reason_detail_is_bounded_on_a_char_boundary() {
+        use super::bounded_reason_detail;
+        // 4-byte characters: 300 of them is 1200 bytes, way over the cap.
+        let long = "w".repeat(300);
+        let bounded = bounded_reason_detail(&long);
+        assert!(bounded.len() <= 512);
+        assert!(bounded.is_char_boundary(bounded.len()));
+        // Short prose passes through untouched.
+        assert_eq!(bounded_reason_detail("short"), "short");
+    }
+
+    #[test]
+    fn crafted_runs_on_label_cannot_flip_the_classification() {
+        // The starvation prose interpolates `runs-on` labels verbatim. A
+        // label containing the platform phrase must still classify as
+        // `no_runner` — the anchored prefix is checked first.
+        let starved = "no runner is registered for `runs-on: self-hosted, \
+                       runner is registered with this server` and none \
+                       appeared within 120s, so the job cannot be scheduled";
+        assert_eq!(bounded_termination_reason(starved), "no_runner");
+    }
+
+    #[test]
+    fn platform_and_starvation_do_not_collide() {
+        let starved = "no runner is registered for `runs-on: self-hosted, Linux, ARM64` and none \
+                       appeared within 120s, so the job cannot be scheduled";
+        let platform = "no windows runner is registered with this server, so \
+                        `runs-on: windows-latest` cannot be scheduled";
+        assert_eq!(bounded_termination_reason(starved), "no_runner");
+        assert_eq!(bounded_termination_reason(platform), "no_platform_runner");
+    }
+
+    #[test]
+    fn unknown_prose_is_bounded_not_passed_through() {
+        let bounded = bounded_termination_reason("something entirely new happened with id-99999");
+        assert_eq!(bounded, "unrecognized");
+        assert!(!bounded.contains("99999"));
+    }
+
+    #[test]
+    fn classification_is_a_finite_set() {
+        // Drive 1,000 distinct prose strings; the label set must stay bounded.
+        let mut seen = std::collections::BTreeSet::new();
+        for i in 0..1000 {
+            let prose = format!(
+                "no runner is registered for `runs-on: label-{i}` and none appeared within 120s"
+            );
+            seen.insert(bounded_termination_reason(&prose));
+            seen.insert(bounded_termination_reason(&format!("novel reason {i}")));
+        }
+        assert_eq!(seen.len(), 2, "expected exactly no_runner + unrecognized");
     }
 }

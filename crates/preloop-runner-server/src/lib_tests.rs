@@ -137,6 +137,8 @@ async fn sqlite_recovery_restores_queued_runs_and_next_run_number() {
                 CacheV2Pending {
                     key: "cache-key".to_owned(),
                     version: "cache-version".to_owned(),
+                    job_backend_id: String::new(),
+                    created_unix: 0,
                 },
             );
             state
@@ -745,6 +747,8 @@ async fn openapi_document_lists_native_surface_and_excludes_runner_protocol() {
     let document: serde_json::Value = serde_json::from_slice(&body).unwrap();
     let paths = document["paths"].as_object().unwrap();
     assert!(paths.contains_key("/api/v1/runs"));
+    assert!(paths.contains_key("/api/v1/runs/{run_id}/logs"));
+    assert!(paths.contains_key("/api/v1/runs/{run_id}/logs/live"));
     assert!(paths.contains_key("/api/v1/debug/sessions"));
     assert!(!paths.keys().any(|path| path.starts_with("/_apis/")));
     assert!(!paths.keys().any(|path| path.starts_with("/broker/")));
@@ -1660,6 +1664,7 @@ jobs:
   deploy:
     needs: [build]
     runs-on: ubuntu-latest
+    environment: ${{ needs.build.outputs.environment }}
     steps:
       - run: echo deploy
 "#,
@@ -1678,7 +1683,7 @@ jobs:
             "run_id": run_id,
             "job_id": "build",
             "status": "success",
-            "outputs": {"artifact": "dist.tgz"}
+            "outputs": {"artifact": "dist.tgz", "environment": "staging"}
         }),
     )
     .await;
@@ -1690,6 +1695,14 @@ jobs:
         .find(|job| job.job_id.0 == "deploy")
         .expect("deploy job should be promoted");
     let needs = deploy.message.context_data.get("needs").unwrap();
+    assert_eq!(
+        deploy
+            .message
+            .actions_environment
+            .as_ref()
+            .map(|environment| environment.name.as_str()),
+        Some("staging")
+    );
     let azdo::PipelineContextData::Dict(needs) = needs else {
         panic!("needs context should be a dict");
     };
@@ -2203,7 +2216,7 @@ jobs:
         &app,
         Method::PATCH,
         &format!("/_apis/v1/Timeline/scope/actions/{run_id}/timeline-1"),
-        json!({"count": 1, "value": [{
+        json!({"count": 2, "value": [{
             "id": "00000000-0000-0000-0000-000000000001",
             "name": "build",
             "type": "job",
@@ -2213,6 +2226,19 @@ jobs:
                 "type": "error",
                 "message": "boom",
                 "data": {"file": "src/lib.rs", "line": "42"}
+            }]
+        }, {
+            // A typed step with no `parentId`. The manifest path counts this as
+            // a step, so the annotation path must scope its issue to the step
+            // rather than reporting it against the job.
+            "id": "00000000-0000-0000-0000-000000000002",
+            "name": "Run echo one",
+            "type": "Task",
+            "state": "completed",
+            "result": "failed",
+            "issues": [{
+                "type": "error",
+                "message": "step boom"
             }]
         }]}),
     )
@@ -2235,6 +2261,76 @@ jobs:
     assert!(events.contains("\"type\":\"annotation\""));
     assert!(events.contains("\"message\":\"boom\""));
     assert!(events.contains("\"status\":\"failure\""));
+
+    // The step's issue is scoped to the step; the job's stays job-level. Both
+    // paths deciding "is this a step" differently is what put a record in the
+    // manifest while its annotation pointed at the job.
+    let step_annotation = events
+        .lines()
+        .find(|line| line.contains("\"step boom\""))
+        .expect("the step's annotation must be projected");
+    assert!(
+        step_annotation.contains("\"step_id\":\"00000000-0000-0000-0000-000000000002\""),
+        "a typed step's issue must carry its step id: {step_annotation}"
+    );
+    let job_annotation = events
+        .lines()
+        .find(|line| line.contains("\"boom\"") && !line.contains("\"step boom\""))
+        .expect("the job's annotation must be projected");
+    assert!(
+        !job_annotation.contains("\"step_id\""),
+        "the job record's issue must stay job-level: {job_annotation}"
+    );
+}
+
+/// Following a re-dispatched job streams the current attempt, not the first.
+///
+/// `job_requests` is keyed by monotonic request id, so selecting with `find`
+/// returned the oldest attempt: after a retry, following the logical job key
+/// subscribed to the dead attempt's feed, which never speaks again.
+#[tokio::test]
+async fn live_log_key_follows_the_newest_attempt() {
+    let temp = tempfile::tempdir().unwrap();
+    let state = AppState::new(temp.path().to_path_buf()).await.unwrap();
+    let app = app(state.clone(), CancellationToken::new());
+    let (run_id, _) = three_step_run_for_log_filters(&app, &state).await;
+
+    // A re-dispatch: a second request for the same logical job, with a higher
+    // request id and its own agent job id.
+    let (first_attempt, second_attempt) = {
+        let mut inner = state.inner.lock().await;
+        let (first_id, first) = inner
+            .job_requests
+            .iter()
+            .find(|(_, record)| record.run_id == run_id && record.job_id.0 == "build")
+            .map(|(id, record)| (*id, record.clone()))
+            .expect("the dispatched attempt");
+        let mut retry = first.clone();
+        retry.request_id = first_id + 1;
+        retry.agent_job_id = uuid::Uuid::new_v4();
+        let second = retry.agent_job_id;
+        inner.job_requests.insert(retry.request_id, retry);
+        (first.agent_job_id, second)
+    };
+    assert_ne!(first_attempt, second_attempt);
+
+    let inner = state.inner.lock().await;
+    let key = crate::live_logs::live_log_key_for_job(&inner, run_id, "build")
+        .expect("a logical job key must resolve");
+    assert_eq!(
+        key,
+        second_attempt.to_string(),
+        "the logical job key must follow the current attempt, not the first"
+    );
+
+    // An explicit agent job id still addresses exactly that attempt, so an
+    // older feed stays reachable when asked for by name.
+    assert_eq!(
+        crate::live_logs::live_log_key_for_job(&inner, run_id, &first_attempt.to_string())
+            .expect("an explicit attempt id must resolve"),
+        first_attempt.to_string(),
+        "an explicit agent job id must not be redirected to another attempt"
+    );
 }
 
 #[tokio::test]
@@ -2597,6 +2693,1495 @@ async fn log_get_run_logs_returns_404_for_unknown_run() {
         .await
         .unwrap();
     assert_eq!(response.status(), StatusCode::NOT_FOUND);
+}
+
+/// Build a two-job run and return `(run_id, [(job_id, plan_id, agent_job_id)])`
+/// ordered by request id, so filter tests can address either job.
+async fn two_job_run_for_log_filters(
+    app: &axum::Router,
+    state: &AppState,
+) -> (RunId, Vec<(String, String, String)>) {
+    let accepted = submit_yaml(
+        app,
+        r#"
+on: push
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - run: echo build
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - run: echo test
+"#,
+        "owner/repo",
+    )
+    .await;
+    let run_id: RunId = accepted["run_id"].as_str().unwrap().parse().unwrap();
+    let jobs = {
+        let inner = state.inner.lock().await;
+        let mut requests: Vec<_> = inner
+            .job_requests
+            .values()
+            .filter(|request| request.run_id == run_id)
+            .collect();
+        requests.sort_by_key(|request| request.request_id);
+        requests
+            .into_iter()
+            .map(|request| {
+                (
+                    request.job_id.0.clone(),
+                    request.plan_id.clone(),
+                    request.agent_job_id.to_string(),
+                )
+            })
+            .collect::<Vec<_>>()
+    };
+    assert_eq!(jobs.len(), 2, "fixture must produce two jobs");
+    (run_id, jobs)
+}
+
+/// Build a run whose `build` job declares three steps.
+///
+/// Step-filter tests need more than one declared step to prove `--step N`
+/// selects the right one.
+async fn three_step_run_for_log_filters(
+    app: &axum::Router,
+    state: &AppState,
+) -> (RunId, Vec<(String, String, String)>) {
+    let accepted = submit_yaml(
+        app,
+        r#"
+on: push
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - run: echo one
+      - run: echo two
+      - run: echo three
+"#,
+        "owner/repo",
+    )
+    .await;
+    let run_id: RunId = accepted["run_id"].as_str().unwrap().parse().unwrap();
+    let jobs = {
+        let inner = state.inner.lock().await;
+        inner
+            .job_requests
+            .values()
+            .filter(|request| request.run_id == run_id)
+            .map(|request| {
+                (
+                    request.job_id.0.clone(),
+                    request.plan_id.clone(),
+                    request.agent_job_id.to_string(),
+                )
+            })
+            .collect::<Vec<_>>()
+    };
+    assert_eq!(jobs.len(), 1, "fixture must produce one job");
+    (run_id, jobs)
+}
+
+/// The declared workflow step ids of a job's latest attempt, in workflow order.
+///
+/// Tests must name their `step-<id>.txt` blobs with these ids and report them
+/// as `external_id`: that is what the official runner does (verified in
+/// `.runner-watch/golden/v2.336.0/06-multi-step`), and the server resolves
+/// `?step=` through this manifest rather than through anything on disk.
+async fn workflow_step_ids(state: &AppState, run_id: RunId, job: &str) -> Vec<String> {
+    let inner = state.inner.lock().await;
+    let agent_job_id = inner
+        .job_requests
+        .values()
+        .filter(|request| request.run_id == run_id && request.job_id.0 == job)
+        .max_by_key(|request| request.request_id)
+        .map(|request| request.agent_job_id)
+        .expect("job must have been dispatched");
+    inner
+        .job_steps
+        .get(&agent_job_id)
+        .map(|records| {
+            crate::models::StepRecord::workflow_steps(records)
+                .into_iter()
+                .map(|step| step.id.clone())
+                .collect()
+        })
+        .unwrap_or_default()
+}
+
+async fn get_logs(app: &axum::Router, uri: String) -> (StatusCode, Vec<u8>) {
+    let response = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method(Method::GET)
+                .uri(uri)
+                .header(header::AUTHORIZATION, "Bearer preloop-system-token")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    let status = response.status();
+    let body = to_bytes(response.into_body(), usize::MAX).await.unwrap();
+    (status, body.to_vec())
+}
+
+/// Write `job-logs.txt` for one job.
+async fn write_merged_job_log(temp: &tempfile::TempDir, plan: &str, agent: &str, body: &str) {
+    let dir = temp
+        .path()
+        .join("replay")
+        .join("results")
+        .join(plan)
+        .join(agent);
+    tokio::fs::create_dir_all(&dir).await.unwrap();
+    tokio::fs::write(dir.join("job-logs.txt"), body.as_bytes())
+        .await
+        .unwrap();
+}
+
+/// Write ordered per-step logs for one job. Mtimes are spaced so the handler's
+/// (mtime, name) ordering is deterministic.
+async fn write_step_job_logs(
+    temp: &tempfile::TempDir,
+    plan: &str,
+    agent: &str,
+    steps: &[(&str, &str)],
+) {
+    let dir = temp
+        .path()
+        .join("replay")
+        .join("results")
+        .join(plan)
+        .join(agent);
+    tokio::fs::create_dir_all(&dir).await.unwrap();
+    for (name, body) in steps {
+        tokio::fs::write(dir.join(format!("step-{name}.txt")), body.as_bytes())
+            .await
+            .unwrap();
+        tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+    }
+}
+
+#[tokio::test]
+async fn log_run_logs_job_filter_returns_only_that_job() {
+    let temp = tempfile::tempdir().unwrap();
+    let state = AppState::new(temp.path().to_path_buf()).await.unwrap();
+    let app = app(state.clone(), CancellationToken::new());
+    let (run_id, jobs) = two_job_run_for_log_filters(&app, &state).await;
+    write_merged_job_log(&temp, &jobs[0].1, &jobs[0].2, "build output\n").await;
+    write_merged_job_log(&temp, &jobs[1].1, &jobs[1].2, "test output\n").await;
+
+    // Unfiltered still merges every job, in request order.
+    let (status, body) = get_logs(&app, format!("/api/v1/runs/{run_id}/logs")).await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(body, b"build output\ntest output\n");
+
+    // Filtering by the workflow job key returns only that job.
+    let (status, body) = get_logs(&app, format!("/api/v1/runs/{run_id}/logs?job=test")).await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(
+        body, b"test output\n",
+        "job filter must exclude the other job"
+    );
+
+    let (status, body) = get_logs(&app, format!("/api/v1/runs/{run_id}/logs?job=build")).await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(body, b"build output\n");
+}
+
+#[tokio::test]
+async fn log_run_logs_job_filter_accepts_agent_job_uuid() {
+    let temp = tempfile::tempdir().unwrap();
+    let state = AppState::new(temp.path().to_path_buf()).await.unwrap();
+    let app = app(state.clone(), CancellationToken::new());
+    let (run_id, jobs) = two_job_run_for_log_filters(&app, &state).await;
+    write_merged_job_log(&temp, &jobs[0].1, &jobs[0].2, "build output\n").await;
+    write_merged_job_log(&temp, &jobs[1].1, &jobs[1].2, "test output\n").await;
+
+    // The live-log feed accepts either identifier; so must this.
+    let agent_uuid = &jobs[1].2;
+    let (status, body) =
+        get_logs(&app, format!("/api/v1/runs/{run_id}/logs?job={agent_uuid}")).await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(body, b"test output\n");
+}
+
+#[tokio::test]
+async fn log_run_logs_unknown_job_is_404_not_whole_run() {
+    let temp = tempfile::tempdir().unwrap();
+    let state = AppState::new(temp.path().to_path_buf()).await.unwrap();
+    let app = app(state.clone(), CancellationToken::new());
+    let (run_id, jobs) = two_job_run_for_log_filters(&app, &state).await;
+    write_merged_job_log(&temp, &jobs[0].1, &jobs[0].2, "build output\n").await;
+
+    let (status, body) = get_logs(
+        &app,
+        format!("/api/v1/runs/{run_id}/logs?job=does-not-exist"),
+    )
+    .await;
+    assert_eq!(
+        status,
+        StatusCode::NOT_FOUND,
+        "a bogus job must fail loudly, never fall back to the full run"
+    );
+    assert!(
+        !String::from_utf8_lossy(&body).contains("build output"),
+        "404 body must not leak the unfiltered log"
+    );
+}
+
+/// A restart before the first step report keeps the declared steps.
+///
+/// Only a runner report writes step rows, so an attempt dispatched and then
+/// interrupted has none. Its request message is persisted, and that message is
+/// what the manifest was built from, so startup rebuilds it — otherwise the
+/// run loses its declared steps and `--step` answers 409 for blobs that are
+/// sitting on disk.
+#[tokio::test]
+async fn dispatched_but_unreported_manifests_are_rebuilt_on_restart() {
+    let temp = tempfile::tempdir().unwrap();
+    let (run_id, plan_id, agent_job_id, ids) = {
+        let state = AppState::new(temp.path().to_path_buf()).await.unwrap();
+        let app = app(state.clone(), CancellationToken::new());
+        let (run_id, jobs) = three_step_run_for_log_filters(&app, &state).await;
+        let ids = workflow_step_ids(&state, run_id, "build").await;
+        // Deliberately no forced snapshot: `store_inner` writes step rows,
+        // which would persist the manifest and make the rebuild moot. The real
+        // window is a submission persisted only by its run events, which carry
+        // the run, the requests and the broker message but never steps.
+        (run_id, jobs[0].1.clone(), jobs[0].2.clone(), ids)
+    };
+
+    let state = AppState::new(temp.path().to_path_buf()).await.unwrap();
+    let app = app(state.clone(), CancellationToken::new());
+    assert_eq!(
+        workflow_step_ids(&state, run_id, "build").await,
+        ids,
+        "declared steps must be rebuilt from the persisted request message"
+    );
+
+    write_step_job_logs(
+        &temp,
+        &plan_id,
+        &agent_job_id,
+        &[(ids[2].as_str(), "third step\n")],
+    )
+    .await;
+    let (status, body) =
+        get_logs(&app, format!("/api/v1/runs/{run_id}/logs?job=build&step=3")).await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(body, b"third step\n", "`--step` must resolve after restart");
+}
+
+/// The AzDO timeline path orders synthetic steps and ignores the job record.
+///
+/// `TimelineRecord` carries no ordinal, so a synthetic step reported this way
+/// has no `runner_number` and must be ordered by when it started — otherwise
+/// `Set up job` sorts after every declared step. The PATCH also carries the
+/// job's own record, whose UUID never equals the workflow job key, so it was
+/// reconciled in as an extra step named after the job.
+#[tokio::test]
+async fn timeline_path_orders_synthetic_steps_and_skips_the_job_record() {
+    let temp = tempfile::tempdir().unwrap();
+    let state = AppState::new(temp.path().to_path_buf()).await.unwrap();
+    let app = app(state.clone(), CancellationToken::new());
+    let (run_id, _) = three_step_run_for_log_filters(&app, &state).await;
+    let ids = workflow_step_ids(&state, run_id, "build").await;
+    let (plan_id, timeline_id) = {
+        let inner = state.inner.lock().await;
+        let request = inner
+            .job_requests
+            .values()
+            .find(|request| request.run_id == run_id)
+            .expect("dispatched request");
+        (request.plan_id.clone(), request.timeline_id.to_string())
+    };
+
+    // Setup started before the declared steps, and the job record is sent
+    // alongside them exactly as the official runner does.
+    //
+    // The three step records deliberately use the three shapes that appear on
+    // the wire: `Task` (official runner), `Step` (which this file's annotation
+    // path already recognises), and no `type` at all (the field is optional).
+    // An allow-list of one type passes a test that only sends that type while
+    // silently dropping the others' conclusions.
+    let setup_id = uuid::Uuid::new_v4().to_string();
+    let job_record_id = uuid::Uuid::new_v4().to_string();
+    let record = |id: &str, kind: Option<&str>, name: &str, start: &str| {
+        let mut value = json!({
+            "id": id,
+            "name": name,
+            "displayName": name,
+            "state": "completed",
+            "result": "succeeded",
+            "startTime": start,
+        });
+        match kind {
+            Some(kind) => value["type"] = json!(kind),
+            // Untyped records are identified as steps by their parent.
+            None => value["parentId"] = json!(job_record_id),
+        }
+        value
+    };
+    let response = request_json(
+        &app,
+        Method::PATCH,
+        &format!("/_apis/v1/Timeline/scope/actions/{plan_id}/{timeline_id}"),
+        json!({"count": 5, "value": [
+            record(&job_record_id, Some("Job"), "build", "2026-01-01T00:00:00Z"),
+            record(&ids[0], Some("Task"), "Run echo one", "2026-01-01T00:00:02Z"),
+            record(&ids[1], Some("Step"), "Run echo two", "2026-01-01T00:00:03Z"),
+            record(&ids[2], None, "Run echo three", "2026-01-01T00:00:04Z"),
+            record(&setup_id, Some("Task"), "Set up job", "2026-01-01T00:00:01Z"),
+        ]}),
+    )
+    .await;
+    assert_eq!(response["count"], 5);
+
+    let run = get_run_json(&app, &run_id.to_string()).await;
+    let names: Vec<&str> = run["jobs_list"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|detail| detail["job_id"] == "build")
+        .expect("build detail")["steps"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|step| step["name"].as_str().unwrap_or_default())
+        .collect();
+    assert_eq!(
+        names,
+        vec![
+            "Set up job",
+            "Run echo one",
+            "Run echo two",
+            "Run echo three"
+        ],
+        "synthetic setup must lead, and the job record must not become a step"
+    );
+}
+
+/// Expansion does not leave the placeholder's manifest behind.
+///
+/// A deferred-matrix node is dispatched as a placeholder, gets a manifest
+/// seeded, and is purged when expansion replaces it with real legs. Without
+/// cleanup every dynamic expansion accumulates an entry no run projection can
+/// reach.
+#[tokio::test]
+async fn expansion_purges_the_placeholder_step_manifest() {
+    let temp = tempfile::tempdir().unwrap();
+    let state = AppState::new(temp.path().to_path_buf()).await.unwrap();
+    let app = app(state.clone(), CancellationToken::new());
+
+    let accepted = submit_yaml(
+        &app,
+        r#"
+on: push
+jobs:
+  gen:
+    runs-on: ubuntu-latest
+    outputs:
+      matrix: ${{ steps.build.outputs.matrix }}
+    steps:
+      - id: build
+        run: echo matrix
+  fan:
+    needs: [gen]
+    runs-on: ubuntu-latest
+    strategy:
+      matrix: ${{ fromJson(needs.gen.outputs.matrix) }}
+    steps:
+      - run: echo leg
+"#,
+        "owner/repo",
+    )
+    .await;
+    let run_id: RunId = accepted["run_id"].as_str().unwrap().parse().unwrap();
+
+    let before = {
+        let inner = state.inner.lock().await;
+        inner.job_steps.len()
+    };
+
+    // Finish `gen` with a matrix so the deferred node expands. The result is
+    // propagated: swallowing it let this test pass without ever completing the
+    // job, checking orphans against a run that never expanded.
+    let _completed = crate::distributed_task::complete_job_inner(
+        state.shared(),
+        preloop_gha_protocol::JobCompletion {
+            run_id,
+            job_id: preloop_gha_protocol::JobId("gen".to_owned()),
+            agent_job_id: None,
+            status: ExecutionStatus::Success,
+            outputs: [("matrix".to_owned(), serde_json::json!("{\"leg\":[1,2]}"))]
+                .into_iter()
+                .collect(),
+            annotations: Vec::new(),
+            step_results: Vec::new(),
+        },
+    )
+    .await
+    .expect("completing gen must succeed");
+
+    let inner = state.inner.lock().await;
+    // The placeholder must actually be gone, replaced by one leg per matrix
+    // value. Without this the orphan check below could pass vacuously.
+    let legs: Vec<&str> = inner
+        .job_requests
+        .values()
+        .filter(|record| record.run_id == run_id && record.job_id.0.starts_with("fan"))
+        .map(|record| record.job_id.0.as_str())
+        .collect();
+    assert_eq!(
+        legs.len(),
+        2,
+        "the deferred node must expand into two legs, got {legs:?}"
+    );
+    // Every retained manifest must belong to a request that still exists.
+    let live: std::collections::BTreeSet<uuid::Uuid> = inner
+        .job_requests
+        .values()
+        .map(|record| record.agent_job_id)
+        .collect();
+    let orphans: Vec<&uuid::Uuid> = inner
+        .job_steps
+        .keys()
+        .filter(|agent_job_id| !live.contains(agent_job_id))
+        .collect();
+    assert!(
+        orphans.is_empty(),
+        "expansion left {} unreachable manifest(s) (had {before} before)",
+        orphans.len()
+    );
+}
+
+/// The list endpoint projects steps like the single-run endpoint.
+///
+/// Step records live in the attempt manifest, not in the stored run, so a
+/// handler that clones `inner.runs` directly returns empty step arrays even
+/// though `GET /api/v1/runs/{id}` has the current ones.
+#[tokio::test]
+async fn list_runs_projects_step_records() {
+    let temp = tempfile::tempdir().unwrap();
+    let state = AppState::new(temp.path().to_path_buf()).await.unwrap();
+    let app = app(state.clone(), CancellationToken::new());
+    let (run_id, jobs) = three_step_run_for_log_filters(&app, &state).await;
+    let ids = workflow_step_ids(&state, run_id, "build").await;
+
+    let response = request_json(
+        &app,
+        Method::POST,
+        "/twirp/github.actions.results.api.v1.WorkflowStepUpdateService/WorkflowStepsUpdate",
+        json!({
+            "workflow_run_backend_id": jobs[0].1,
+            "workflow_job_run_backend_id": jobs[0].2,
+            "steps": [{
+                "external_id": ids[0],
+                "number": 2,
+                "name": "Run echo one",
+                "status": 6,
+                "conclusion": 2
+            }]
+        }),
+    )
+    .await;
+    assert_eq!(response["ok"], true);
+
+    let listed = request_json(&app, Method::GET, "/api/v1/runs", json!(null)).await;
+    let run = listed
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|entry| entry["run_id"] == run_id.to_string())
+        .expect("the submitted run must be listed");
+    let steps = run["jobs_list"][0]["steps"].as_array().unwrap();
+    assert_eq!(
+        steps.len(),
+        3,
+        "the list endpoint must carry the declared steps: {steps:?}"
+    );
+    assert_eq!(steps[0]["conclusion"], "success");
+    assert_eq!(steps[0]["name"], "Run echo one");
+}
+
+#[tokio::test]
+async fn list_runs_puts_active_work_before_newer_terminal_runs() {
+    let temp = tempfile::tempdir().unwrap();
+    let state = AppState::new(temp.path().to_path_buf()).await.unwrap();
+    let app = app(state.clone(), CancellationToken::new());
+    let first: RunId = submit_simple_run(&app).await["run_id"]
+        .as_str()
+        .unwrap()
+        .parse()
+        .unwrap();
+    let second: RunId = submit_simple_run(&app).await["run_id"]
+        .as_str()
+        .unwrap()
+        .parse()
+        .unwrap();
+    let (active, terminal) = if first < second {
+        (first, second)
+    } else {
+        (second, first)
+    };
+    {
+        let mut inner = state.inner.lock().await;
+        let completed = inner.runs.get_mut(&terminal).unwrap();
+        completed.status = ExecutionStatus::Success;
+        completed.completed_at = Some(chrono::Utc::now());
+    }
+
+    let listed = request_json(&app, Method::GET, "/api/v1/runs?limit=2", json!(null)).await;
+    let runs = listed.as_array().unwrap();
+    assert_eq!(runs[0]["run_id"], active.to_string());
+    assert_eq!(runs[0]["status"], "queued");
+    assert_eq!(runs[1]["run_id"], terminal.to_string());
+}
+
+/// A runner report persists the attempt, so a restart keeps step state.
+///
+/// Step records deliberately do not ride in `runs.record_blob` (which reseals
+/// the workflow YAML and event payload on every run event) nor in
+/// `MetaSnapshot` (every field of which is sealed on each `store_meta_only`),
+/// and the run-event projection no longer carries them at all. The only thing
+/// that persists them is `store_job_steps`, called from the reconciliation
+/// paths — so this drives a real `WorkflowStepsUpdate` rather than forcing a
+/// snapshot, which is what makes it a regression test for losing step
+/// conclusions across a restart.
+#[tokio::test]
+async fn step_manifests_survive_a_restart() {
+    let temp = tempfile::tempdir().unwrap();
+    let (run_id, plan_id, agent_job_id, ids) = {
+        let state = AppState::new(temp.path().to_path_buf()).await.unwrap();
+        let app = app(state.clone(), CancellationToken::new());
+        let (run_id, jobs) = three_step_run_for_log_filters(&app, &state).await;
+        let ids = workflow_step_ids(&state, run_id, "build").await;
+        assert_eq!(ids.len(), 3);
+        let (plan_id, agent_job_id) = (jobs[0].1.clone(), jobs[0].2.clone());
+
+        let response = request_json(
+            &app,
+            Method::POST,
+            "/twirp/github.actions.results.api.v1.WorkflowStepUpdateService/WorkflowStepsUpdate",
+            json!({
+                "workflow_run_backend_id": plan_id,
+                "workflow_job_run_backend_id": agent_job_id,
+                "steps": [{
+                    "external_id": ids[1],
+                    "number": 3,
+                    "name": "Run echo two",
+                    "status": 6,
+                    "conclusion": 2
+                }]
+            }),
+        )
+        .await;
+        assert_eq!(response["ok"], true);
+        (run_id, plan_id, agent_job_id, ids)
+    };
+
+    // A fresh AppState over the same state dir is the restart.
+    let state = AppState::new(temp.path().to_path_buf()).await.unwrap();
+    let app = app(state.clone(), CancellationToken::new());
+    let restored = workflow_step_ids(&state, run_id, "build").await;
+    assert_eq!(
+        restored, ids,
+        "declared step ids and their order must come back intact"
+    );
+
+    // The reported conclusion came back too, not just the identities.
+    {
+        let inner = state.inner.lock().await;
+        let records = &inner.job_steps[&agent_job_id.parse::<uuid::Uuid>().unwrap()];
+        let reported = records
+            .iter()
+            .find(|step| step.id == ids[1])
+            .expect("the reported step must be restored");
+        assert_eq!(reported.conclusion, "success");
+        assert_eq!(reported.runner_number, Some(3));
+    }
+
+    write_step_job_logs(
+        &temp,
+        &plan_id,
+        &agent_job_id,
+        &[(ids[1].as_str(), "second step\n")],
+    )
+    .await;
+    let (status, body) =
+        get_logs(&app, format!("/api/v1/runs/{run_id}/logs?job=build&step=2")).await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(
+        body, b"second step\n",
+        "`--step` must still resolve after a restart"
+    );
+}
+
+/// A step report made after a restart is still persisted.
+///
+/// The out-of-order write guard compares an in-memory revision against the
+/// persisted one, so the counter has to resume above what is on disk. Left at
+/// zero it hands every post-restart write a revision the stored rows already
+/// exceed, and the upsert discards them — invisibly, because memory stays
+/// authoritative until the next restart drops the conclusion.
+#[tokio::test]
+async fn step_reports_after_a_restart_are_persisted() {
+    let temp = tempfile::tempdir().unwrap();
+    let report = |app: axum::Router, plan_id: String, agent_job_id: String, id: String, n: i64| async move {
+        let response = request_json(
+            &app,
+            Method::POST,
+            "/twirp/github.actions.results.api.v1.WorkflowStepUpdateService/WorkflowStepsUpdate",
+            json!({
+                "workflow_run_backend_id": plan_id,
+                "workflow_job_run_backend_id": agent_job_id,
+                "steps": [{
+                    "external_id": id,
+                    "number": n,
+                    "name": "Run echo one",
+                    "status": 6,
+                    "conclusion": 2
+                }]
+            }),
+        )
+        .await;
+        assert_eq!(response["ok"], true);
+    };
+
+    let (plan_id, agent_job_id, ids) = {
+        let state = AppState::new(temp.path().to_path_buf()).await.unwrap();
+        let app = app(state.clone(), CancellationToken::new());
+        let (run_id, jobs) = three_step_run_for_log_filters(&app, &state).await;
+        let ids = workflow_step_ids(&state, run_id, "build").await;
+        let (plan_id, agent_job_id) = (jobs[0].1.clone(), jobs[0].2.clone());
+        // Two reports before the restart, so the persisted revision is above
+        // the value a fresh counter would hand out first.
+        report(
+            app.clone(),
+            plan_id.clone(),
+            agent_job_id.clone(),
+            ids[0].clone(),
+            2,
+        )
+        .await;
+        report(
+            app.clone(),
+            plan_id.clone(),
+            agent_job_id.clone(),
+            ids[1].clone(),
+            3,
+        )
+        .await;
+        (plan_id, agent_job_id, ids)
+    };
+
+    {
+        let state = AppState::new(temp.path().to_path_buf()).await.unwrap();
+        let app = app(state.clone(), CancellationToken::new());
+        report(
+            app,
+            plan_id.clone(),
+            agent_job_id.clone(),
+            ids[2].clone(),
+            4,
+        )
+        .await;
+    }
+
+    // Only a second restart can tell whether that write reached the store.
+    let state = AppState::new(temp.path().to_path_buf()).await.unwrap();
+    let inner = state.inner.lock().await;
+    let records = &inner.job_steps[&agent_job_id.parse::<uuid::Uuid>().unwrap()];
+    let reported = records
+        .iter()
+        .find(|step| step.id == ids[2])
+        .expect("the post-restart step must be restored");
+    assert_eq!(
+        reported.conclusion, "success",
+        "a report made after a restart must survive the next one"
+    );
+    assert_eq!(reported.runner_number, Some(4));
+}
+
+/// Every surface showing a whole step list uses execution order.
+///
+/// The stored manifest is seeded with declared steps and then appends
+/// synthetic ones as the runner reports them, so its raw order puts
+/// `Set up job` last despite it running first. A step id is a v4 UUID, so it
+/// cannot supply the order either.
+#[tokio::test]
+async fn step_lists_and_job_logs_follow_execution_order() {
+    let temp = tempfile::tempdir().unwrap();
+    let state = AppState::new(temp.path().to_path_buf()).await.unwrap();
+    let app = app(state.clone(), CancellationToken::new());
+    let (run_id, jobs) = three_step_run_for_log_filters(&app, &state).await;
+    let ids = workflow_step_ids(&state, run_id, "build").await;
+    let (plan_id, agent_job_id) = (jobs[0].1.clone(), jobs[0].2.clone());
+
+    // The runner reports `Set up job` first, then the declared steps at the
+    // offset positions the golden capture shows (declared step 1 is number 2).
+    let setup_id = uuid::Uuid::new_v4().to_string();
+    let report = |external_id: &str, number: u64, name: &str| {
+        serde_json::json!({
+            "external_id": external_id,
+            "number": number,
+            "name": name,
+            "status": 6,
+            "conclusion": 2
+        })
+    };
+    let response = request_json(
+        &app,
+        Method::POST,
+        "/twirp/github.actions.results.api.v1.WorkflowStepUpdateService/WorkflowStepsUpdate",
+        json!({
+            "workflow_run_backend_id": plan_id,
+            "workflow_job_run_backend_id": agent_job_id,
+            "steps": [
+                report(&setup_id, 1, "Set up job"),
+                report(&ids[0], 2, "Run echo one"),
+                report(&ids[1], 3, "Run echo two"),
+                report(&ids[2], 4, "Run echo three"),
+            ]
+        }),
+    )
+    .await;
+    assert_eq!(response["ok"], true);
+
+    // The run record lists the synthetic setup step first.
+    let run = get_run_json(&app, &run_id.to_string()).await;
+    let names: Vec<&str> = run["jobs_list"][0]["steps"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|step| step["name"].as_str().unwrap_or_default())
+        .collect();
+    assert_eq!(
+        names,
+        vec![
+            "Set up job",
+            "Run echo one",
+            "Run echo two",
+            "Run echo three"
+        ],
+        "the run record must show execution order, not seeded-then-appended"
+    );
+
+    // The whole-job log concatenates in the same order, even though the ids
+    // sort differently.
+    write_step_job_logs(
+        &temp,
+        &plan_id,
+        &agent_job_id,
+        &[
+            (ids[2].as_str(), "three\n"),
+            (ids[0].as_str(), "one\n"),
+            (setup_id.as_str(), "setup\n"),
+            (ids[1].as_str(), "two\n"),
+        ],
+    )
+    .await;
+    let (status, body) = get_logs(&app, format!("/api/v1/runs/{run_id}/logs?job=build")).await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(
+        String::from_utf8_lossy(&body),
+        "setup\none\ntwo\nthree\n",
+        "whole-job output must follow execution order"
+    );
+
+    // `--step` still counts declared steps only, so setup takes no slot.
+    let (status, body) =
+        get_logs(&app, format!("/api/v1/runs/{run_id}/logs?job=build&step=1")).await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(body, b"one\n");
+}
+
+/// A completion reconciles the attempt that actually reported.
+///
+/// `job_requests` is keyed by monotonic request id, so picking the first match
+/// for `(run_id, job_id)` selects the *oldest* dispatch. A re-dispatched job
+/// then applied the new attempt's `external_id`s to the previous attempt's
+/// manifest — matching nothing — and terminalized that older attempt's steps
+/// while the run view still projected the newer one as in-flight.
+#[tokio::test]
+async fn completion_reconciles_the_reporting_attempt_not_the_oldest() {
+    let temp = tempfile::tempdir().unwrap();
+    let state = AppState::new(temp.path().to_path_buf()).await.unwrap();
+    let app = app(state.clone(), CancellationToken::new());
+    let (run_id, _) = two_job_run_for_log_filters(&app, &state).await;
+    let first_ids = workflow_step_ids(&state, run_id, "build").await;
+    let first_step_id = first_ids[0].clone();
+
+    // Re-dispatch: a newer request, its own agent job id, its own step ids.
+    let (first_agent_job_id, second_agent_job_id, second_step_id) = {
+        let mut inner = state.inner.lock().await;
+        let mut record = inner
+            .job_requests
+            .values()
+            .find(|request| request.run_id == run_id && request.job_id.0 == "build")
+            .cloned()
+            .expect("first attempt must exist");
+        let first_agent_job_id = record.agent_job_id;
+        let request_id = inner.job_requests.keys().copied().max().unwrap_or(0) + 1;
+        let agent_job_id = uuid::Uuid::new_v4();
+        record.request_id = request_id;
+        record.agent_job_id = agent_job_id;
+        record.plan_id = uuid::Uuid::new_v4().to_string();
+        record.result = None;
+        let step_id = uuid::Uuid::new_v4().to_string();
+        inner.job_steps.insert(
+            agent_job_id,
+            vec![crate::models::StepRecord::workflow(
+                step_id.clone(),
+                0,
+                "Run echo build".to_owned(),
+                Some("__run".to_owned()),
+            )],
+        );
+        inner.agent_job_requests.insert(agent_job_id, request_id);
+        inner.job_requests.insert(request_id, record);
+        (first_agent_job_id, agent_job_id, step_id)
+    };
+
+    let _ = crate::distributed_task::complete_job_inner(
+        state.shared(),
+        preloop_gha_protocol::JobCompletion {
+            run_id,
+            job_id: preloop_gha_protocol::JobId("build".to_owned()),
+            agent_job_id: Some(second_agent_job_id),
+            status: ExecutionStatus::Success,
+            outputs: Default::default(),
+            annotations: Vec::new(),
+            step_results: vec![preloop_gha_protocol::CompletionStepResult {
+                external_id: Some(second_step_id.clone()),
+                number: Some(2),
+                name: Some("Run echo build".to_owned()),
+                status: Some(serde_json::json!("completed")),
+                conclusion: Some(serde_json::json!("skipped")),
+            }],
+        },
+    )
+    .await;
+
+    let inner = state.inner.lock().await;
+    let reporting = &inner.job_steps[&second_agent_job_id];
+    assert_eq!(
+        reporting[0].conclusion, "skipped",
+        "the reporting attempt takes the completion's step conclusion"
+    );
+    let earlier = &inner.job_steps[&first_agent_job_id];
+    assert_eq!(
+        earlier[0].id, first_step_id,
+        "the earlier attempt keeps its own step identity"
+    );
+    assert_eq!(
+        earlier[0].conclusion, "pending",
+        "a completion for one attempt must not terminalize another's steps"
+    );
+}
+
+/// A second dispatch of the same job gets its own manifest.
+///
+/// `build_task_step` mints a fresh `TaskStep` id per build, so a job-scoped
+/// manifest would overwrite the mapping the first attempt's `step-<id>.txt`
+/// blobs are named after, and that attempt's logs would become unreachable.
+/// Keying by `agent_job_id` keeps both attempts resolvable.
+#[tokio::test]
+async fn step_manifests_are_scoped_per_job_attempt() {
+    let temp = tempfile::tempdir().unwrap();
+    let state = AppState::new(temp.path().to_path_buf()).await.unwrap();
+    let app = app(state.clone(), CancellationToken::new());
+    let (run_id, jobs) = two_job_run_for_log_filters(&app, &state).await;
+    let first_ids = workflow_step_ids(&state, run_id, "build").await;
+    assert_eq!(first_ids.len(), 1);
+
+    // Simulate a re-dispatch: a new attempt with a new agent job id and new
+    // step ids, exactly as a fresh `build_job_artifacts` would produce.
+    let (second_plan_id, second_agent_job_id, second_step_id) = {
+        let mut inner = state.inner.lock().await;
+        let mut record = inner
+            .job_requests
+            .values()
+            .find(|request| request.run_id == run_id && request.job_id.0 == "build")
+            .cloned()
+            .expect("first attempt must exist");
+        let request_id = inner.job_requests.keys().copied().max().unwrap_or(0) + 1;
+        let agent_job_id = uuid::Uuid::new_v4();
+        record.request_id = request_id;
+        record.agent_job_id = agent_job_id;
+        record.plan_id = uuid::Uuid::new_v4().to_string();
+        let step_id = uuid::Uuid::new_v4().to_string();
+        inner.job_steps.insert(
+            agent_job_id,
+            vec![crate::models::StepRecord::workflow(
+                step_id.clone(),
+                0,
+                "Run echo build".to_owned(),
+                Some("__run".to_owned()),
+            )],
+        );
+        let plan_id = record.plan_id.clone();
+        inner.agent_job_requests.insert(agent_job_id, request_id);
+        inner.job_requests.insert(request_id, record);
+        (plan_id, agent_job_id.to_string(), step_id)
+    };
+
+    // The run API — not an internal helper — must show the newest attempt's
+    // steps. Asserting through `workflow_step_ids` alone could not detect a
+    // stale projection, because it reads the same map the projection reads.
+    let run = get_run_json(&app, &run_id.to_string()).await;
+    let projected: Vec<&str> = run["jobs_list"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|detail| detail["job_id"] == "build")
+        .expect("build must be in the run record")["steps"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|step| step["id"].as_str().unwrap_or_default())
+        .collect();
+    assert_eq!(
+        projected,
+        vec![second_step_id.as_str()],
+        "the run record must project the newest attempt, not the first"
+    );
+
+    // The earlier attempt keeps its own mapping, which is what makes its
+    // already-uploaded `step-<id>.txt` blobs still reachable.
+    {
+        let inner = state.inner.lock().await;
+        let first_agent_job_id: uuid::Uuid = jobs[0].2.parse().unwrap();
+        let retained = inner
+            .job_steps
+            .get(&first_agent_job_id)
+            .expect("the earlier attempt's manifest must survive the re-dispatch");
+        assert_eq!(retained[0].id, first_ids[0]);
+    }
+
+    // Both attempts' logs resolve, each through its own manifest.
+    write_step_job_logs(
+        &temp,
+        &jobs[0].1,
+        &jobs[0].2,
+        &[(first_ids[0].as_str(), "first attempt\n")],
+    )
+    .await;
+    write_step_job_logs(
+        &temp,
+        &second_plan_id,
+        &second_agent_job_id,
+        &[(second_step_id.as_str(), "second attempt\n")],
+    )
+    .await;
+    let (status, body) =
+        get_logs(&app, format!("/api/v1/runs/{run_id}/logs?job=build&step=1")).await;
+    assert_eq!(status, StatusCode::OK);
+    let text = String::from_utf8_lossy(&body);
+    assert!(
+        text.contains("first attempt") && text.contains("second attempt"),
+        "each attempt resolves step 1 through its own manifest: {text}"
+    );
+}
+
+#[tokio::test]
+async fn log_run_logs_step_filter_selects_one_step() {
+    let temp = tempfile::tempdir().unwrap();
+    let state = AppState::new(temp.path().to_path_buf()).await.unwrap();
+    let app = app(state.clone(), CancellationToken::new());
+    let (run_id, jobs) = three_step_run_for_log_filters(&app, &state).await;
+    let ids = workflow_step_ids(&state, run_id, "build").await;
+    assert_eq!(ids.len(), 3, "manifest must carry the three declared steps");
+    write_step_job_logs(
+        &temp,
+        &jobs[0].1,
+        &jobs[0].2,
+        &[
+            (ids[0].as_str(), "step one\n"),
+            (ids[1].as_str(), "step two\n"),
+            (ids[2].as_str(), "step three\n"),
+        ],
+    )
+    .await;
+
+    for (step, expected) in [(1, "step one\n"), (2, "step two\n"), (3, "step three\n")] {
+        let (status, body) = get_logs(
+            &app,
+            format!("/api/v1/runs/{run_id}/logs?job=build&step={step}"),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "step {step}");
+        assert_eq!(body, expected.as_bytes(), "step {step} content");
+    }
+}
+
+#[tokio::test]
+async fn log_run_logs_step_filter_uses_workflow_step_ids() {
+    let temp = tempfile::tempdir().unwrap();
+    let state = AppState::new(temp.path().to_path_buf()).await.unwrap();
+    let app = app(state.clone(), CancellationToken::new());
+    let (run_id, jobs) = two_job_run_for_log_filters(&app, &state).await;
+    let ids = workflow_step_ids(&state, run_id, "build").await;
+    let workflow_step_id = ids.first().expect("manifest must carry the declared step");
+
+    // A synthetic runner step ("Set up job") uploads a blob too, and sorts
+    // ahead of the user step by both name and upload time. `step=1` must still
+    // resolve through the manifest and pick the declared step.
+    write_step_job_logs(
+        &temp,
+        &jobs[0].1,
+        &jobs[0].2,
+        &[
+            ("00000000-0000-0000-0000-000000000000", "setup output\n"),
+            (workflow_step_id.as_str(), "user step output\n"),
+        ],
+    )
+    .await;
+
+    let (status, body) =
+        get_logs(&app, format!("/api/v1/runs/{run_id}/logs?job=build&step=1")).await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(body, b"user step output\n");
+
+    // The declared step is the only one `--step` can address; the synthetic
+    // blob never occupies a slot of its own.
+    let (status, _) = get_logs(&app, format!("/api/v1/runs/{run_id}/logs?job=build&step=2")).await;
+    assert_eq!(
+        status,
+        StatusCode::NOT_FOUND,
+        "a synthetic upload must not become step 2"
+    );
+}
+
+#[tokio::test]
+async fn log_run_logs_step_out_of_range_is_404() {
+    let temp = tempfile::tempdir().unwrap();
+    let state = AppState::new(temp.path().to_path_buf()).await.unwrap();
+    let app = app(state.clone(), CancellationToken::new());
+    let (run_id, jobs) = three_step_run_for_log_filters(&app, &state).await;
+    let ids = workflow_step_ids(&state, run_id, "build").await;
+    write_step_job_logs(
+        &temp,
+        &jobs[0].1,
+        &jobs[0].2,
+        &[
+            (ids[0].as_str(), "step one\n"),
+            (ids[1].as_str(), "step two\n"),
+        ],
+    )
+    .await;
+
+    let (status, body) =
+        get_logs(&app, format!("/api/v1/runs/{run_id}/logs?job=build&step=9")).await;
+    assert_eq!(status, StatusCode::NOT_FOUND);
+    let message = String::from_utf8_lossy(&body);
+    assert!(
+        message.contains('3'),
+        "error should report how many declared steps exist: {message}"
+    );
+}
+
+#[tokio::test]
+async fn log_run_logs_step_zero_is_rejected_as_one_based() {
+    let temp = tempfile::tempdir().unwrap();
+    let state = AppState::new(temp.path().to_path_buf()).await.unwrap();
+    let app = app(state.clone(), CancellationToken::new());
+    let (run_id, jobs) = two_job_run_for_log_filters(&app, &state).await;
+    write_step_job_logs(&temp, &jobs[0].1, &jobs[0].2, &[("a", "step one\n")]).await;
+
+    let (status, _) = get_logs(&app, format!("/api/v1/runs/{run_id}/logs?job=build&step=0")).await;
+    assert_eq!(status, StatusCode::BAD_REQUEST);
+}
+
+#[tokio::test]
+async fn log_run_logs_step_on_merged_upload_is_conflict() {
+    let temp = tempfile::tempdir().unwrap();
+    let state = AppState::new(temp.path().to_path_buf()).await.unwrap();
+    let app = app(state.clone(), CancellationToken::new());
+    let (run_id, jobs) = two_job_run_for_log_filters(&app, &state).await;
+    // A merged job log carries no step boundaries.
+    write_merged_job_log(&temp, &jobs[0].1, &jobs[0].2, "everything\n").await;
+
+    let (status, body) =
+        get_logs(&app, format!("/api/v1/runs/{run_id}/logs?job=build&step=1")).await;
+    assert_eq!(
+        status,
+        StatusCode::CONFLICT,
+        "must refuse rather than pass the whole job off as one step"
+    );
+    assert!(
+        !String::from_utf8_lossy(&body).contains("everything"),
+        "conflict body must not return the unsplit log"
+    );
+}
+
+#[tokio::test]
+async fn log_run_logs_step_without_job_in_multi_job_run_is_ambiguous() {
+    let temp = tempfile::tempdir().unwrap();
+    let state = AppState::new(temp.path().to_path_buf()).await.unwrap();
+    let app = app(state.clone(), CancellationToken::new());
+    let (run_id, jobs) = two_job_run_for_log_filters(&app, &state).await;
+    write_step_job_logs(&temp, &jobs[0].1, &jobs[0].2, &[("a", "step one\n")]).await;
+
+    let (status, body) = get_logs(&app, format!("/api/v1/runs/{run_id}/logs?step=1")).await;
+    assert_eq!(
+        status,
+        StatusCode::BAD_REQUEST,
+        "step numbering restarts per job, so this names two things"
+    );
+    let message = String::from_utf8_lossy(&body);
+    assert!(
+        message.contains("build") && message.contains("test"),
+        "error should name the candidate jobs: {message}"
+    );
+}
+
+#[tokio::test]
+async fn log_run_logs_step_filter_refuses_live_console_blocks() {
+    let temp = tempfile::tempdir().unwrap();
+    let state = AppState::new(temp.path().to_path_buf()).await.unwrap();
+    let app = app(state.clone(), CancellationToken::new());
+    let (run_id, jobs) = two_job_run_for_log_filters(&app, &state).await;
+
+    // Nothing on disk yet: a job still in flight streams console blocks keyed
+    // by the runner's numeric log id. Those ids count every record the runner
+    // opened, `Set up job` among them, so they are not declared-step
+    // positions — block "2" is not step 1.
+    for (log_id, body) in [("2", "live block two\n"), ("10", "live block ten\n")] {
+        let plan = &jobs[0].1;
+        let response = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method(Method::POST)
+                    .uri(format!("/_apis/v1/Logfiles/scope/actions/{plan}/{log_id}"))
+                    .header(header::AUTHORIZATION, "Bearer preloop-system-token")
+                    .body(Body::from(body))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::ACCEPTED);
+    }
+
+    // Refusing beats guessing: indexing these blocks is the same numbering
+    // error `--step` was fixed to remove for durable blobs.
+    let (status, body) =
+        get_logs(&app, format!("/api/v1/runs/{run_id}/logs?job=build&step=1")).await;
+    assert_eq!(status, StatusCode::CONFLICT);
+    let message = String::from_utf8_lossy(&body);
+    assert!(
+        message.contains("has not uploaded per-step logs yet"),
+        "the error must say why the step cannot be identified: {message}"
+    );
+
+    // The whole-job read still serves the streamed output, in numeric console
+    // order rather than lexicographic: 2 precedes 10.
+    let (status, body) = get_logs(&app, format!("/api/v1/runs/{run_id}/logs?job=build")).await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(body, b"live block two\nlive block ten\n");
+}
+
+#[tokio::test]
+async fn live_run_logs_native_route_requires_job_when_ambiguous() {
+    let temp = tempfile::tempdir().unwrap();
+    let state = AppState::new(temp.path().to_path_buf()).await.unwrap();
+    let app = app(state.clone(), CancellationToken::new());
+    let (run_id, _jobs) = two_job_run_for_log_filters(&app, &state).await;
+
+    let (status, body) = get_logs(&app, format!("/api/v1/runs/{run_id}/logs/live")).await;
+    assert_eq!(
+        status,
+        StatusCode::BAD_REQUEST,
+        "two jobs cannot be followed on one stream"
+    );
+    let message = String::from_utf8_lossy(&body);
+    assert!(
+        message.contains("build") && message.contains("test"),
+        "error should name the candidate jobs: {message}"
+    );
+}
+
+#[tokio::test]
+async fn live_run_logs_native_route_rejects_unknown_job() {
+    let temp = tempfile::tempdir().unwrap();
+    let state = AppState::new(temp.path().to_path_buf()).await.unwrap();
+    let app = app(state.clone(), CancellationToken::new());
+    let (run_id, _jobs) = two_job_run_for_log_filters(&app, &state).await;
+
+    let (status, _) = get_logs(&app, format!("/api/v1/runs/{run_id}/logs/live?job=nope")).await;
+    assert_eq!(status, StatusCode::NOT_FOUND);
+}
+
+#[tokio::test]
+async fn live_run_logs_native_route_rejects_uuid_from_other_run() {
+    let temp = tempfile::tempdir().unwrap();
+    let state = AppState::new(temp.path().to_path_buf()).await.unwrap();
+    let app = app(state.clone(), CancellationToken::new());
+    let (_foreign_run_id, foreign_jobs) = two_job_run_for_log_filters(&app, &state).await;
+    let (run_id, _jobs) = two_job_run_for_log_filters(&app, &state).await;
+    let foreign_job_uuid = foreign_jobs[0].2.clone();
+
+    // Leave a globally keyed buffer behind, then ask for that UUID through a
+    // different run. A live-log key is not a sufficient authorization to read
+    // another run's output.
+    crate::live_logs::record_live_log_wrapper(
+        &state.shared(),
+        &foreign_job_uuid,
+        preloop_gha_protocol::LiveLogFeedLinesWrapper {
+            step_id: "foreign".into(),
+            start_line: 1,
+            count: 1,
+            value: vec!["must stay private".into()],
+        },
+    )
+    .await;
+
+    let (status, body) = get_logs(
+        &app,
+        format!("/api/v1/runs/{run_id}/logs/live?job={foreign_job_uuid}"),
+    )
+    .await;
+    assert_eq!(status, StatusCode::NOT_FOUND);
+    assert!(
+        !String::from_utf8_lossy(&body).contains("must stay private"),
+        "cross-run UUID lookup must not expose the foreign buffer"
+    );
+}
+
+#[tokio::test]
+async fn live_run_logs_native_route_defaults_single_job_run() {
+    let temp = tempfile::tempdir().unwrap();
+    let state = AppState::new(temp.path().to_path_buf()).await.unwrap();
+    let app = app(state.clone(), CancellationToken::new());
+    let accepted = submit_yaml(
+        &app,
+        "on: push\njobs:\n  only:\n    runs-on: ubuntu-latest\n    steps:\n      - run: echo hi\n",
+        "owner/repo",
+    )
+    .await;
+    let run_id: RunId = accepted["run_id"].as_str().unwrap().parse().unwrap();
+
+    // One job means no ambiguity, so omitting `job` must stream rather than 400.
+    let response = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method(Method::GET)
+                .uri(format!("/api/v1/runs/{run_id}/logs/live"))
+                .header(header::AUTHORIZATION, "Bearer preloop-system-token")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+    assert_eq!(
+        response.headers()[header::CONTENT_TYPE],
+        "text/event-stream"
+    );
+}
+
+#[tokio::test]
+async fn live_run_logs_native_route_rejects_unauthenticated() {
+    let temp = tempfile::tempdir().unwrap();
+    let state = AppState::new(temp.path().to_path_buf()).await.unwrap();
+    let app = app(state.clone(), CancellationToken::new());
+    let (run_id, _jobs) = two_job_run_for_log_filters(&app, &state).await;
+
+    // The runner-protocol twin of this route is unreachable with a native
+    // bearer; this one must still refuse an anonymous caller.
+    let response = app
+        .oneshot(
+            Request::builder()
+                .method(Method::GET)
+                .uri(format!("/api/v1/runs/{run_id}/logs/live?job=build"))
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
+}
+
+/// Drive one job of a run to a terminal status through the same path every
+/// completion funnels through (`complete_job_inner`).
+async fn complete_job(state: &AppState, run_id: RunId, job_id: &str, status: ExecutionStatus) {
+    let _ = crate::distributed_task::complete_job_inner(
+        state.shared(),
+        preloop_gha_protocol::JobCompletion {
+            run_id,
+            job_id: preloop_gha_protocol::JobId(job_id.to_owned()),
+            agent_job_id: None,
+            status,
+            outputs: Default::default(),
+            annotations: Vec::new(),
+            step_results: Vec::new(),
+        },
+    )
+    .await
+    .expect("completion should succeed");
+}
+
+/// Read an SSE response body to its end, failing (rather than hanging the test
+/// run) if the stream does not close within a short window. A live-log stream
+/// that never ends is exactly the bug these tests guard against.
+async fn read_sse_to_end(response: Response) -> String {
+    let body = tokio::time::timeout(
+        std::time::Duration::from_secs(5),
+        to_bytes(response.into_body(), usize::MAX),
+    )
+    .await
+    .expect("live-log stream must close, not hang")
+    .expect("body readable");
+    String::from_utf8_lossy(&body).into_owned()
+}
+
+async fn open_live(app: &axum::Router, uri: String) -> Response {
+    app.clone()
+        .oneshot(
+            Request::builder()
+                .method(Method::GET)
+                .uri(uri)
+                .header(header::AUTHORIZATION, "Bearer preloop-system-token")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap()
+}
+
+#[tokio::test]
+async fn live_log_stream_ends_when_job_completes() {
+    let temp = tempfile::tempdir().unwrap();
+    let state = AppState::new(temp.path().to_path_buf()).await.unwrap();
+    let app = app(state.clone(), CancellationToken::new());
+    let (run_id, jobs) = two_job_run_for_log_filters(&app, &state).await;
+    let build_uuid = jobs[0].2.clone();
+
+    // Emit a line so a follower has something, then open the stream.
+    crate::live_logs::record_live_log_wrapper(
+        &state.shared(),
+        &build_uuid,
+        preloop_gha_protocol::LiveLogFeedLinesWrapper {
+            step_id: "s1".into(),
+            start_line: 1,
+            count: 1,
+            value: vec!["building...".into()],
+        },
+    )
+    .await;
+
+    let response = open_live(&app, format!("/api/v1/runs/{run_id}/logs/live?job=build")).await;
+    assert_eq!(response.status(), StatusCode::OK);
+
+    // Complete the job on another task; the open stream must then end on its
+    // own, carrying the line that was already buffered.
+    let completer = {
+        let state = state.clone();
+        tokio::spawn(async move {
+            tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+            complete_job(&state, run_id, "build", ExecutionStatus::Success).await;
+        })
+    };
+    let body = read_sse_to_end(response).await;
+    completer.await.unwrap();
+    assert!(
+        body.contains("building..."),
+        "the buffered line must survive the close: {body}"
+    );
+}
+
+#[tokio::test]
+async fn live_log_stream_for_already_completed_job_serves_snapshot_and_ends() {
+    let temp = tempfile::tempdir().unwrap();
+    let state = AppState::new(temp.path().to_path_buf()).await.unwrap();
+    let app = app(state.clone(), CancellationToken::new());
+    let (run_id, jobs) = two_job_run_for_log_filters(&app, &state).await;
+    let build_uuid = jobs[0].2.clone();
+
+    crate::live_logs::record_live_log_wrapper(
+        &state.shared(),
+        &build_uuid,
+        preloop_gha_protocol::LiveLogFeedLinesWrapper {
+            step_id: "s1".into(),
+            start_line: 1,
+            count: 1,
+            value: vec!["already done".into()],
+        },
+    )
+    .await;
+    // Complete BEFORE anyone connects — the late follower must still get the
+    // retained snapshot and then a clean end, never a hang.
+    complete_job(&state, run_id, "build", ExecutionStatus::Success).await;
+
+    let response = open_live(&app, format!("/api/v1/runs/{run_id}/logs/live?job=build")).await;
+    assert_eq!(response.status(), StatusCode::OK);
+    let body = read_sse_to_end(response).await;
+    assert!(
+        body.contains("already done"),
+        "a late follower still gets the snapshot: {body}"
+    );
+}
+
+#[tokio::test]
+async fn live_log_stream_ends_on_cancellation() {
+    let temp = tempfile::tempdir().unwrap();
+    let state = AppState::new(temp.path().to_path_buf()).await.unwrap();
+    let app = app(state.clone(), CancellationToken::new());
+    let (run_id, _jobs) = two_job_run_for_log_filters(&app, &state).await;
+
+    let response = open_live(&app, format!("/api/v1/runs/{run_id}/logs/live?job=build")).await;
+    assert_eq!(response.status(), StatusCode::OK);
+    let completer = {
+        let state = state.clone();
+        tokio::spawn(async move {
+            tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+            // Cancellation is a terminal status and must close the feed too.
+            complete_job(&state, run_id, "build", ExecutionStatus::Cancelled).await;
+        })
+    };
+    // Completes only because the cancel closed the stream.
+    let _ = read_sse_to_end(response).await;
+    completer.await.unwrap();
+}
+
+#[tokio::test]
+async fn live_log_reopens_when_a_completed_job_streams_again() {
+    let temp = tempfile::tempdir().unwrap();
+    let state = AppState::new(temp.path().to_path_buf()).await.unwrap();
+    let app = app(state.clone(), CancellationToken::new());
+    let (run_id, jobs) = two_job_run_for_log_filters(&app, &state).await;
+    let build_uuid = jobs[0].2.clone();
+
+    complete_job(&state, run_id, "build", ExecutionStatus::Failure).await;
+    // A retry reuses the agent job and streams fresh lines: the feed must
+    // reopen so a follower attaching now subscribes instead of ending early.
+    crate::live_logs::record_live_log_wrapper(
+        &state.shared(),
+        &build_uuid,
+        preloop_gha_protocol::LiveLogFeedLinesWrapper {
+            step_id: "retry".into(),
+            start_line: 1,
+            count: 1,
+            value: vec!["second attempt".into()],
+        },
+    )
+    .await;
+
+    {
+        let inner = state.inner.lock().await;
+        assert!(
+            !inner.live_log_closed.contains(&build_uuid),
+            "fresh ingest must clear the closed mark"
+        );
+    }
 }
 
 #[tokio::test]
@@ -3119,12 +4704,10 @@ async fn registration_and_oauth_return_runner_compatible_tokens() {
     );
 }
 
-/// The registration mint hands out a RunnerManage JWT. On the TCP surface it
-/// accepts any non-empty credential, exactly as GitHub accepts any token it
-/// issued — the conformance golden replays a real GitHub registration token
-/// and must get a 200. Through the mounted control socket, where workflow
-/// code inside a VM can reach, only the system credential — the token the
-/// pool injects into its own configure invocation — may mint.
+/// The registration mint hands out a RunnerManage JWT. Strict mode requires
+/// the system credential on both TCP and the mounted control socket; the
+/// conformance golden replays a real GitHub registration token that this
+/// control plane cannot verify, so those runs opt into `Permissive` explicitly.
 #[tokio::test]
 async fn registration_mint_credential_rules_are_strict_by_default() {
     let temp = tempfile::tempdir().unwrap();
@@ -3201,6 +4784,23 @@ async fn registration_mint_permissive_only_under_an_explicit_env_opt_in() {
     assert_eq!(
         minted["token_schema"], "OAuthAccessToken",
         "permissive policy is the conformance-harness opt-in"
+    );
+    // The conformance escape remains fail-closed on the mounted socket:
+    // workflow code must never mint another runner identity from inside a VM.
+    let socket_app = app
+        .clone()
+        .layer(middleware::from_fn(crate::auth::runner_surface_only));
+    assert_eq!(
+        request_status_with_bearer(
+            &socket_app,
+            Method::POST,
+            "/api/v3/actions/runner-registration",
+            json!({"url": "http://socket-workflow"}),
+            "any-non-empty-credential",
+        )
+        .await,
+        StatusCode::UNAUTHORIZED,
+        "permissive registration must remain strict on the guest socket"
     );
 }
 
@@ -3446,12 +5046,8 @@ async fn job_message_carries_github_token_as_a_secret() {
     let temp = tempfile::tempdir().unwrap();
     let state = AppState::new(temp.path().to_path_buf()).await.unwrap();
     let app = app(state.clone(), CancellationToken::new());
-    let runner_token = state
-        .local_jwt(json!({
-            "sub": "preloop-runner-listen-1",
-            "scp": "ActionsRuntime.RunnerListen",
-        }))
-        .unwrap();
+    let (_runner_id, runner_token) =
+        register_runner_with_token(&app, "runner-1", &["self-hosted"], None).await;
 
     let accepted = request_json(
         &app,
@@ -3540,12 +5136,8 @@ async fn environment_secrets_override_repo_and_global_per_job() {
     let temp = tempfile::tempdir().unwrap();
     let state = AppState::new(temp.path().to_path_buf()).await.unwrap();
     let app = app(state.clone(), CancellationToken::new());
-    let runner_token = state
-        .local_jwt(json!({
-            "sub": "preloop-runner-listen-1",
-            "scp": "ActionsRuntime.RunnerListen",
-        }))
-        .unwrap();
+    let (_runner_id, runner_token) =
+        register_runner_with_token(&app, "runner-1", &["self-hosted"], None).await;
 
     // Seed the three stored tiers with the same name so precedence is
     // observable, plus a name that exists only in the environment tier.
@@ -3749,6 +5341,13 @@ async fn current_service_broker_flow_uses_queued_job() {
             "scp": "ActionsRuntime.RunnerListen",
         }))
         .unwrap();
+    let _runner = request_json(
+        &app,
+        Method::POST,
+        "/runner/server/_apis/v1/Agent/1/0",
+        json!({"name": "runner-1", "version": "2.335.1"}),
+    )
+    .await;
 
     let workflow = "on:
   push:
@@ -3889,6 +5488,32 @@ jobs:
         .await
         .unwrap();
     assert_eq!(response.status(), StatusCode::NO_CONTENT);
+    let duplicate_completion = status_with_bearer(
+        &app,
+        &runner_token,
+        Method::POST,
+        "/broker/1/completejob",
+        json!({"jobId": runner_request_id, "planId": acquired["plan"]["planId"]}),
+    )
+    .await;
+    assert_eq!(
+        duplicate_completion,
+        StatusCode::NO_CONTENT,
+        "broker completion retries are idempotent"
+    );
+    let renew_after_completion = status_with_bearer(
+        &app,
+        &runner_token,
+        Method::POST,
+        "/broker/1/renewjob",
+        json!({"jobId": runner_request_id, "planId": acquired["plan"]["planId"]}),
+    )
+    .await;
+    assert_eq!(
+        renew_after_completion,
+        StatusCode::CONFLICT,
+        "completed broker requests cannot be renewed"
+    );
     let completed_run = request_json(
         &app,
         Method::GET,
@@ -4075,7 +5700,106 @@ async fn broker_job_refs_use_session_runner_id_for_pool_and_root_polls() {
 }
 
 #[tokio::test]
-async fn action_download_info_returns_remote_action_tickets() {
+async fn action_download_info_returns_batch_download_collection() {
+    // Held for the whole test: `PRELOOP_GITHUB_API_URL` is process-global.
+    let _env = crate::state::GITHUB_ENV_LOCK.lock().await;
+    let _token = crate::state::TestEnvVar::set("PRELOOP_GITHUB_TOKEN", "mock-bearer-token");
+
+    // Hermetic ref→SHA resolution: a mock GitHub API answers `commits/{ref}`
+    // with a fixed SHA so the batch handler never touches real GitHub.
+    let api_listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let api_base = format!("http://{}", api_listener.local_addr().unwrap());
+    let mock = axum::Router::new().route(
+        "/repos/:owner/:repo/commits/:git_ref",
+        axum::routing::get(|| async {
+            axum::Json(serde_json::json!({"sha": "abc123def456abc123def456abc123def456abc1"}))
+        }),
+    );
+    tokio::spawn(async move {
+        axum::serve(api_listener, mock).await.unwrap();
+    });
+    let _api_url = crate::state::TestEnvVar::set("PRELOOP_GITHUB_API_URL", &api_base);
+
+    let temp = tempfile::tempdir().unwrap();
+    let app = app(
+        AppState::new(temp.path().to_path_buf()).await.unwrap(),
+        CancellationToken::new(),
+    );
+
+    // Official runner batch shape: `ActionReferenceList` of
+    // `{nameWithOwner, ref, path}`. Local (`./`) and docker refs are dropped.
+    let response = request_json(
+        &app,
+        Method::POST,
+        "/runner/server/_apis/v1/ActionDownloadInfo/scope/actions/plan",
+        json!({
+            "actions": [
+                {"nameWithOwner": "actions/checkout", "ref": "v4", "path": ""},
+                {"nameWithOwner": "owner/repo", "ref": "main", "path": "sub/dir"},
+                {"nameWithOwner": "actions/setup-node.js", "ref": "v4", "path": ""},
+                {"nameWithOwner": "./.github/actions/local", "ref": ""},
+                {"nameWithOwner": "docker://alpine:3.20", "ref": ""}
+            ]
+        }),
+    )
+    .await;
+
+    // Reply is an `ActionDownloadInfoCollection`: `actions` keyed by
+    // `nameWithOwner@ref`, each entry an `ActionDownloadInfo`.
+    let actions = response["actions"].as_object().unwrap();
+
+    let checkout = &actions["actions/checkout@v4"];
+    assert_eq!(checkout["nameWithOwner"], "actions/checkout");
+    assert_eq!(checkout["ref"], "v4");
+    // The ref is pinned to the SHA the mock API resolves.
+    assert_eq!(
+        checkout["resolvedSha"],
+        "abc123def456abc123def456abc123def456abc1"
+    );
+    // The runner reads `tarballUrl`; it carries a signed, expiring ticket
+    // pinned to the resolved SHA (the bearerless route treats the URL as the
+    // capability).
+    let tarball = checkout["tarballUrl"].as_str().unwrap();
+    let (base, query) = tarball.split_once('?').expect("ticket query");
+    assert_eq!(
+        base,
+        "http://127.0.0.1:9090/api/v1/actions/download/actions/checkout/abc123def456abc123def456abc123def456abc1"
+    );
+    assert!(query.contains("exp=") && query.contains("sig="), "{query}");
+    // Preloop's own download capability route is HMAC signed and bearerless; operator PAT is never leaked.
+    assert!(checkout["authentication"].is_null());
+
+    // Repositories with dots in their names (e.g. actions/setup-node.js) resolve cleanly.
+    let node = &actions["actions/setup-node.js@v4"];
+    assert_eq!(node["nameWithOwner"], "actions/setup-node.js");
+    assert!(node["tarballUrl"]
+        .as_str()
+        .unwrap()
+        .contains("actions/setup-node.js/abc123def456abc123def456abc123def456abc1"));
+
+    // Subpath actions key on `nameWithOwner@ref` (path excluded, matching the
+    // runner's `GetDownloadInfoLookupKey`).
+    let sub = &actions["owner/repo@main"];
+    assert_eq!(sub["nameWithOwner"], "owner/repo");
+    assert!(
+        sub["tarballUrl"].as_str().unwrap().starts_with(
+            "http://127.0.0.1:9090/api/v1/actions/download/owner/repo/abc123def456abc123def456abc123def456abc1?"
+        ),
+        "{}",
+        sub["tarballUrl"]
+    );
+
+    // Local and docker refs are never resolvable to a download.
+    assert!(!actions.contains_key("./.github/actions/local@"));
+    assert!(!actions.contains_key("docker://alpine:3.20@"));
+    assert_eq!(actions.len(), 3);
+}
+
+#[tokio::test]
+async fn action_download_info_returns_null_auth_when_token_unset() {
+    let _env = crate::state::GITHUB_ENV_LOCK.lock().await;
+    let _no_token = crate::state::TestEnvVar::unset("PRELOOP_GITHUB_TOKEN");
+
     let temp = tempfile::tempdir().unwrap();
     let app = app(
         AppState::new(temp.path().to_path_buf()).await.unwrap(),
@@ -4088,40 +5812,98 @@ async fn action_download_info_returns_remote_action_tickets() {
         "/runner/server/_apis/v1/ActionDownloadInfo/scope/actions/plan",
         json!({
             "actions": [
-                {"action": "actions/checkout", "version": "v4"},
-                "dtolnay/rust-toolchain@stable",
-                "./.github/actions/local",
-                "docker://alpine:3.20"
+                {"nameWithOwner": "actions/checkout", "ref": "v4", "path": ""}
             ]
         }),
     )
     .await;
 
-    let tickets = response["archiveDownloadTickets"].as_object().unwrap();
-    // The URL carries a signed, expiring ticket: the download route is
-    // bearerless, so the URL itself is the capability.
-    let checkout = tickets["actions/checkout@v4"]["url"].as_str().unwrap();
-    let (base, query) = checkout.split_once('?').expect("ticket query");
-    assert_eq!(
-        base,
-        "http://127.0.0.1:9090/api/v1/actions/download/actions/checkout/v4"
+    let actions = response["actions"].as_object().unwrap();
+    let checkout = &actions["actions/checkout@v4"];
+    assert!(checkout["authentication"].is_null());
+}
+
+#[tokio::test]
+async fn action_download_info_discards_malformed_or_abbreviated_sha() {
+    let _env = crate::state::GITHUB_ENV_LOCK.lock().await;
+    // Mock API returns an abbreviated 7-char SHA rather than full 40-char SHA
+    let api_listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let api_base = format!("http://{}", api_listener.local_addr().unwrap());
+    let mock = axum::Router::new().route(
+        "/repos/:owner/:repo/commits/:git_ref",
+        axum::routing::get(|| async { axum::Json(serde_json::json!({"sha": "abc1234"})) }),
     );
-    assert!(query.contains("exp=") && query.contains("sig="), "{query}");
-    assert!(
-        tickets["dtolnay/rust-toolchain@stable"]["url"]
-            .as_str()
-            .unwrap()
-            .starts_with(
-                "http://127.0.0.1:9090/api/v1/actions/download/dtolnay/rust-toolchain/stable?"
-            ),
-        "{}",
-        tickets["dtolnay/rust-toolchain@stable"]["url"]
+    tokio::spawn(async move {
+        axum::serve(api_listener, mock).await.unwrap();
+    });
+    let _api_url = crate::state::TestEnvVar::set("PRELOOP_GITHUB_API_URL", &api_base);
+
+    let temp = tempfile::tempdir().unwrap();
+    let app = app(
+        AppState::new(temp.path().to_path_buf()).await.unwrap(),
+        CancellationToken::new(),
     );
-    assert!(!tickets.contains_key("./.github/actions/local"));
-    assert!(!tickets.contains_key("docker://alpine:3.20"));
+
+    let response = request_json(
+        &app,
+        Method::POST,
+        "/runner/server/_apis/v1/ActionDownloadInfo/scope/actions/plan",
+        json!({
+            "actions": [
+                {"nameWithOwner": "actions/checkout", "ref": "v4", "path": ""}
+            ]
+        }),
+    )
+    .await;
+
+    let actions = response["actions"].as_object().unwrap();
+    let checkout = &actions["actions/checkout@v4"];
+    // Short SHA was discarded; resolvedSha is null and tarball URL falls back to ref
+    assert!(checkout["resolvedSha"].is_null());
+    assert!(checkout["tarballUrl"]
+        .as_str()
+        .unwrap()
+        .contains("actions/checkout/v4?"));
+}
+
+#[tokio::test]
+async fn resolve_ref_to_sha_omits_pat_over_http() {
+    let _env = crate::state::GITHUB_ENV_LOCK.lock().await;
+    let _token = crate::state::TestEnvVar::set("PRELOOP_GITHUB_TOKEN", "secret-pat");
+
+    let api_listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let api_base = format!("http://{}", api_listener.local_addr().unwrap());
+    let mock = axum::Router::new().route(
+        "/repos/:owner/:repo/commits/:git_ref",
+        axum::routing::get(|headers: axum::http::HeaderMap| async move {
+            assert!(
+                !headers.contains_key(axum::http::header::AUTHORIZATION),
+                "PAT must never be transmitted over plain unencrypted HTTP"
+            );
+            axum::Json(serde_json::json!({"sha": "abc123def456abc123def456abc123def456abc1"}))
+        }),
+    );
+    tokio::spawn(async move {
+        axum::serve(api_listener, mock).await.unwrap();
+    });
+    let _api_url = crate::state::TestEnvVar::set("PRELOOP_GITHUB_API_URL", &api_base);
+
+    let temp = tempfile::tempdir().unwrap();
+    let app = app(
+        AppState::new(temp.path().to_path_buf()).await.unwrap(),
+        CancellationToken::new(),
+    );
+
+    let response = request_json(
+        &app,
+        Method::POST,
+        "/runner/server/_apis/v1/ActionDownloadInfo/scope/actions/plan",
+        json!({ "actions": [{"nameWithOwner": "actions/checkout", "ref": "v4"}] }),
+    )
+    .await;
     assert_eq!(
-        response["actionsDownloadInfo"],
-        response["archiveDownloadTickets"]
+        response["actions"]["actions/checkout@v4"]["resolvedSha"],
+        "abc123def456abc123def456abc123def456abc1"
     );
 }
 
@@ -4143,14 +5925,13 @@ async fn runnerresolve_actions_returns_runner_parseable_tar_urls() {
     tokio::spawn(async move {
         axum::serve(api_listener, mock).await.unwrap();
     });
-    std::env::set_var("PRELOOP_GITHUB_API_URL", &api_base);
+    let _api_url = crate::state::TestEnvVar::set("PRELOOP_GITHUB_API_URL", &api_base);
 
     let temp = tempfile::tempdir().unwrap();
     let app = app(
         AppState::new(temp.path().to_path_buf()).await.unwrap(),
         CancellationToken::new(),
     );
-    std::env::remove_var("PRELOOP_GITHUB_API_URL");
 
     let response = request_json(
         &app,
@@ -4312,6 +6093,18 @@ async fn download_action_tarball_serves_from_cache_and_rejects_traversal() {
         .await
         .unwrap();
 
+    // Cache entry for repo with dots in its name
+    let dotted_dir = temp
+        .path()
+        .join("actions")
+        .join("test.owner")
+        .join("test.repo.js")
+        .join("v1#tag");
+    tokio::fs::create_dir_all(&dotted_dir).await.unwrap();
+    tokio::fs::write(dotted_dir.join("action.tar.gz"), b"dotted-tar-content")
+        .await
+        .unwrap();
+
     // 1. Successful cache hit, with the signed ticket the server mints
     let expires_at = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
@@ -4341,6 +6134,113 @@ async fn download_action_tarball_serves_from_cache_and_rejects_traversal() {
     let bytes = to_bytes(response.into_body(), usize::MAX).await.unwrap();
     assert_eq!(bytes.as_ref(), b"dummy-tar-content");
 
+    // 1b. Successful cache hit for dotted repo name and special character in tag
+    let dotted_sig = state.sign_action_ticket("test.owner", "test.repo.js", "v1#tag", expires_at);
+    let enc_ref = percent_encode_path_segment("v1#tag");
+    let response = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method(Method::GET)
+                .uri(format!(
+                    "/api/v1/actions/download/test.owner/test.repo.js/{enc_ref}?exp={expires_at}&sig={dotted_sig}"
+                ))
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+    assert_eq!(
+        to_bytes(response.into_body(), usize::MAX)
+            .await
+            .unwrap()
+            .as_ref(),
+        b"dotted-tar-content"
+    );
+
+    // 1c. Ref containing literal % (e.g. v1%tag)
+    let pct_dir = temp
+        .path()
+        .join("actions")
+        .join("test-owner")
+        .join("test-repo")
+        .join("v1%tag");
+    tokio::fs::create_dir_all(&pct_dir).await.unwrap();
+    tokio::fs::write(pct_dir.join("action.tar.gz"), b"pct-tar-content")
+        .await
+        .unwrap();
+    let pct_sig = state.sign_action_ticket("test-owner", "test-repo", "v1%tag", expires_at);
+    let enc_pct_ref = percent_encode_path_segment("v1%tag"); // "v1%25tag"
+    let response = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method(Method::GET)
+                .uri(format!(
+                    "/api/v1/actions/download/test-owner/test-repo/{enc_pct_ref}?exp={expires_at}&sig={pct_sig}"
+                ))
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+
+    // 1d. Cache miss with special ref (v1#beta) correctly percent-encodes outbound fetch
+    let _env = crate::state::GITHUB_ENV_LOCK.lock().await;
+    let api_listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let api_base = format!("http://{}", api_listener.local_addr().unwrap());
+    let mock = axum::Router::new().route(
+        "/repos/:owner/:repo/tarball/:git_ref",
+        axum::routing::get(
+            |axum::extract::Path((_owner, _repo, git_ref)): axum::extract::Path<(
+                String,
+                String,
+                String,
+            )>| async move {
+                assert_eq!(
+                    git_ref, "v1#beta",
+                    "outbound fetch must preserve exact tag without fragment stripping"
+                );
+                axum::response::Response::builder()
+                    .status(StatusCode::OK)
+                    .body(Body::from("fetched-tar-content"))
+                    .unwrap()
+            },
+        ),
+    );
+    tokio::spawn(async move {
+        axum::serve(api_listener, mock).await.unwrap();
+    });
+    let _api_url = crate::state::TestEnvVar::set("PRELOOP_GITHUB_API_URL", &api_base);
+
+    let miss_temp = tempfile::tempdir().unwrap();
+    let miss_state = AppState::new(miss_temp.path().to_path_buf()).await.unwrap();
+    let miss_app = crate::routes::app(miss_state.clone(), CancellationToken::new());
+    let miss_sig = miss_state.sign_action_ticket("test-owner", "test-repo", "v1#beta", expires_at);
+    let enc_hash_ref = percent_encode_path_segment("v1#beta");
+    let response = miss_app
+        .oneshot(
+            Request::builder()
+                .method(Method::GET)
+                .uri(format!(
+                    "/api/v1/actions/download/test-owner/test-repo/{enc_hash_ref}?exp={expires_at}&sig={miss_sig}"
+                ))
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+    assert_eq!(
+        to_bytes(response.into_body(), usize::MAX)
+            .await
+            .unwrap()
+            .as_ref(),
+        b"fetched-tar-content"
+    );
+
     // 2. Reject path traversal
     let response = app
         .clone()
@@ -4356,6 +6256,7 @@ async fn download_action_tarball_serves_from_cache_and_rejects_traversal() {
     assert_eq!(response.status(), StatusCode::BAD_REQUEST);
 
     let response = app
+        .clone()
         .oneshot(
             Request::builder()
                 .method(Method::GET)
@@ -4366,6 +6267,28 @@ async fn download_action_tarball_serves_from_cache_and_rejects_traversal() {
         .await
         .unwrap();
     assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+
+    // 2b. Reject absolute paths and leading slashes in ref
+    let response = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method(Method::GET)
+                .uri("/api/v1/actions/download/test-owner/test-repo/%2Ftmp%2Fescape")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+
+    // action_download_ticket returns None for absolute refs
+    assert!(crate::actions::action_download_ticket(
+        &state,
+        "test-owner/test-repo@/tmp/escape",
+        None
+    )
+    .is_none());
 }
 
 #[tokio::test]
@@ -4558,6 +6481,188 @@ async fn all_twirp_api_routes_reject_missing_bearer_before_body_validation() {
         assert_eq!(response.status(), StatusCode::UNAUTHORIZED, "{route}");
     }
 }
+#[tokio::test]
+async fn results_cache_and_artifact_routes_reject_inconsistent_bearers() {
+    let temp = tempfile::tempdir().unwrap();
+    let state = AppState::new(temp.path().to_path_buf()).await.unwrap();
+    let app = app(state.clone(), CancellationToken::new());
+    let subject_job = uuid::Uuid::new_v4();
+    let other_job = uuid::Uuid::new_v4();
+
+    let mismatched = state
+        .local_jwt(json!({
+            "sub": format!("preloop-job-{subject_job}"),
+            "scp": format!("Actions.Results:plan-{other_job}:{other_job}"),
+        }))
+        .unwrap();
+    let malformed = state
+        .local_jwt(json!({
+            "sub": format!("preloop-job-{subject_job}"),
+            "scp": "Actions.Results:plan",
+        }))
+        .unwrap();
+    let routes = [
+        (
+            "/twirp/github.actions.results.api.v1.CacheService/CreateCacheEntry",
+            json!({"key": "rejected-cache", "version": "v1"}),
+        ),
+        (
+            "/twirp/github.actions.results.api.v1.ArtifactService/CreateArtifact",
+            json!({
+                "workflow_run_backend_id": "rejected-plan",
+                "workflow_job_run_backend_id": subject_job.to_string(),
+                "name": "rejected-artifact",
+            }),
+        ),
+    ];
+
+    for (token, reason) in [
+        (&mismatched, "mismatched subject/scope"),
+        (&malformed, "malformed scope"),
+    ] {
+        for (uri, body) in &routes {
+            assert_eq!(
+                status_with_bearer(&app, token, Method::POST, uri, body.clone()).await,
+                StatusCode::UNAUTHORIZED,
+                "{reason} must be rejected by the Results bearer gate on {uri}"
+            );
+        }
+    }
+
+    // A regular runner token for a registered trusted run remains usable on
+    // the cache Results route and carries the same job identity the quota
+    // helper records. (Artifact creation additionally requires run scoping,
+    // and unregistered jobs fail closed on cache writes, so the cache route
+    // with a real job is the right place to prove gate-plus-quota.)
+    let trusted = crate::submit_run_inner(
+        &state.shared(),
+        preloop_gha_protocol::WorkflowSubmission {
+            workflow_yaml: "on: push\njobs:\n  build:\n    runs-on: ubuntu-latest\n    steps:\n      - run: echo hi\n"
+                .to_owned(),
+            event: "push".to_owned(),
+            payload: json!({"ref": "refs/heads/main", "commits": []}),
+            repository: "owner/repo".to_owned(),
+            git_ref: "refs/heads/main".to_owned(),
+            trust_tier: None,
+            ..Default::default()
+        },
+    )
+    .await
+    .expect("trusted submission accepted");
+    let (matching, subject_job) = {
+        let inner = state.inner.lock().await;
+        let message = queued_message_for(&inner, &trusted.run_id.to_string());
+        (
+            state.mint_runtime_token(&message.plan.plan_id, &message.job_id),
+            message.job_id,
+        )
+    };
+    assert_eq!(
+        status_with_bearer(
+            &app,
+            &matching,
+            Method::POST,
+            "/twirp/github.actions.results.api.v1.CacheService/CreateCacheEntry",
+            json!({"key": "runner-cache", "version": "v1"}),
+        )
+        .await,
+        StatusCode::OK
+    );
+
+    // The administrator credential intentionally remains a cross-job Results
+    // credential and is not assigned to a per-job quota bucket.
+    assert_eq!(
+        status_with_bearer(
+            &app,
+            &state.system_token,
+            Method::POST,
+            "/twirp/github.actions.results.api.v1.CacheService/CreateCacheEntry",
+            json!({"key": "system-cache", "version": "v1"}),
+        )
+        .await,
+        StatusCode::OK
+    );
+    assert_eq!(
+        status_with_bearer(
+            &app,
+            &state.system_token,
+            Method::POST,
+            "/twirp/github.actions.results.api.v1.ArtifactService/CreateArtifact",
+            json!({
+                "workflow_run_backend_id": "system-plan",
+                "workflow_job_run_backend_id": "system-job",
+                "name": "system-artifact",
+            }),
+        )
+        .await,
+        StatusCode::OK
+    );
+
+    let subject_job = subject_job.to_string();
+    let inner = state.inner.lock().await;
+    assert_eq!(inner.cache_v2_pending.len(), 2);
+    let cache_job_ids = inner
+        .cache_v2_pending
+        .values()
+        .map(|pending| pending.job_backend_id.as_str())
+        .collect::<Vec<_>>();
+    assert!(
+        cache_job_ids.contains(&subject_job.as_str()),
+        "the runner token's reservation must carry its job quota identity"
+    );
+    assert!(
+        cache_job_ids.contains(&""),
+        "system Results credentials must not enter a job quota bucket"
+    );
+    let artifact_job_ids = inner
+        .artifact_v2_pending
+        .values()
+        .map(|pending| pending.job_backend_id.as_str())
+        .collect::<Vec<_>>();
+    assert_eq!(
+        artifact_job_ids,
+        vec![""],
+        "only the unscoped system reservation reaches the artifact registry here"
+    );
+}
+
+#[tokio::test]
+async fn results_metadata_noop_requests_require_strict_identity() {
+    let temp = tempfile::tempdir().unwrap();
+    let state = AppState::new(temp.path().to_path_buf()).await.unwrap();
+    let app = app(state.clone(), CancellationToken::new());
+    // The Results route guard validates typed identity before body extraction,
+    // so malformed identity tokens cannot take the metadata no-op path.
+    let loose_results_token = state
+        .local_jwt(json!({
+            "sub": "preloop-job-not-a-uuid",
+            "scp": "Actions.Results:plan:not-a-uuid",
+        }))
+        .unwrap();
+
+    for route in [
+        "/twirp/results.services.receiver.Receiver/CreateStepLogsMetadata",
+        "/twirp/results.services.receiver.Receiver/CreateJobLogsMetadata",
+    ] {
+        let response = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method(Method::POST)
+                    .uri(route)
+                    .header(
+                        header::AUTHORIZATION,
+                        format!("Bearer {loose_results_token}"),
+                    )
+                    .header(header::CONTENT_TYPE, "application/json")
+                    .body(Body::from("{}"))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::UNAUTHORIZED, "{route}");
+    }
+}
 
 #[tokio::test]
 async fn twirp_metadata_routes_persist_log_metadata() {
@@ -4573,7 +6678,7 @@ async fn twirp_metadata_routes_persist_log_metadata() {
                 "workflow_run_backend_id": "run-1",
                 "size": 321,
             }),
-            "summary:step-summary",
+            "results:run-1:job-1:summary:step-summary",
         ),
         (
             "/twirp/results.services.receiver.Receiver/CreateStepLogsMetadata",
@@ -4609,15 +6714,198 @@ async fn twirp_metadata_routes_persist_log_metadata() {
     }
 
     let inner = state.inner.lock().await;
-    let summary = inner.log_metadata.get("summary:step-summary").unwrap();
+    let summary = inner
+        .log_metadata
+        .get("results:run-1:job-1:summary:step-summary")
+        .unwrap();
     assert_eq!(summary.byte_count, 321);
     assert_eq!(summary.line_count, 0);
-    let step = inner.log_metadata.get("step:step-logs").unwrap();
-    assert_eq!(step.byte_count, 560);
-    assert_eq!(step.line_count, 7);
-    let job = inner.log_metadata.get("job:job-logs").unwrap();
-    assert_eq!(job.byte_count, 720);
-    assert_eq!(job.line_count, 9);
+    // Requests without plan/job identifiers succeed without writing: there is
+    // nothing to key or authorize against.
+    assert!(!inner.log_metadata.contains_key("step:step-logs"));
+    assert!(!inner.log_metadata.contains_key("job:job-logs"));
+}
+#[tokio::test]
+async fn job_results_metadata_cannot_overwrite_another_job_namespace() {
+    let temp = tempfile::tempdir().unwrap();
+    let state = AppState::new(temp.path().to_path_buf()).await.unwrap();
+    let app = app(state.clone(), CancellationToken::new());
+    let plan_a = uuid::Uuid::new_v4().to_string();
+    let plan_b = uuid::Uuid::new_v4().to_string();
+    let job_a = uuid::Uuid::new_v4();
+    let job_b = uuid::Uuid::new_v4();
+    let token_a = state.mint_runtime_token(&plan_a, &job_a);
+    let shared_step = "shared-step";
+    let keys = [
+        format!("summary:{shared_step}"),
+        format!("step:{shared_step}"),
+        format!("job:{job_b}"),
+    ];
+    {
+        let mut inner = state.inner.lock().await;
+        for (index, key) in keys.iter().enumerate() {
+            inner.log_metadata.insert(
+                key.clone(),
+                LogMetadata {
+                    byte_count: index + 1,
+                    line_count: index + 10,
+                },
+            );
+        }
+    }
+
+    let requests = [
+        (
+            "/twirp/results.services.receiver.Receiver/CreateStepSummaryMetadata",
+            json!({
+                "step_backend_id": shared_step,
+                "workflow_job_run_backend_id": job_b,
+                "workflow_run_backend_id": plan_b,
+                "size": 999
+            }),
+        ),
+        (
+            "/twirp/results.services.receiver.Receiver/CreateStepLogsMetadata",
+            json!({
+                "step_backend_id": shared_step,
+                "workflow_job_run_backend_id": job_b,
+                "workflow_run_backend_id": plan_b,
+                "line_count": 999
+            }),
+        ),
+        (
+            "/twirp/results.services.receiver.Receiver/CreateJobLogsMetadata",
+            json!({
+                "workflow_job_run_backend_id": job_b,
+                "workflow_run_backend_id": plan_b,
+                "line_count": 999
+            }),
+        ),
+    ];
+    for (uri, body) in requests {
+        assert_eq!(
+            status_with_bearer(&app, &token_a, Method::POST, uri, body).await,
+            StatusCode::FORBIDDEN,
+            "{uri}"
+        );
+    }
+
+    let inner = state.inner.lock().await;
+    assert_eq!(
+        keys.iter()
+            .map(|key| {
+                inner
+                    .log_metadata
+                    .get(key)
+                    .map(|meta| (meta.byte_count, meta.line_count))
+            })
+            .collect::<Vec<_>>(),
+        vec![Some((1, 10)), Some((2, 11)), Some((3, 12))]
+    );
+    assert_eq!(inner.log_metadata.len(), keys.len());
+}
+
+#[tokio::test]
+async fn job_results_token_cannot_update_another_jobs_steps() {
+    let temp = tempfile::tempdir().unwrap();
+    let state = AppState::new(temp.path().to_path_buf()).await.unwrap();
+    let app = app(state.clone(), CancellationToken::new());
+    let (_, jobs) = two_job_run_for_log_filters(&app, &state).await;
+    let (_, plan_id, own_agent_job_id) = jobs[0].clone();
+    let (_, _, other_agent_job_id) = jobs[1].clone();
+    let own_job_id = uuid::Uuid::parse_str(&own_agent_job_id).unwrap();
+    let token = state.mint_runtime_token(&plan_id, &own_job_id);
+    let uri = "/twirp/github.actions.results.api.v1.WorkflowStepUpdateService/WorkflowStepsUpdate";
+    let update = |job_id: &str, external_id: &str| {
+        json!({
+            "workflow_run_backend_id": plan_id,
+            "workflow_job_run_backend_id": job_id,
+            "steps": [{
+                "external_id": external_id,
+                "number": 1,
+                "name": "Run echo",
+                "status": 6,
+                "conclusion": 2
+            }]
+        })
+    };
+
+    assert_eq!(
+        status_with_bearer(
+            &app,
+            &token,
+            Method::POST,
+            uri,
+            update(&own_agent_job_id, "own-step")
+        )
+        .await,
+        StatusCode::OK
+    );
+    assert_eq!(
+        status_with_bearer(
+            &app,
+            &token,
+            Method::POST,
+            uri,
+            update(&other_agent_job_id, "other-step")
+        )
+        .await,
+        StatusCode::FORBIDDEN
+    );
+
+    let inner = state.inner.lock().await;
+    assert!(inner
+        .job_steps
+        .get(&own_job_id)
+        .is_some_and(|steps| steps.iter().any(|step| step.id == "own-step")));
+    assert!(!inner
+        .job_steps
+        .get(&own_job_id)
+        .is_some_and(|steps| steps.iter().any(|step| step.id == "other-step")));
+    let other_job_id = uuid::Uuid::parse_str(&other_agent_job_id).unwrap();
+    assert!(!inner
+        .job_steps
+        .get(&other_job_id)
+        .is_some_and(|steps| steps.iter().any(|step| step.id == "other-step")));
+}
+
+#[tokio::test]
+async fn twirp_step_metadata_rejects_missing_step_backend_id() {
+    let temp = tempfile::tempdir().unwrap();
+    let state = AppState::new(temp.path().to_path_buf()).await.unwrap();
+    let app = app(state.clone(), CancellationToken::new());
+    let requests = [
+        (
+            "/twirp/results.services.receiver.Receiver/CreateStepSummaryMetadata",
+            json!({
+                "workflow_job_run_backend_id": "job-1",
+                "workflow_run_backend_id": "run-1",
+                "size": 321,
+            }),
+        ),
+        (
+            "/twirp/results.services.receiver.Receiver/CreateStepLogsMetadata",
+            json!({
+                "workflow_job_run_backend_id": "job-1",
+                "workflow_run_backend_id": "run-1",
+                "line_count": 7,
+            }),
+        ),
+    ];
+
+    for (uri, body) in requests {
+        let (status, payload) = request_json_status(&app, Method::POST, uri, body).await;
+        assert!(status.is_client_error(), "{uri} returned {status}");
+        assert!(
+            !matches!(payload.get("ok"), Some(Value::Bool(true))),
+            "{uri} must not report success"
+        );
+    }
+
+    assert!(
+        state.inner.lock().await.log_metadata.is_empty(),
+        "missing step ids must not create metadata"
+    );
 }
 
 #[tokio::test]
@@ -4736,6 +7024,130 @@ async fn twirp_diag_route_issues_random_blob_url_and_accepts_bearerless_upload()
 }
 
 #[tokio::test]
+async fn blob_single_shot_streams_to_disk_and_roundtrips() {
+    let temp = tempfile::tempdir().unwrap();
+    let state = AppState::new(temp.path().to_path_buf()).await.unwrap();
+    let app = app(state.clone(), CancellationToken::new());
+    let token = state.mint_runtime_token("plan-blob", &uuid::Uuid::new_v4());
+
+    // A 3 MiB single-shot upload is streamed to a temp file, never buffered
+    // whole in memory, and must round-trip byte-for-byte.
+    let payload = vec![b'z'; 3 * 1024 * 1024];
+    let put = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method(Method::PUT)
+                .uri("/twirp-blob/artifact/single-shot-tok")
+                .header(header::AUTHORIZATION, format!("Bearer {token}"))
+                .body(Body::from(payload.clone()))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(put.status(), StatusCode::CREATED);
+
+    let get = app
+        .oneshot(
+            Request::builder()
+                .method(Method::GET)
+                .uri("/twirp-blob/artifact/single-shot-tok")
+                .header(header::AUTHORIZATION, format!("Bearer {token}"))
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(get.status(), StatusCode::OK);
+    let body = to_bytes(get.into_body(), usize::MAX).await.unwrap();
+    assert_eq!(body.len(), payload.len());
+    assert_eq!(body.as_ref(), payload.as_slice());
+}
+
+#[tokio::test]
+async fn blob_blocklist_commits_are_serialized_and_survive_concurrency() {
+    let temp = tempfile::tempdir().unwrap();
+    let state = AppState::new(temp.path().to_path_buf()).await.unwrap();
+    let app = app(state.clone(), CancellationToken::new());
+    let token = state.mint_runtime_token("plan-blob", &uuid::Uuid::new_v4());
+    let bearer = format!("Bearer {token}");
+    let put_uri = "/twirp-blob/artifact/concurrent-tok";
+
+    // Stage two 1 MiB blocks (ids are base64-safe, so they survive
+    // blockid_to_filename unchanged and match the commit XML verbatim).
+    for (bid, byte) in [("YmxvY2sx", b'a'), ("YmxvY2sy", b'b')] {
+        let chunk = vec![byte; 1024 * 1024];
+        let staged = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method(Method::PUT)
+                    .uri(format!("{put_uri}?comp=block&blockid={bid}"))
+                    .header(header::AUTHORIZATION, bearer.clone())
+                    .body(Body::from(chunk))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(staged.status(), StatusCode::CREATED);
+    }
+
+    let commit_xml =
+        "<BlockList><Latest>YmxvY2sx</Latest><Latest>YmxvY2sy</Latest></BlockList>".to_string();
+    let commit = |app: Router, bearer: String, xml: String| {
+        tokio::spawn(async move {
+            app.oneshot(
+                Request::builder()
+                    .method(Method::PUT)
+                    .uri("/twirp-blob/artifact/concurrent-tok?comp=blocklist")
+                    .header(header::AUTHORIZATION, bearer)
+                    .body(Body::from(xml))
+                    .unwrap(),
+            )
+            .await
+            .unwrap()
+            .status()
+        })
+    };
+
+    // Two identical commits race. The per-(kind,token) lock serializes them,
+    // and assembly goes through a temp file + atomic rename, so a losing/late
+    // commit can never truncate or delete the blob the winner committed.
+    let (s1, s2) = tokio::join!(
+        commit(app.clone(), bearer.clone(), commit_xml.clone()),
+        commit(app.clone(), bearer.clone(), commit_xml.clone()),
+    );
+    let (s1, s2) = (s1.unwrap(), s2.unwrap());
+    assert!(
+        s1 == StatusCode::CREATED || s2 == StatusCode::CREATED,
+        "at least one concurrent commit must succeed (got {s1}, {s2})"
+    );
+
+    // The committed blob is exactly the two blocks concatenated — never a
+    // truncated or missing `data` file from a clobbering concurrent commit.
+    let get = app
+        .oneshot(
+            Request::builder()
+                .method(Method::GET)
+                .uri(put_uri)
+                .header(header::AUTHORIZATION, bearer)
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(get.status(), StatusCode::OK);
+    let body = to_bytes(get.into_body(), usize::MAX).await.unwrap();
+    assert_eq!(
+        body.len(),
+        2 * 1024 * 1024,
+        "assembled blob must contain both blocks, never truncated"
+    );
+    assert!(body[..1024 * 1024].iter().all(|&b| b == b'a'));
+    assert!(body[1024 * 1024..].iter().all(|&b| b == b'b'));
+}
+
+#[tokio::test]
 async fn native_api_rejects_job_runtime_token() {
     let temp = tempfile::tempdir().unwrap();
     let state = AppState::new(temp.path().to_path_buf()).await.unwrap();
@@ -4822,7 +7234,851 @@ async fn runner_server_v1_sensitive_routes_require_bearer() {
         );
     }
 }
+/// SEC-01. Runner/session/agent administration must reject a job's
+/// `ACTIONS_RUNTIME_TOKEN` (arbitrary workflow code holds it) while still
+/// serving the credential the runner itself owns: the official runner deletes
+/// its own session on shutdown and deregisters its own agent on clean exit
+/// through these very routes, so the guard cannot be system-token-only.
+#[tokio::test]
+async fn admin_deletes_reject_job_tokens_and_confine_runners_to_themselves() {
+    let temp = tempfile::tempdir().unwrap();
+    let state = AppState::new(temp.path().to_path_buf()).await.unwrap();
+    let runtime_token = state.mint_runtime_token("plan-delete-auth", &uuid::Uuid::new_v4());
+    let app = app(state, CancellationToken::new());
 
+    for uri in [
+        "/runner/server/_apis/distributedtask/pools/1/agents/101",
+        "/_apis/distributedtask/pools/1/agents/101",
+        "/runner/server/_apis/distributedtask/pools/1/sessions",
+        "/_apis/distributedtask/pools/1/sessions",
+        "/_apis/v1/AgentSession/1/session-1",
+        "/runner/server/_apis/v1/AgentSession/1/session-1",
+        "/acme/_apis/v1/AgentSession/1/session-1",
+    ] {
+        let status =
+            status_with_bearer(&app, &runtime_token, Method::DELETE, uri, Value::Null).await;
+        assert!(
+            matches!(status, StatusCode::UNAUTHORIZED | StatusCode::FORBIDDEN),
+            "{uri} should reject a runtime token, got {status}"
+        );
+    }
+
+    let (status, body) = try_req(
+        &app,
+        Method::DELETE,
+        "/runner/server/_apis/distributedtask/pools/1/sessions",
+        Value::Null,
+    )
+    .await;
+    assert_eq!(status, StatusCode::NO_CONTENT);
+    assert_eq!(body, Value::Null);
+
+    let (runner_a, token_a) =
+        register_runner_with_token(&app, "runner-a", &["self-hosted"], None).await;
+    let (runner_b, token_b) =
+        register_runner_with_token(&app, "runner-b", &["self-hosted"], None).await;
+    let (status, session_a) = create_disttask_session(&app, &token_a, runner_a).await;
+    assert_eq!(status, StatusCode::CREATED);
+    let session_a = session_a["sessionId"].as_str().unwrap().to_owned();
+
+    // Runner B must not end runner A's session: that strands A's in-flight
+    // job until the lease reaper notices.
+    let uri = format!("/runner/server/_apis/distributedtask/pools/1/sessions/{session_a}");
+    assert_eq!(
+        status_with_bearer(&app, &token_b, Method::DELETE, &uri, Value::Null).await,
+        StatusCode::FORBIDDEN,
+        "a runner must not delete another runner's session"
+    );
+    // Its owner may, and that is the runner's normal shutdown path.
+    assert_eq!(
+        status_with_bearer(&app, &token_a, Method::DELETE, &uri, Value::Null).await,
+        StatusCode::NO_CONTENT,
+        "a runner must be able to end its own session"
+    );
+
+    // Deregistration is likewise self-only: purging another runner revokes
+    // its listen tokens and requeues its work.
+    let foreign = format!("/runner/server/_apis/distributedtask/pools/1/agents/{runner_b}");
+    assert_eq!(
+        status_with_bearer(&app, &token_a, Method::DELETE, &foreign, Value::Null).await,
+        StatusCode::FORBIDDEN,
+        "a runner must not deregister another runner"
+    );
+    let own = format!("/runner/server/_apis/distributedtask/pools/1/agents/{runner_a}");
+    assert_eq!(
+        status_with_bearer(&app, &token_a, Method::DELETE, &own, Value::Null).await,
+        StatusCode::NO_CONTENT,
+        "a runner must be able to deregister itself on clean exit"
+    );
+    // Purging the identity revokes the listen token it was good for.
+    assert_eq!(
+        status_with_bearer(&app, &token_a, Method::DELETE, &own, Value::Null).await,
+        StatusCode::UNAUTHORIZED,
+        "a listen token must not outlive its runner registration"
+    );
+}
+
+#[tokio::test]
+async fn artifact_v2_ownership_is_enforced_by_runtime_token_scope() {
+    let temp = tempfile::tempdir().unwrap();
+    let state = AppState::new(temp.path().to_path_buf()).await.unwrap();
+    let app = app(state.clone(), CancellationToken::new());
+    let workflow =
+        "on: push\njobs:\n  build:\n    runs-on: ubuntu-latest\n    steps:\n      - run: echo hi\n";
+    let artifact_name = "owner-artifact";
+    let artifact_bytes = b"artifact bytes from owner".to_vec();
+    let artifact_size = artifact_bytes.len().to_string();
+
+    let owner_run = submit_yaml(&app, workflow, "owner/repo").await;
+    let owner_run_id = owner_run["run_id"].as_str().unwrap().to_owned();
+    let (owner_plan_id, owner_job_id, owner_token) = {
+        let inner = state.inner.lock().await;
+        let message = queued_message_for(&inner, &owner_run_id);
+        (
+            message.plan.plan_id.clone(),
+            message.job_id.to_string(),
+            state.mint_runtime_token(&message.plan.plan_id, &message.job_id),
+        )
+    };
+
+    let foreign_run = submit_yaml(&app, workflow, "owner/repo").await;
+    let foreign_run_id = foreign_run["run_id"].as_str().unwrap().to_owned();
+    let foreign_token = {
+        let inner = state.inner.lock().await;
+        let message = queued_message_for(&inner, &foreign_run_id);
+        state.mint_runtime_token(&message.plan.plan_id, &message.job_id)
+    };
+
+    let create_request = json!({
+        "workflow_run_backend_id": owner_plan_id.clone(),
+        "workflow_job_run_backend_id": owner_job_id.clone(),
+        "name": artifact_name,
+    });
+    let created = request_json_with_bearer(
+        &app,
+        Method::POST,
+        "/twirp/github.actions.results.api.v1.ArtifactService/CreateArtifact",
+        create_request,
+        &owner_token,
+    )
+    .await;
+    assert_eq!(created["ok"], true);
+    let upload_url = created["signed_upload_url"].as_str().unwrap().to_owned();
+    assert!(!upload_url.is_empty());
+
+    let upload = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method(Method::PUT)
+                .uri(upload_url)
+                .body(Body::from(artifact_bytes.clone()))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(upload.status(), StatusCode::CREATED);
+
+    let finalize_request = json!({
+        "workflow_run_backend_id": owner_plan_id.clone(),
+        "workflow_job_run_backend_id": owner_job_id.clone(),
+        "name": artifact_name,
+        "size": artifact_size.clone(),
+    });
+    let denied_finalize = status_with_bearer(
+        &app,
+        &foreign_token,
+        Method::POST,
+        "/twirp/github.actions.results.api.v1.ArtifactService/FinalizeArtifact",
+        finalize_request.clone(),
+    )
+    .await;
+    assert_eq!(denied_finalize, StatusCode::FORBIDDEN);
+    let artifact_key = artifact_v2_registry_key(&owner_run_id, artifact_name);
+    {
+        let inner = state.inner.lock().await;
+        assert!(inner
+            .artifact_v2_pending
+            .values()
+            .any(|pending| pending.registry_key == artifact_key));
+        assert!(!inner.artifact_v2_registry.contains_key(&artifact_key));
+    }
+
+    let finalized = request_json_with_bearer(
+        &app,
+        Method::POST,
+        "/twirp/github.actions.results.api.v1.ArtifactService/FinalizeArtifact",
+        finalize_request.clone(),
+        &owner_token,
+    )
+    .await;
+    let artifact_id = finalized["artifact_id"].as_str().unwrap().to_owned();
+    assert_eq!(finalized["ok"], true);
+    assert_eq!(artifact_id, "1");
+    {
+        let inner = state.inner.lock().await;
+        let entry = inner
+            .artifact_v2_registry
+            .get(&artifact_key)
+            .expect("owner artifact must be registered");
+        assert_eq!(entry.id, 1);
+        assert_eq!(entry.workflow_run_backend_id, owner_plan_id);
+        assert_eq!(entry.workflow_job_run_backend_id, owner_job_id);
+        assert_eq!(entry.name, artifact_name);
+        assert_eq!(entry.size, artifact_bytes.len() as u64);
+        assert_eq!(entry.digest, None);
+        assert!(inner.artifact_v2_pending.is_empty());
+    }
+
+    let list_request = json!({
+        "workflow_run_backend_id": owner_plan_id.clone(),
+        "workflow_job_run_backend_id": owner_job_id.clone(),
+    });
+    let listed = request_json_with_bearer(
+        &app,
+        Method::POST,
+        "/twirp/github.actions.results.api.v1.ArtifactService/ListArtifacts",
+        list_request.clone(),
+        &owner_token,
+    )
+    .await;
+    let artifacts = listed["artifacts"].as_array().unwrap();
+    assert_eq!(artifacts.len(), 1);
+    let artifact = &artifacts[0];
+    assert_eq!(artifact["database_id"].as_str(), Some(artifact_id.as_str()));
+    assert_eq!(
+        artifact["workflow_run_backend_id"].as_str(),
+        Some(owner_plan_id.as_str())
+    );
+    assert_eq!(
+        artifact["workflow_job_run_backend_id"].as_str(),
+        Some(owner_job_id.as_str())
+    );
+    assert_eq!(artifact["name"].as_str(), Some(artifact_name));
+    assert_eq!(artifact["size"].as_str(), Some(artifact_size.as_str()));
+
+    let signed_request = json!({
+        "workflow_run_backend_id": owner_plan_id.clone(),
+        "workflow_job_run_backend_id": owner_job_id.clone(),
+        "name": artifact_name,
+    });
+    let signed = request_json_with_bearer(
+        &app,
+        Method::POST,
+        "/twirp/github.actions.results.api.v1.ArtifactService/GetSignedArtifactURL",
+        signed_request.clone(),
+        &owner_token,
+    )
+    .await;
+    let signed_url = signed["signed_url"].as_str().unwrap().to_owned();
+    assert!(!signed_url.is_empty());
+
+    let downloaded = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method(Method::GET)
+                .uri(&signed_url)
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(downloaded.status(), StatusCode::OK);
+    let downloaded_bytes = to_bytes(downloaded.into_body(), usize::MAX).await.unwrap();
+    assert_eq!(downloaded_bytes.as_ref(), artifact_bytes.as_slice());
+
+    for (uri, body) in [
+        (
+            "/twirp/github.actions.results.api.v1.ArtifactService/ListArtifacts",
+            list_request.clone(),
+        ),
+        (
+            "/twirp/github.actions.results.api.v1.ArtifactService/GetSignedArtifactURL",
+            signed_request.clone(),
+        ),
+        (
+            "/twirp/github.actions.results.api.v1.ArtifactService/DeleteArtifact",
+            signed_request.clone(),
+        ),
+    ] {
+        let status = status_with_bearer(&app, &foreign_token, Method::POST, uri, body).await;
+        assert_eq!(status, StatusCode::FORBIDDEN, "{uri}");
+    }
+    {
+        let inner = state.inner.lock().await;
+        assert!(inner.artifact_v2_registry.contains_key(&artifact_key));
+    }
+
+    let deleted = request_json_with_bearer(
+        &app,
+        Method::POST,
+        "/twirp/github.actions.results.api.v1.ArtifactService/DeleteArtifact",
+        signed_request,
+        &owner_token,
+    )
+    .await;
+    assert_eq!(deleted["ok"], true);
+    assert_eq!(deleted["artifact_id"].as_str(), Some(artifact_id.as_str()));
+    {
+        let inner = state.inner.lock().await;
+        assert!(!inner.artifact_v2_registry.contains_key(&artifact_key));
+    }
+}
+
+/// The system-token split must not swallow job-facing runner traffic. The
+/// distributedtask message DELETE is paired with the GET on the same prefix;
+/// dropping it (as an earlier cut of the split did) 404s every client that
+/// polls messages there, since no other route serves that path.
+#[tokio::test]
+async fn disttask_message_delete_stays_reachable_for_protocol_tokens() {
+    let temp = tempfile::tempdir().unwrap();
+    let state = AppState::new(temp.path().to_path_buf()).await.unwrap();
+    let app = app(state.clone(), CancellationToken::new());
+    let (runner_id, listen_token) =
+        register_runner_with_token(&app, "message-ack-runner", &["self-hosted"], None).await;
+    let (_, session) = create_disttask_session(&app, &listen_token, runner_id).await;
+    assert!(session.get("sessionId").and_then(Value::as_str).is_some());
+    let session_id = session["sessionId"].as_str().unwrap();
+    let status = status_with_bearer(
+        &app,
+        &listen_token,
+        Method::DELETE,
+        &format!("/runner/server/_apis/distributedtask/pools/1/messages/7?sessionId={session_id}"),
+        Value::Null,
+    )
+    .await;
+    assert_eq!(
+        status,
+        StatusCode::NO_CONTENT,
+        "message ack must stay on the distributedtask prefix under the runner protocol guard"
+    );
+}
+#[tokio::test]
+async fn listener_token_probe_gates_only_job_lifecycle_calls() {
+    use std::sync::atomic::Ordering::Relaxed;
+
+    let temp = tempfile::tempdir().unwrap();
+    let state = AppState::new(temp.path().to_path_buf()).await.unwrap();
+    let app = app(state.clone(), CancellationToken::new());
+    let (runner_id, listen_token) =
+        register_runner_with_token(&app, "runner-1", &["self-hosted"], None).await;
+
+    let workflow =
+        "on: push\njobs:\n  build:\n    runs-on: ubuntu-latest\n    steps:\n      - run: echo hi\n";
+    let run = submit_yaml(&app, workflow, "owner/repo").await;
+    let run_id = run["run_id"].as_str().unwrap().to_owned();
+
+    let session = request_json(
+        &app,
+        Method::POST,
+        "/runner/server/_apis/distributedtask/pools/1/sessions",
+        json!({
+            "agent": {"id": runner_id, "name": "runner-1"},
+            "ownerName": "owner",
+            "sessionId": "00000000-0000-0000-0000-000000000000",
+            "useFipsEncryption": false
+        }),
+    )
+    .await;
+    let session_id = session["sessionId"].as_str().unwrap().to_owned();
+
+    let (plan_id, agent_job_id) = {
+        let inner = state.inner.lock().await;
+        let message = queued_message_for(&inner, &run_id);
+        (message.plan.plan_id.clone(), message.job_id)
+    };
+    let runtime_token = state.mint_runtime_token(&plan_id, &agent_job_id);
+
+    // Claim the job so renew/complete resolve an owned request.
+    let claimed = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method(Method::GET)
+                .uri(format!(
+                    "/runner/server/_apis/distributedtask/pools/1/messages?sessionId={session_id}&waitSeconds=0"
+                ))
+                .header(header::AUTHORIZATION, format!("Bearer {listen_token}"))
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(claimed.status(), StatusCode::OK);
+
+    let acquire = json!({
+        "jobMessageId": agent_job_id.to_string(),
+        "billingOwnerId": "local",
+        "runnerOS": "macOS",
+    });
+    let acquired = request_json_with_bearer(
+        &app,
+        Method::POST,
+        &format!("/broker/{runner_id}/acquirejob"),
+        acquire,
+        &listen_token,
+    )
+    .await;
+    assert!(acquired["jobId"].is_string());
+
+    // acquirejob is the Listener's own call: baseline, never the gate.
+    assert_eq!(state.listener_token_acquire_calls.load(Relaxed), 1);
+    assert_eq!(
+        state.listener_token_lifecycle_calls.load(Relaxed),
+        0,
+        "claims and acquirejob must not register on the fencing gate"
+    );
+
+    let renew = json!({"jobId": agent_job_id.to_string(), "planId": plan_id});
+
+    // The job runtime token is what Plan 004's fencing carrier rides.
+    let renewed = request_json_with_bearer(
+        &app,
+        Method::POST,
+        &format!("/broker/{runner_id}/renewjob"),
+        renew.clone(),
+        &runtime_token,
+    )
+    .await;
+    assert!(renewed["lockedUntil"].is_string());
+    assert_eq!(
+        state.listener_token_lifecycle_calls.load(Relaxed),
+        0,
+        "a renew on the job runtime token is the assumed path, not a finding"
+    );
+
+    // The bare listen token on the same route is the finding.
+    let renewed = request_json_with_bearer(
+        &app,
+        Method::POST,
+        &format!("/broker/{runner_id}/renewjob"),
+        renew,
+        &listen_token,
+    )
+    .await;
+    assert!(renewed["lockedUntil"].is_string());
+    assert_eq!(state.listener_token_lifecycle_calls.load(Relaxed), 1);
+
+    let completed = status_with_bearer(
+        &app,
+        &listen_token,
+        Method::POST,
+        &format!("/broker/{runner_id}/completejob"),
+        json!({"jobId": agent_job_id.to_string(), "planId": plan_id, "conclusion": "succeeded"}),
+    )
+    .await;
+    assert_eq!(completed, StatusCode::NO_CONTENT);
+    assert_eq!(state.listener_token_lifecycle_calls.load(Relaxed), 2);
+    assert_eq!(
+        state.listener_token_acquire_calls.load(Relaxed),
+        1,
+        "the baseline counter must not absorb lifecycle findings"
+    );
+}
+
+#[tokio::test]
+async fn legacy_runner_aliases_require_registration_and_bound_runner_credentials() {
+    let temp = tempfile::tempdir().unwrap();
+    let state = AppState::new(temp.path().to_path_buf()).await.unwrap();
+    let app = app(state.clone(), CancellationToken::new());
+    let socket_app = app
+        .clone()
+        .layer(middleware::from_fn(crate::auth::runner_surface_only));
+    let prefixes = ["/runner/server/_apis/v1", "/_apis/v1", "/contoso/_apis/v1"];
+
+    // The TCP router and the guest-mounted socket must reject the complete
+    // legacy lifecycle surface before it can create or address an identity.
+    for surface in [&app, &socket_app] {
+        for prefix in prefixes {
+            for (method, suffix, body) in [
+                (Method::GET, "/Agent/1/0", Value::Null),
+                (
+                    Method::POST,
+                    "/Agent/1/0",
+                    json!({"name": "unauthorized", "labels": []}),
+                ),
+                (
+                    Method::POST,
+                    "/AgentSession/1/session",
+                    json!({"agent": {"id": 1, "name": "unauthorized"}}),
+                ),
+                (
+                    Method::GET,
+                    "/Message/1?sessionId=session&waitSeconds=0",
+                    Value::Null,
+                ),
+                (Method::GET, "/AgentRequest/1/1", Value::Null),
+                (Method::PATCH, "/Timeline/s/h/p/t", json!({})),
+                (Method::POST, "/Logfiles/s/h/p", json!({})),
+                (Method::POST, "/Logfiles/s/h/p/l", json!({})),
+                (Method::POST, "/TimeLineWebConsoleLog/s/h/p/t/r", json!({})),
+                (Method::POST, "/FinishJob/s/h/p", json!({})),
+                (Method::POST, "/ActionDownloadInfo/s/h/p", json!({})),
+            ] {
+                let uri = format!("{prefix}{suffix}");
+                assert_eq!(
+                    request_status_without_bearer(surface, method.clone(), &uri, body).await,
+                    StatusCode::UNAUTHORIZED,
+                    "{method} {uri} must reject an unauthenticated caller"
+                );
+            }
+        }
+    }
+    // The configure client also uses the distributedtask registration alias.
+    // It must enforce the same boundary on TCP and the guest socket.
+    for surface in [&app, &socket_app] {
+        assert_eq!(
+            request_status_without_bearer(
+                surface,
+                Method::POST,
+                "/runner/server/_apis/distributedtask/pools/1/agents",
+                json!({"name": "unauthorized", "labels": []}),
+            )
+            .await,
+            StatusCode::UNAUTHORIZED,
+            "distributedtask registration must reject an unauthenticated caller"
+        );
+    }
+
+    // The GitHub-compatible endpoint returns a narrowly scoped local
+    // RunnerManage credential. That credential is valid for all registration
+    // aliases, unlike an arbitrary locally signed JWT.
+    let registration = request_json_with_bearer(
+        &app,
+        Method::POST,
+        "/api/v3/actions/runner-registration",
+        json!({"url": "https://github.com/acme/repo"}),
+        DEFAULT_PRELOOP_SYSTEM_TOKEN,
+    )
+    .await;
+    let manage = registration["token"].as_str().unwrap();
+    let registration_paths = [
+        (
+            "/runner/server/_apis/distributedtask/pools/1/agents",
+            "distributedtask",
+        ),
+        ("/runner/server/_apis/v1/Agent/1/0", "runner-server"),
+        ("/_apis/v1/Agent/1/0", "root"),
+        ("/contoso/_apis/v1/Agent/1/0", "org"),
+    ];
+    let mut registered = Vec::new();
+    for (path, name) in registration_paths {
+        let body = json!({"name": name, "labels": ["self-hosted"]});
+        let response = request_json_with_bearer(&app, Method::POST, path, body, manage).await;
+        registered.push((
+            response["id"].as_i64().unwrap(),
+            response["authorization"]["clientId"]
+                .as_str()
+                .unwrap()
+                .to_owned(),
+        ));
+    }
+
+    // A pool-issued one-time credential is the alternate host-side
+    // registration path. It is consumed by the handler, not reusable.
+    stage_provision_token(&state, "one-time-provision");
+    let provisioned = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method(Method::POST)
+                .uri("/runner/server/_apis/distributedtask/pools/1/agents")
+                .header("x-preloop-provision-token", "one-time-provision")
+                .header(header::CONTENT_TYPE, "application/json")
+                .body(Body::from(
+                    json!({"name": "provisioned", "labels": []}).to_string(),
+                ))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(provisioned.status(), StatusCode::OK);
+    assert!(
+        state
+            .pending_registrations
+            .read()
+            .map(|pending| pending.is_empty())
+            .unwrap_or(false),
+        "the provision credential must be single-use"
+    );
+
+    // Knowing a client id is not an OAuth credential. The JSON compatibility
+    // flow is intentionally limited to the trusted local control-plane token;
+    // production runners use the signed client_assertion form.
+    let oauth_body = json!({
+        "grant_type": "client_credentials",
+        "client_id": registered[0].1.clone(),
+        "client_secret": "unused"
+    });
+    assert_eq!(
+        request_status_without_bearer(
+            &app,
+            Method::POST,
+            "/runner/server/_apis/v1/oauth2/token",
+            oauth_body.clone(),
+        )
+        .await,
+        StatusCode::UNAUTHORIZED
+    );
+    let oauth_a = request_json_with_bearer(
+        &app,
+        Method::POST,
+        "/runner/server/_apis/v1/oauth2/token",
+        oauth_body,
+        DEFAULT_PRELOOP_SYSTEM_TOKEN,
+    )
+    .await;
+    let token_a = oauth_a["access_token"].as_str().unwrap().to_owned();
+
+    assert_eq!(
+        request_status_with_bearer(
+            &app,
+            Method::POST,
+            "/_apis/v1/Agent/1/0",
+            json!({"name": "listen-token-registration", "labels": []}),
+            &token_a,
+        )
+        .await,
+        StatusCode::UNAUTHORIZED,
+        "a RunnerListen token must not authorize a new registration"
+    );
+    assert_eq!(
+        request_status_with_bearer(
+            &app,
+            Method::POST,
+            "/runner/server/_apis/distributedtask/pools/1/agents",
+            json!({"name": "listen-token-registration", "labels": []}),
+            &token_a,
+        )
+        .await,
+        StatusCode::UNAUTHORIZED,
+        "a RunnerListen token must not authorize distributedtask registration"
+    );
+    let oauth_b = request_json_with_bearer(
+        &app,
+        Method::POST,
+        "/_apis/v1/oauth2/token",
+        json!({
+            "grant_type": "client_credentials",
+            "client_id": registered[1].1.clone(),
+            "client_secret": "unused"
+        }),
+        DEFAULT_PRELOOP_SYSTEM_TOKEN,
+    )
+    .await;
+    let token_b = oauth_b["access_token"].as_str().unwrap().to_owned();
+
+    assert_eq!(
+        request_status_with_bearer(
+            &app,
+            Method::DELETE,
+            &format!(
+                "/runner/server/_apis/distributedtask/pools/1/agents/{}",
+                registered[0].0
+            ),
+            Value::Null,
+            &token_b,
+        )
+        .await,
+        StatusCode::FORBIDDEN,
+        "runner B must not delete runner A"
+    );
+
+    // Session creation binds the stored owner to the verified listen token,
+    // not to a caller-controlled agent.id field.
+    assert_eq!(
+        request_status_with_bearer(
+            &app,
+            Method::POST,
+            "/runner/server/_apis/v1/AgentSession/1/session-cross",
+            json!({"agent": {"id": registered[1].0, "name": "wrong"}}),
+            &token_a,
+        )
+        .await,
+        StatusCode::FORBIDDEN
+    );
+    let session_a = request_json_with_bearer(
+        &app,
+        Method::POST,
+        "/runner/server/_apis/v1/AgentSession/1/session-a",
+        json!({"agent": {"id": registered[0].0, "name": "runner-a"}}),
+        &token_a,
+    )
+    .await;
+    let session_a_id = session_a["sessionId"].as_str().unwrap().to_owned();
+    let _session_b = request_json_with_bearer(
+        &app,
+        Method::POST,
+        "/contoso/_apis/v1/AgentSession/1/session-b",
+        json!({"agent": {"id": registered[1].0, "name": "runner-b"}}),
+        &token_b,
+    )
+    .await;
+
+    // A valid runner credential still cannot poll another runner's session,
+    // including when that session already has an inflight message.
+    assert_eq!(
+        request_status_with_bearer(
+            &app,
+            Method::GET,
+            &format!("/_apis/v1/Message/1?sessionId={session_a_id}&waitSeconds=0"),
+            Value::Null,
+            &token_b,
+        )
+        .await,
+        StatusCode::FORBIDDEN
+    );
+    assert_eq!(
+        request_status_with_bearer(
+            &app,
+            Method::GET,
+            &format!("/runner/server/_apis/v1/Message/1?sessionId={session_a_id}&waitSeconds=0"),
+            Value::Null,
+            &token_a,
+        )
+        .await,
+        StatusCode::OK
+    );
+}
+
+#[tokio::test]
+async fn legacy_agent_requests_are_bound_to_runner_identity() {
+    let temp = tempfile::tempdir().unwrap();
+    let state = AppState::new(temp.path().to_path_buf()).await.unwrap();
+    let app = app(state.clone(), CancellationToken::new());
+
+    let (runner_a, token_a) =
+        register_runner_with_token(&app, "agent-request-a", &["self-hosted"], None).await;
+    let (runner_b, token_b) =
+        register_runner_with_token(&app, "agent-request-b", &["self-hosted"], None).await;
+    let (session_status, session) = create_disttask_session(&app, &token_a, runner_a).await;
+    assert_eq!(session_status, StatusCode::CREATED);
+    let session_id = session["sessionId"].as_str().unwrap().to_owned();
+
+    let _accepted = submit_simple_run(&app).await;
+    let message = poll_message(&app, &token_a, &session_id).await;
+    assert_eq!(
+        message["messageType"],
+        azdo::message_type::PIPELINE_AGENT_JOB_REQUEST
+    );
+    let request_id = {
+        let inner = state.inner.lock().await;
+        *inner.session_active_requests.get(&session_id).unwrap()
+    };
+
+    // Deleting a session can happen during listener recovery. The request
+    // owner must survive that lifecycle event so the original runner can
+    // still finish its in-flight job.
+    assert_eq!(
+        request_status_with_bearer(
+            &app,
+            Method::DELETE,
+            &format!("/runner/server/_apis/v1/AgentSession/1/{session_id}"),
+            Value::Null,
+            &token_a,
+        )
+        .await,
+        StatusCode::NO_CONTENT
+    );
+
+    for (method, body) in [
+        (Method::GET, Value::Null),
+        (Method::POST, Value::Null),
+        (Method::PATCH, json!({"result": "failed"})),
+    ] {
+        assert_eq!(
+            request_status_with_bearer(
+                &app,
+                method.clone(),
+                &format!("/runner/server/_apis/v1/AgentRequest/1/{request_id}"),
+                body,
+                &token_b,
+            )
+            .await,
+            StatusCode::FORBIDDEN,
+            "runner B must not address runner A's agent request with {method}"
+        );
+    }
+
+    assert_eq!(
+        request_status_with_bearer(
+            &app,
+            Method::PATCH,
+            &format!("/runner/server/_apis/v1/AgentRequest/1/{request_id}"),
+            json!({"result": "succeeded"}),
+            &token_a,
+        )
+        .await,
+        StatusCode::OK
+    );
+
+    // Completion does not make the request readable or writable by another
+    // registered runner; the owner is retained on the request record.
+    for (method, body) in [
+        (Method::GET, Value::Null),
+        (Method::PATCH, json!({"result": "failed"})),
+    ] {
+        assert_eq!(
+            request_status_with_bearer(
+                &app,
+                method.clone(),
+                &format!("/runner/server/_apis/v1/AgentRequest/1/{request_id}"),
+                body,
+                &token_b,
+            )
+            .await,
+            StatusCode::FORBIDDEN,
+            "runner B must not address completed runner A request with {method}"
+        );
+    }
+    let inner = state.inner.lock().await;
+    assert_eq!(
+        inner.job_requests.get(&request_id).unwrap().result,
+        Some(ExecutionStatus::Success)
+    );
+    let _ = runner_b;
+}
+
+#[tokio::test]
+async fn legacy_provision_token_is_consumed_atomically() {
+    let temp = tempfile::tempdir().unwrap();
+    let state = AppState::new(temp.path().to_path_buf()).await.unwrap();
+    let app = app(state.clone(), CancellationToken::new());
+    stage_provision_token(&state, "concurrent-provision");
+
+    let make_request = || {
+        Request::builder()
+            .method(Method::POST)
+            .uri("/_apis/v1/Agent/1/0")
+            .header("x-preloop-provision-token", "concurrent-provision")
+            .header(header::CONTENT_TYPE, "application/json")
+            .body(Body::from(
+                json!({"name": "concurrent", "labels": []}).to_string(),
+            ))
+            .unwrap()
+    };
+    let (first, second) = tokio::join!(
+        app.clone().oneshot(make_request()),
+        app.clone().oneshot(make_request())
+    );
+    let first = first.unwrap().status();
+    let second = second.unwrap().status();
+
+    assert!(
+        [first, second].contains(&StatusCode::OK),
+        "one concurrent registration must consume the token: {first}, {second}"
+    );
+    assert!(
+        [first, second].contains(&StatusCode::UNAUTHORIZED),
+        "the consumed token must reject the competing registration: {first}, {second}"
+    );
+    assert!(state
+        .pending_registrations
+        .read()
+        .map(|pending| pending.is_empty())
+        .unwrap_or(false));
+}
 #[tokio::test]
 async fn oidc_endpoint_mints_rs256_jwt_with_requested_audience() {
     let temp = tempfile::tempdir().unwrap();
@@ -4898,6 +8154,98 @@ async fn oidc_endpoint_mints_rs256_jwt_with_requested_audience() {
 
     // Verify the OIDC keypair is persisted.
     assert!(temp.path().join("oidc-key.json").exists());
+}
+
+#[tokio::test]
+async fn results_surfaces_agree_on_alternate_uuid_scope_spelling() {
+    let temp = tempfile::tempdir().unwrap();
+    let state = AppState::new(temp.path().to_path_buf()).await.unwrap();
+    let app = app(state.clone(), CancellationToken::new());
+
+    request_json(
+        &app,
+        Method::POST,
+        "/api/v1/runs",
+        json!({
+            "workflow_yaml": "on: push\npermissions:\n  id-token: write\njobs:\n  build:\n    runs-on: ubuntu-latest\n    steps: [{ run: \"echo hi\" }]\n",
+            "event": "push",
+            "repository": "owner/repo"
+        }),
+    )
+    .await;
+
+    let (plan_id, agent_job_id) = {
+        let inner = state.inner.lock().await;
+        inner
+            .queue
+            .front()
+            .map(|job| (job.message.plan.plan_id.clone(), job.message.job_id))
+            .unwrap()
+    };
+    let alternate_scope_token = state
+        .local_jwt(json!({
+            "sub": format!("preloop-job-{agent_job_id}"),
+            "scp": format!(
+                "Actions.Results:{plan_id}:{}",
+                agent_job_id.to_string().to_uppercase()
+            ),
+        }))
+        .unwrap();
+
+    // The trust-tier surface already accepts UUID spelling variants through
+    // the canonical Results payload parser.
+    assert_eq!(
+        crate::events::trust_tier::fork_restricted_from_token(&state, &alternate_scope_token).await,
+        Some(false)
+    );
+
+    let malformed_job_token = state
+        .local_jwt(json!({
+            "sub": "preloop-job-not-a-uuid",
+            "scp": format!("Actions.Results:{plan_id}:{agent_job_id}"),
+        }))
+        .unwrap();
+    assert_eq!(
+        crate::events::trust_tier::fork_restricted_from_token(&state, &malformed_job_token).await,
+        Some(true),
+        "job-shaped malformed claims must keep cache writes fail-closed"
+    );
+    // Before centralization, the OIDC surface compared the raw scope string,
+    // so this valid Results identity was rejected: the scope spells the job
+    // UUID uppercase while the path uses the canonical lowercase spelling.
+    // (Using the same spelling in both would compare equal pre-centralization
+    // and prove nothing.)
+    let oidc_status = status_with_bearer(
+        &app,
+        &alternate_scope_token,
+        Method::GET,
+        &format!(
+            "/runner/server/_apis/distributedtask/hubs/actions/plans/{plan_id}/jobs/{agent_job_id}/oidctoken"
+        ),
+        Value::Null,
+    )
+    .await;
+    assert_eq!(
+        oidc_status,
+        StatusCode::OK,
+        "OIDC must accept the same typed identity as trust-tier checks"
+    );
+
+    let invalid_path_status = status_with_bearer(
+        &app,
+        &alternate_scope_token,
+        Method::GET,
+        &format!(
+            "/runner/server/_apis/distributedtask/hubs/actions/plans/{plan_id}/jobs/not-a-uuid/oidctoken"
+        ),
+        Value::Null,
+    )
+    .await;
+    assert_eq!(
+        invalid_path_status,
+        StatusCode::FORBIDDEN,
+        "an invalid job path remains an authorization failure for a job token"
+    );
 }
 
 #[tokio::test]
@@ -5331,6 +8679,90 @@ async fn cancel_run_completes_github_checks_and_terminal_metadata() {
     assert_eq!(mine.len(), 1, "one cancel, one check-run completion");
     assert_eq!(mine[0]["status"], "completed");
     assert_eq!(mine[0]["conclusion"], "cancelled");
+}
+
+#[tokio::test]
+async fn completed_check_uploads_every_annotation_in_batches_of_fifty() {
+    const CHECK_RUN_ID: u64 = 7;
+    let patches = Arc::new(parking_lot::Mutex::new(Vec::<Value>::new()));
+    let mock_app = Router::new()
+        .route(
+            "/repos/owner/repo/check-runs",
+            post(|| async { Json(json!({"id": CHECK_RUN_ID})) }),
+        )
+        .route(
+            "/repos/owner/repo/check-runs/:id",
+            axum::routing::patch({
+                let patches = patches.clone();
+                move |Path(_id): Path<u64>, body: axum::extract::Json<Value>| {
+                    let patches = patches.clone();
+                    async move {
+                        patches.lock().push(body.0);
+                        Json(json!({"id": CHECK_RUN_ID}))
+                    }
+                }
+            }),
+        );
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let port = listener.local_addr().unwrap().port();
+    tokio::spawn(async move {
+        axum::serve(listener, mock_app).await.unwrap();
+    });
+
+    let _env = crate::state::GITHUB_ENV_LOCK.lock().await;
+    let _api_url =
+        crate::state::TestEnvVar::set("PRELOOP_GITHUB_API_URL", format!("http://127.0.0.1:{port}"));
+    let _token = crate::state::TestEnvVar::set("PRELOOP_GITHUB_TOKEN", "annotation-test-token");
+    let temp = tempfile::tempdir().unwrap();
+    let state = AppState::new(temp.path().to_path_buf()).await.unwrap();
+    let app = app(state.clone(), CancellationToken::new());
+    let accepted = submit_simple_run(&app).await;
+    let run_id: RunId = accepted["run_id"].as_str().unwrap().parse().unwrap();
+    let job_id = JobId("build".to_owned());
+    {
+        let mut inner = state.inner.lock().await;
+        inner
+            .runs
+            .get_mut(&run_id)
+            .unwrap()
+            .job_check_run_ids
+            .insert(job_id.clone(), CHECK_RUN_ID);
+        let events = inner.timeline_events.entry(run_id).or_default();
+        for line in 1..=120 {
+            events.push(NdjsonEvent::Annotation {
+                run_id,
+                job_id: job_id.clone(),
+                level: AnnotationLevel::Warning,
+                message: format!("warning {line}"),
+                file: Some("src/lib.rs".to_owned()),
+                line: Some(line),
+                end_line: None,
+                col: None,
+                end_column: None,
+                title: None,
+                step_id: None,
+            });
+        }
+    }
+
+    request_json(
+        &app,
+        Method::POST,
+        &format!("/api/v1/runs/{run_id}/cancel"),
+        Value::Null,
+    )
+    .await;
+
+    let patches = patches.lock();
+    assert_eq!(patches.len(), 3);
+    let batch_sizes: Vec<usize> = patches
+        .iter()
+        .map(|body| body["output"]["annotations"].as_array().unwrap().len())
+        .collect();
+    assert_eq!(batch_sizes, vec![50, 50, 20]);
+    assert!(patches[0].get("status").is_none());
+    assert_eq!(patches[2]["status"], "completed");
+    assert_eq!(patches[2]["conclusion"], "cancelled");
 }
 
 #[tokio::test]
@@ -7126,6 +10558,8 @@ async fn fork_pull_request_webhook_jobs_are_downgraded_and_secrets_denied() {
     .await
     .unwrap();
 
+    let base_sha = commit_workflow_fixture(&ws_dir, &[".github/workflows/test.yml"]);
+
     let mut state = AppState::new(temp.path().to_path_buf()).await.unwrap();
     state.webhook_secret = Some("super-secret".to_owned());
     state.local_workspace = Some(ws_dir);
@@ -7150,8 +10584,9 @@ async fn fork_pull_request_webhook_jobs_are_downgraded_and_secrets_denied() {
             },
             "base": {
                 "ref": "main",
-                "sha": "a1b2c3d4e5f6a1b2c3d4e5f6a1b2c3d4e5f6a1b2"
-            }
+                "sha": base_sha.clone()
+            },
+            "merge_commit_sha": base_sha
         },
         "repository": {
             "full_name": "owner/repo",
@@ -7430,6 +10865,96 @@ async fn a_dispatch_refused_by_the_mint_policy_fails_its_run_without_the_reaper(
     assert!(!inner.inflight_requests.contains_key(&request_id));
 }
 
+/// A settled attempt must not be acquirable. The broker retains
+/// `owner_runner_id` after completion so late protocol reads stay bound to the
+/// runner that ran the job, which means ownership alone cannot gate
+/// `acquirejob`: a runner that retries the call after reporting would be
+/// handed the job payload (and a freshly minted installation token) and would
+/// execute the same job's side effects twice, then fail to report because
+/// `renewjob` 409s and `completejob` ignores duplicates.
+#[tokio::test]
+async fn a_settled_attempt_cannot_be_acquired_again() {
+    let temp = tempfile::tempdir().unwrap();
+    let state = AppState::new(temp.path().to_path_buf()).await.unwrap();
+    let app = app(state.clone(), CancellationToken::new());
+    let registered = request_json(
+        &app,
+        Method::POST,
+        "/runner/server/_apis/v1/Agent/1/0",
+        json!({"name": "acquire-guard-runner", "version": "2.336.0"}),
+    )
+    .await;
+    let runner_id = registered["id"].as_i64().unwrap();
+    let runner_token = state
+        .local_jwt(json!({
+            "sub": format!("preloop-runner-listen-{runner_id}"),
+            "scp": "ActionsRuntime.RunnerListen",
+        }))
+        .unwrap();
+
+    submit_simple_run(&app).await;
+    let session = request_json_with_bearer(
+        &app,
+        Method::POST,
+        "/runner/server/session",
+        json!({}),
+        &runner_token,
+    )
+    .await;
+    let session_id = session["sessionId"].as_str().unwrap();
+    let job_ref = request_json_with_bearer(
+        &app,
+        Method::GET,
+        &format!("/runner/server/message?sessionId={session_id}&status=Online&waitSeconds=0"),
+        Value::Null,
+        &runner_token,
+    )
+    .await;
+    let body: Value = serde_json::from_str(job_ref["body"].as_str().unwrap()).unwrap();
+    let job_message_id = body["runner_request_id"].as_str().unwrap().to_owned();
+    let request_id = {
+        let inner = state.inner.lock().await;
+        *inner.job_requests.keys().next().unwrap()
+    };
+    let acquire =
+        json!({"jobMessageId": job_message_id, "billingOwnerId": "local", "runnerOS": "Linux"});
+
+    // A live claim acquires normally: the guard must not break dispatch.
+    assert_eq!(
+        status_with_bearer(
+            &app,
+            &runner_token,
+            Method::POST,
+            &format!("/broker/{runner_id}/acquirejob"),
+            acquire.clone(),
+        )
+        .await,
+        StatusCode::OK
+    );
+
+    request_json_with_bearer(
+        &app,
+        Method::PATCH,
+        &format!("/_apis/v1/AgentRequest/1/{request_id}"),
+        json!({"result": "Succeeded"}),
+        &runner_token,
+    )
+    .await;
+
+    assert_eq!(
+        status_with_bearer(
+            &app,
+            &runner_token,
+            Method::POST,
+            &format!("/broker/{runner_id}/acquirejob"),
+            acquire,
+        )
+        .await,
+        StatusCode::CONFLICT,
+        "a reported attempt must never be handed back to a runner"
+    );
+}
+
 #[tokio::test]
 async fn app_only_server_fetches_webhook_workflows_with_installation_token() {
     use crate::github_app::{GitHubAppCredentials, MintFailurePolicy};
@@ -7501,6 +11026,78 @@ async fn app_only_server_fetches_webhook_workflows_with_installation_token() {
         RsaPrivateKey::new(&mut rand::thread_rng(), 2048).unwrap(),
         MintFailurePolicy::LocalJwt,
     ));
+    let shared = Arc::new(SharedState {
+        state,
+        shutdown: CancellationToken::new(),
+    });
+
+    let workflows = crate::github::fetch_workflows_at(
+        &shared,
+        "preloopdev/preloop",
+        "refs/heads/main",
+        &api_base,
+    )
+    .await
+    .unwrap();
+
+    assert_eq!(workflows.len(), 1);
+    assert!(workflows["ci.yml"].contains("runs-on: self-hosted"));
+}
+
+#[tokio::test]
+async fn pat_only_server_fetches_webhook_workflows_with_configured_pat() {
+    use axum::http::HeaderMap;
+    use axum::routing::get;
+
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let api_base = format!("http://{}", listener.local_addr().unwrap());
+    let download_url = format!("{api_base}/raw/ci.yml");
+    let stub = Router::new()
+        .route(
+            "/repos/preloopdev/preloop/contents/.github/workflows",
+            get(move |headers: HeaderMap| {
+                let download_url = download_url.clone();
+                async move {
+                    assert_eq!(
+                        headers
+                            .get("authorization")
+                            .and_then(|value| value.to_str().ok()),
+                        Some("Bearer ghp_config_workflow_token")
+                    );
+                    Json(json!([{
+                        "name": "ci.yml",
+                        "type": "file",
+                        "download_url": download_url
+                    }]))
+                }
+            }),
+        )
+        .route(
+            "/raw/ci.yml",
+            get(|headers: HeaderMap| async move {
+                assert_eq!(
+                    headers
+                        .get("authorization")
+                        .and_then(|value| value.to_str().ok()),
+                    Some("Bearer ghp_config_workflow_token")
+                );
+                "on: push\njobs:\n  test:\n    runs-on: self-hosted\n    steps:\n      - run: true\n"
+            }),
+        );
+    tokio::spawn(async move { axum::serve(listener, stub).await.unwrap() });
+
+    let temp = tempfile::tempdir().unwrap();
+    let config_path = temp.path().join("config.toml");
+    std::fs::write(
+        &config_path,
+        "[github]\npat = \"ghp_config_workflow_token\"\n",
+    )
+    .unwrap();
+    let mut state = AppState::new_with_config(temp.path().join("state"), config_path)
+        .await
+        .unwrap();
+    state.local_workspace = None;
+    assert!(state.github_app.is_none());
     let shared = Arc::new(SharedState {
         state,
         shutdown: CancellationToken::new(),
@@ -7812,17 +11409,17 @@ async fn liveness_sweep_requeues_job_of_deaf_runner() {
     let job_id = JobId("build".to_owned());
     let message = poll_message(&app, &token, &session_id).await;
     assert!(!message.is_null(), "poll must claim the queued job");
-    {
+    let request_id = {
         let inner = state.inner.lock().await;
         assert!(
             inner.claimed_jobs.contains_key(&(run_id, job_id.clone())),
             "poll must record the claim in claimed_jobs"
         );
-        assert!(
-            inner.session_active_requests.contains_key(&session_id),
-            "poll must pin the claim to the session"
-        );
-    }
+        *inner
+            .session_active_requests
+            .get(&session_id)
+            .expect("poll must pin the claim to the session")
+    };
 
     // The runner goes deaf: backdate its last poll and shrink the timeout.
     {
@@ -7853,6 +11450,30 @@ async fn liveness_sweep_requeues_job_of_deaf_runner() {
             !inner.claimed_jobs.contains_key(&(run_id, job_id.clone())),
             "deaf claim must leave claimed_jobs"
         );
+        let request = &inner.job_requests[&request_id];
+        assert_eq!(
+            request.result, None,
+            "the requeued request must remain completable"
+        );
+        assert_eq!(
+            request.owner_runner_id, None,
+            "the purged runner must lose request ownership"
+        );
+        assert_eq!(request.started_at, None);
+        assert_eq!(request.last_renewed_at, None);
+        assert!(
+            inner.inflight_requests.contains_key(&request_id),
+            "the request must remain inflight for its replacement"
+        );
+        assert!(
+            crate::runtime_scheduling::live_runner_assignments(
+                &inner.job_requests,
+                &inner.session_active_requests,
+                SystemTime::now(),
+            )
+            .is_empty(),
+            "status must not report the purged runner as executing"
+        );
         assert!(
             inner
                 .queue
@@ -7861,6 +11482,40 @@ async fn liveness_sweep_requeues_job_of_deaf_runner() {
             "unfinished job must be requeued for a fresh machine"
         );
     }
+
+    // A replacement claims the same correlation, renews it, and completes the
+    // logical job. Settling the request before requeue would let the delivery
+    // happen but make both PATCHes no-ops.
+    let (replacement_id, replacement_token) =
+        register_runner_with_token(&app, "replacement-runner", &["self-hosted"], None).await;
+    let (_, replacement_session) =
+        create_disttask_session(&app, &replacement_token, replacement_id).await;
+    let replacement_session_id = replacement_session["sessionId"].as_str().unwrap();
+    let delivered = poll_message(&app, &replacement_token, replacement_session_id).await;
+    assert!(!delivered.is_null(), "replacement must receive the retry");
+    request_json_with_bearer(
+        &app,
+        Method::PATCH,
+        &format!("/_apis/v1/AgentRequest/1/{request_id}"),
+        json!({}),
+        &replacement_token,
+    )
+    .await;
+    request_json_with_bearer(
+        &app,
+        Method::PATCH,
+        &format!("/_apis/v1/AgentRequest/1/{request_id}"),
+        json!({"result": "Succeeded"}),
+        &replacement_token,
+    )
+    .await;
+    let inner = state.inner.lock().await;
+    assert_eq!(
+        inner.runs[&run_id].jobs[&job_id],
+        ExecutionStatus::Success,
+        "the replacement must be able to finish the retried job"
+    );
+    assert!(!inner.inflight_requests.contains_key(&request_id));
 }
 
 #[tokio::test]
@@ -7936,6 +11591,108 @@ async fn queued_job_survives_the_grace_window_while_the_pool_is_preparing() {
             inner.queue.is_empty(),
             "a job nobody can claim still fails once the pool is ready"
         );
+    }
+}
+
+#[tokio::test]
+async fn restored_old_job_survives_the_restarted_pools_warm_window() {
+    let temp = tempfile::tempdir().unwrap();
+    let run_id = {
+        let state = AppState::new(temp.path().to_path_buf()).await.unwrap();
+        let app = app(state.clone(), CancellationToken::new());
+        let accepted = submit_simple_run(&app).await;
+        let run_id: RunId = accepted["run_id"].as_str().unwrap().parse().unwrap();
+        {
+            let mut inner = state.inner.lock().await;
+            let cutoff = (SystemTime::now() - Duration::from_secs(700))
+                .duration_since(SystemTime::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos() as i64;
+            inner
+                .queue
+                .iter_mut()
+                .find(|job| job.run_id == run_id)
+                .unwrap()
+                .enqueued_at_unix_nanos = cutoff;
+            let snapshot = crate::store::StoreSnapshot::from_inner(&inner);
+            state.store.store_inner(&snapshot).await.unwrap();
+        }
+        run_id
+    };
+
+    let mut restored = AppState::new(temp.path().to_path_buf()).await.unwrap();
+    restored.pool_preparing = Some(std::sync::Arc::new(std::sync::atomic::AtomicBool::new(
+        true,
+    )));
+    let shared = Arc::new(SharedState {
+        state: restored.clone(),
+        shutdown: CancellationToken::new(),
+    });
+    reap_once(&shared).await;
+
+    let inner = restored.inner.lock().await;
+    assert_eq!(
+        inner.queue.len(),
+        1,
+        "durable queue age must not defeat the fresh process-local pool warm"
+    );
+    assert_eq!(
+        inner.runs[&run_id].jobs[&JobId("build".to_owned())],
+        ExecutionStatus::Queued
+    );
+}
+
+#[tokio::test]
+async fn queued_job_starves_past_the_ceiling_even_while_the_pool_is_preparing() {
+    let temp = tempfile::tempdir().unwrap();
+    let mut state = AppState::new(temp.path().to_path_buf()).await.unwrap();
+    let shutdown = CancellationToken::new();
+    let app = app(state.clone(), shutdown.clone());
+
+    // The pool signals "preparing" indefinitely -- e.g. a provision that
+    // keeps failing and retrying, or continuous successor prebuilds under
+    // sustained load -- so the signal never clears. A job this pool can
+    // never serve must still hit the bounded starvation failure path
+    // instead of being masked forever.
+    state.pool_preparing = Some(std::sync::Arc::new(std::sync::atomic::AtomicBool::new(
+        true,
+    )));
+    state.started_at = std::time::Instant::now() - Duration::from_secs(700);
+    let shared = Arc::new(SharedState {
+        state: state.clone(),
+        shutdown,
+    });
+
+    let accepted = submit_simple_run(&app).await;
+    let run_id: RunId = accepted["run_id"].as_str().unwrap().parse().unwrap();
+
+    // Age the job's ready-enqueue past the absolute ceiling.
+    {
+        let mut inner = state.inner.lock().await;
+        let cutoff = (SystemTime::now() - Duration::from_secs(700))
+            .duration_since(SystemTime::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos() as i64;
+        for job in inner.queue.iter_mut() {
+            if job.run_id == run_id {
+                job.enqueued_at_unix_nanos = cutoff;
+            }
+        }
+    }
+    reap_once(&shared).await;
+    {
+        let inner = state.inner.lock().await;
+        assert!(
+            inner.queue.is_empty(),
+            "a job past the ceiling must starve even while the pool is preparing"
+        );
+        let run = inner.runs.get(&run_id).expect("run record must survive");
+        assert_eq!(
+            run.jobs.get(&JobId("build".to_owned())),
+            Some(&ExecutionStatus::Failure),
+            "the unschedulable job must fail, not queue forever"
+        );
+        assert_eq!(run.status, ExecutionStatus::Failure);
     }
 }
 
@@ -8219,6 +11976,22 @@ async fn request_status_with_bearer(
         .method(method)
         .uri(uri)
         .header(header::AUTHORIZATION, format!("Bearer {bearer}"));
+    let request = if body.is_null() {
+        builder.body(Body::empty()).unwrap()
+    } else {
+        builder = builder.header(header::CONTENT_TYPE, "application/json");
+        builder.body(Body::from(body.to_string())).unwrap()
+    };
+    app.clone().oneshot(request).await.unwrap().status()
+}
+
+async fn request_status_without_bearer(
+    app: &Router,
+    method: Method,
+    uri: &str,
+    body: Value,
+) -> StatusCode {
+    let mut builder = Request::builder().method(method).uri(uri);
     let request = if body.is_null() {
         builder.body(Body::empty()).unwrap()
     } else {
@@ -9208,6 +12981,8 @@ jobs:
         .await
         .unwrap();
 
+    let event_sha = commit_workflow_fixture(&ws_dir, &[".github/workflows/build.yml"]);
+
     let mut state = AppState::new(temp.path().to_path_buf()).await.unwrap();
     state.webhook_secret = Some("super-secret".to_owned());
     state.local_workspace = Some(ws_dir.clone());
@@ -9221,14 +12996,14 @@ jobs:
     let payload = serde_json::json!({
         "ref": "refs/heads/main",
         "before": "0000000000000000000000000000000000000000",
-        "after": "a1b2c3d4e5f6a1b2c3d4e5f6a1b2c3d4e5f6a1b2",
+        "after": event_sha.clone(),
         "repository": {
             "full_name": "owner/repo",
             "default_branch": "main"
         },
         "commits": [
             {
-                "id": "a1b2c3d4e5f6a1b2c3d4e5f6a1b2c3d4e5f6a1b2",
+                "id": event_sha,
                 "added": ["src/main.rs"],
                 "modified": [],
                 "removed": []
@@ -9304,6 +13079,289 @@ jobs:
     assert!(*check_run_id > 0);
 }
 
+#[tokio::test]
+async fn github_webhook_fetches_workflow_from_event_sha_not_current_branch() {
+    // This is a local-workspace reproduction of the same race as the remote
+    // App path: the webhook names an older commit while the branch has already
+    // advanced to a different workflow definition.
+    let _env = crate::state::GITHUB_ENV_LOCK.lock().await;
+    let _no_token = crate::state::TestEnvVar::unset("PRELOOP_GITHUB_TOKEN");
+    let _no_api_url = crate::state::TestEnvVar::unset("PRELOOP_GITHUB_API_URL");
+
+    let temp = tempfile::tempdir().unwrap();
+    let ws_dir = temp.path().join("workspace");
+    std::fs::create_dir_all(ws_dir.join(".github/workflows")).unwrap();
+
+    let old_workflow = r#"
+name: old
+on: push
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - run: echo old-workflow
+"#;
+    let new_workflow = r#"
+name: new
+on: push
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - run: echo new-workflow
+"#;
+    std::fs::write(ws_dir.join(".github/workflows/build.yml"), old_workflow).unwrap();
+
+    let git = |args: &[&str]| -> String {
+        let output = Command::new("git")
+            .args(args)
+            .current_dir(&ws_dir)
+            .output()
+            .unwrap();
+        assert!(
+            output.status.success(),
+            "git {:?} failed: {}",
+            args,
+            String::from_utf8_lossy(&output.stderr)
+        );
+        String::from_utf8(output.stdout).unwrap().trim().to_owned()
+    };
+    let event_sha = commit_workflow_fixture(&ws_dir, &[".github/workflows/build.yml"]);
+
+    std::fs::write(ws_dir.join(".github/workflows/build.yml"), new_workflow).unwrap();
+    git(&["add", ".github/workflows/build.yml"]);
+    git(&["commit", "-m", "new workflow"]);
+    let branch_sha = git(&["rev-parse", "HEAD"]);
+    assert_ne!(event_sha, branch_sha);
+
+    let mut state = AppState::new(temp.path().to_path_buf()).await.unwrap();
+    state.webhook_secret = Some("super-secret".to_owned());
+    state.local_workspace = Some(ws_dir);
+    let app = app(state.clone(), CancellationToken::new());
+
+    let payload = serde_json::json!({
+        "ref": "refs/heads/main",
+        "before": "0000000000000000000000000000000000000000",
+        "after": event_sha,
+        "repository": {
+            "full_name": "owner/repo",
+            "default_branch": "main"
+        },
+        "commits": [{
+            "id": event_sha,
+            "added": [".github/workflows/build.yml"],
+            "modified": [],
+            "removed": []
+        }]
+    });
+    let payload_bytes = serde_json::to_vec(&payload).unwrap();
+
+    use hmac::{Hmac, Mac};
+    use sha2::Sha256;
+    type HmacSha256 = Hmac<Sha256>;
+    let mut mac = HmacSha256::new_from_slice(b"super-secret").unwrap();
+    mac.update(&payload_bytes);
+    let signature = mac
+        .finalize()
+        .into_bytes()
+        .iter()
+        .map(|byte| format!("{byte:02x}"))
+        .collect::<String>();
+
+    let response = app
+        .oneshot(
+            Request::builder()
+                .method(Method::POST)
+                .uri("/api/v1/github/webhooks")
+                .header("x-github-event", "push")
+                .header("x-github-delivery", "sha-pinned-workflow")
+                .header("x-hub-signature-256", format!("sha256={signature}"))
+                .header("content-type", "application/json")
+                .body(Body::from(payload_bytes))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+
+    let inner = state.inner.lock().await;
+    let run = inner.runs.values().next().expect("webhook created a run");
+    assert_eq!(
+        run.submission.resolved_sha.as_deref(),
+        Some(event_sha.as_str())
+    );
+    assert!(
+        run.submission.workflow_yaml.contains("old-workflow"),
+        "workflow must be loaded from the webhook commit, not current main"
+    );
+    assert!(!run.submission.workflow_yaml.contains("new-workflow"));
+}
+
+#[tokio::test]
+async fn github_webhook_rejects_missing_event_sha_without_workspace_fallback() {
+    let _env = crate::state::GITHUB_ENV_LOCK.lock().await;
+    let _no_token = crate::state::TestEnvVar::unset("PRELOOP_GITHUB_TOKEN");
+    let _no_api_url = crate::state::TestEnvVar::unset("PRELOOP_GITHUB_API_URL");
+
+    let temp = tempfile::tempdir().unwrap();
+    let ws_dir = temp.path().join("workspace");
+    fs::create_dir_all(ws_dir.join(".github/workflows")).unwrap();
+    fs::write(
+        ws_dir.join(".github/workflows/build.yml"),
+        r#"
+on: push
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - run: echo current-worktree
+"#,
+    )
+    .unwrap();
+
+    commit_workflow_fixture(&ws_dir, &[".github/workflows/build.yml"]);
+
+    let missing_sha = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa".to_owned();
+    let mut state = AppState::new(temp.path().to_path_buf()).await.unwrap();
+    state.webhook_secret = Some("super-secret".to_owned());
+    state.local_workspace = Some(ws_dir);
+    let app = app(state.clone(), CancellationToken::new());
+
+    let payload = serde_json::json!({
+        "ref": "refs/heads/main",
+        "before": "0000000000000000000000000000000000000000",
+        "after": missing_sha,
+        "repository": {
+            "full_name": "owner/repo",
+            "default_branch": "main"
+        },
+        "commits": [{
+            "id": missing_sha,
+            "added": [".github/workflows/build.yml"],
+            "modified": [],
+            "removed": []
+        }]
+    });
+    let payload_bytes = serde_json::to_vec(&payload).unwrap();
+
+    use hmac::{Hmac, Mac};
+    use sha2::Sha256;
+    type HmacSha256 = Hmac<Sha256>;
+    let mut mac = HmacSha256::new_from_slice(b"super-secret").unwrap();
+    mac.update(&payload_bytes);
+    let signature = mac
+        .finalize()
+        .into_bytes()
+        .iter()
+        .map(|byte| format!("{byte:02x}"))
+        .collect::<String>();
+
+    let response = app
+        .oneshot(
+            Request::builder()
+                .method(Method::POST)
+                .uri("/api/v1/github/webhooks")
+                .header("x-github-event", "push")
+                .header("x-github-delivery", "missing-event-sha")
+                .header("x-hub-signature-256", format!("sha256={signature}"))
+                .header("content-type", "application/json")
+                .body(Body::from(payload_bytes))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::BAD_GATEWAY);
+
+    let inner = state.inner.lock().await;
+    assert!(
+        inner.runs.is_empty(),
+        "missing event SHA must not execute current-worktree YAML"
+    );
+}
+
+#[tokio::test]
+async fn github_webhook_rejects_pull_request_target_without_base_sha() {
+    let _env = crate::state::GITHUB_ENV_LOCK.lock().await;
+    let _no_token = crate::state::TestEnvVar::unset("PRELOOP_GITHUB_TOKEN");
+    let _no_api_url = crate::state::TestEnvVar::unset("PRELOOP_GITHUB_API_URL");
+
+    let temp = tempfile::tempdir().unwrap();
+    let ws_dir = temp.path().join("workspace");
+    fs::create_dir_all(ws_dir.join(".github/workflows")).unwrap();
+    fs::write(
+        ws_dir.join(".github/workflows/build.yml"),
+        r#"
+on: pull_request_target
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - run: echo base-workflow
+"#,
+    )
+    .unwrap();
+
+    commit_workflow_fixture(&ws_dir, &[".github/workflows/build.yml"]);
+
+    let mut state = AppState::new(temp.path().to_path_buf()).await.unwrap();
+    state.webhook_secret = Some("super-secret".to_owned());
+    state.local_workspace = Some(ws_dir);
+    let app = app(state.clone(), CancellationToken::new());
+
+    let payload = serde_json::json!({
+        "action": "opened",
+        "number": 42,
+        "pull_request": {
+            "number": 42,
+            "base": { "ref": "main" },
+            "head": {
+                "ref": "feature/fork",
+                "sha": "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+                "repo": { "fork": true }
+            }
+        },
+        "repository": {
+            "full_name": "owner/repo",
+            "default_branch": "main"
+        }
+    });
+    let payload_bytes = serde_json::to_vec(&payload).unwrap();
+
+    use hmac::{Hmac, Mac};
+    use sha2::Sha256;
+    type HmacSha256 = Hmac<Sha256>;
+    let mut mac = HmacSha256::new_from_slice(b"super-secret").unwrap();
+    mac.update(&payload_bytes);
+    let signature = mac
+        .finalize()
+        .into_bytes()
+        .iter()
+        .map(|byte| format!("{byte:02x}"))
+        .collect::<String>();
+
+    let response = app
+        .oneshot(
+            Request::builder()
+                .method(Method::POST)
+                .uri("/api/v1/github/webhooks")
+                .header("x-github-event", "pull_request_target")
+                .header("x-github-delivery", "missing-base-sha")
+                .header("x-hub-signature-256", format!("sha256={signature}"))
+                .header("content-type", "application/json")
+                .body(Body::from(payload_bytes))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::BAD_GATEWAY);
+
+    let inner = state.inner.lock().await;
+    assert!(
+        inner.runs.is_empty(),
+        "pull_request_target must not execute head-controlled YAML"
+    );
+}
+
 /// Check-run ids must survive a restart even when no job status event ever
 /// fired — a long queue can sit between check-run creation and the job's
 /// first status event, and a deploy in that window used to restore the run
@@ -9334,6 +13392,8 @@ jobs:
         .await
         .unwrap();
 
+    let event_sha = commit_workflow_fixture(&ws_dir, &[".github/workflows/build.yml"]);
+
     let run_id = {
         let mut state = AppState::new(temp.path().to_path_buf()).await.unwrap();
         state.webhook_secret = Some("super-secret".to_owned());
@@ -9343,14 +13403,14 @@ jobs:
         let payload = serde_json::json!({
             "ref": "refs/heads/main",
             "before": "0000000000000000000000000000000000000000",
-            "after": "a1b2c3d4e5f6a1b2c3d4e5f6a1b2c3d4e5f6a1b2",
+            "after": event_sha.clone(),
             "repository": {
                 "full_name": "owner/repo",
                 "default_branch": "main"
             },
             "commits": [
                 {
-                    "id": "a1b2c3d4e5f6a1b2c3d4e5f6a1b2c3d4e5f6a1b2",
+                    "id": event_sha,
                     "added": ["src/main.rs"],
                     "modified": [],
                     "removed": []
@@ -9512,6 +13572,8 @@ impl WebhookDedupFixture {
         )
         .unwrap();
 
+        let event_sha = commit_workflow_fixture(&ws_dir, &[".github/workflows/build.yml"]);
+
         let mut state = AppState::new(temp.path().join("state").to_path_buf())
             .await
             .unwrap();
@@ -9522,10 +13584,10 @@ impl WebhookDedupFixture {
         let payload = serde_json::json!({
             "ref": "refs/heads/main",
             "before": "0000000000000000000000000000000000000000",
-            "after": "deadbeefdeadbeefdeadbeefdeadbeefdeadbeef",
+            "after": event_sha.clone(),
             "repository": {"full_name": "owner/repo", "default_branch": "main"},
             "commits": [{
-                "id": "deadbeefdeadbeefdeadbeefdeadbeefdeadbeef",
+                "id": event_sha,
                 "added": ["src/main.rs"],
                 "modified": [],
                 "removed": []
@@ -9686,6 +13748,24 @@ jobs:
         .await
         .unwrap();
 
+    let git = |args: &[&str]| -> String {
+        let output = Command::new("git")
+            .args(args)
+            .current_dir(&ws_dir)
+            .output()
+            .unwrap();
+        assert!(
+            output.status.success(),
+            "git {:?} failed: {}",
+            args,
+            String::from_utf8_lossy(&output.stderr)
+        );
+        String::from_utf8(output.stdout).unwrap().trim().to_owned()
+    };
+    let base_sha = commit_workflow_fixture(&ws_dir, &[".github/workflows/test.yml"]);
+    git(&["commit", "--allow-empty", "-m", "head commit"]);
+    let head_sha = git(&["rev-parse", "HEAD"]);
+
     let mut state = AppState::new(temp.path().to_path_buf()).await.unwrap();
     state.webhook_secret = Some("super-secret".to_owned());
     state.local_workspace = Some(ws_dir.clone());
@@ -9699,12 +13779,12 @@ jobs:
         "pull_request": {
             "head": {
                 "ref": "feature-branch",
-                "sha": "b2c3d4e5f6a1b2c3d4e5f6a1b2c3d4e5f6a1b2c3"
+                "sha": head_sha
             },
             "base": {
                 "ref": "main",
-                "sha": "a1b2c3d4e5f6a1b2c3d4e5f6a1b2c3d4e5f6a1b2"
-            }
+                "sha": base_sha.clone()
+            },
         },
         "repository": {
             "full_name": "owner/repo",
@@ -9753,7 +13833,7 @@ jobs:
     // the job. Falling through to all-zeros makes every checkout ask the
     // server for `0000…` and fail as "not our ref".
     assert_eq!(
-        run_record.head_sha, "b2c3d4e5f6a1b2c3d4e5f6a1b2c3d4e5f6a1b2c3",
+        run_record.head_sha, head_sha,
         "pull_request head sha must drive github.sha"
     );
 }
@@ -10672,6 +14752,8 @@ async fn config_webhook_secret_verifies_signed_deliveries() {
     )
     .await
     .unwrap();
+
+    let event_sha = commit_workflow_fixture(&ws_dir, &[".github/workflows/build.yml"]);
     let config_path = temp.path().join("config.toml");
     std::fs::write(
         &config_path,
@@ -10695,10 +14777,10 @@ async fn config_webhook_secret_verifies_signed_deliveries() {
     let payload = serde_json::json!({
         "ref": "refs/heads/main",
         "before": "0000000000000000000000000000000000000000",
-        "after": "a1b2c3d4e5f6a1b2c3d4e5f6a1b2c3d4e5f6a1b2",
+        "after": event_sha.clone(),
         "repository": {"full_name": "owner/repo", "default_branch": "main"},
         "commits": [{
-            "id": "a1b2c3d4e5f6a1b2c3d4e5f6a1b2c3d4e5f6a1b2",
+            "id": event_sha,
             "added": ["src/main.rs"],
             "modified": [],
             "removed": []
@@ -11346,6 +15428,12 @@ async fn completion_step_results_are_authoritative_over_inference() {
             .unwrap();
         (request.plan_id.clone(), request.agent_job_id.to_string())
     };
+    // The step update and the completion report describe the same step, so
+    // both carry the manifest's id — that shared identity is what makes
+    // `stepResults` authoritative over the job-status inference.
+    let step_id = workflow_step_ids(&state, run_id.parse().unwrap(), "build")
+        .await
+        .remove(0);
     request_json(
         &app,
         Method::POST,
@@ -11354,7 +15442,7 @@ async fn completion_step_results_are_authoritative_over_inference() {
             "workflow_run_backend_id": plan_id,
             "workflow_job_run_backend_id": agent_job_id,
             "steps": [{
-                "external_id": uuid::Uuid::new_v4().to_string(),
+                "external_id": step_id,
                 "number": 2,
                 "name": "Test",
                 "status": 3,
@@ -11373,7 +15461,7 @@ async fn completion_step_results_are_authoritative_over_inference() {
             "status": "failure",
             "outputs": {},
             "step_results": [{
-                "external_id": uuid::Uuid::new_v4().to_string(),
+                "external_id": step_id,
                 "number": 2,
                 "name": "Test",
                 "status": "completed",
@@ -11487,7 +15575,9 @@ async fn workflow_steps_update_prefers_runner_reported_step_names() {
             "workflow_run_backend_id": plan_id,
             "workflow_job_run_backend_id": agent_job_id,
             "steps": [{
-                "external_id": uuid::Uuid::new_v4().to_string(),
+                "external_id": workflow_step_ids(&state, run_id.parse().unwrap(), "build")
+                    .await
+                    .remove(0),
                 "number": 2,
                 "name": "Run echo hi",
                 "status": 6,
@@ -11510,6 +15600,103 @@ async fn workflow_steps_update_prefers_runner_reported_step_names() {
             .all(|step| !step["name"].as_str().unwrap_or("").is_empty()),
         "no step may have an empty name in the run record: {steps:?}"
     );
+}
+
+#[tokio::test]
+async fn workflow_steps_update_preserves_duplicate_names_after_restart() {
+    let temp = tempfile::tempdir().unwrap();
+    let state = AppState::new(temp.path().to_path_buf()).await.unwrap();
+    let app = app(state.clone(), CancellationToken::new());
+
+    let accepted = submit_yaml(
+        &app,
+        "on: push\njobs:\n  build:\n    runs-on: ubuntu-latest\n    steps:\n      - name: Test\n        run: cargo test --lib\n      - name: Test\n        run: cargo test --integration\n",
+        "local/preloop",
+    )
+    .await;
+    let run_id = accepted["run_id"].as_str().unwrap().to_owned();
+    let (plan_id, agent_job_id, request_id) = {
+        let inner = state.inner.lock().await;
+        let request = inner
+            .job_requests
+            .values()
+            .find(|request| request.run_id.0.to_string() == run_id)
+            .expect("submitted run must have a job request");
+        (
+            request.plan_id.clone(),
+            request.agent_job_id.to_string(),
+            request.request_id,
+        )
+    };
+    // The runner echoes the request message's step ids back as `external_id`
+    // (verified in `.runner-watch/golden/v2.336.0/06-multi-step`), so the two
+    // same-named steps are distinguished by identity, not by their names.
+    let ids = workflow_step_ids(&state, run_id.parse().unwrap(), "build").await;
+    assert_eq!(ids.len(), 2, "both declared steps must be in the manifest");
+    let first_id = ids[0].clone();
+    let second_id = ids[1].clone();
+
+    let response = request_json(
+        &app,
+        Method::POST,
+        "/twirp/github.actions.results.api.v1.WorkflowStepUpdateService/WorkflowStepsUpdate",
+        json!({
+            "workflow_run_backend_id": plan_id,
+            "workflow_job_run_backend_id": agent_job_id,
+            "steps": [
+                {
+                    "external_id": first_id,
+                    "number": 1,
+                    "name": "Test",
+                    "status": 6,
+                    "conclusion": 2
+                },
+                {
+                    "external_id": second_id,
+                    "number": 2,
+                    "name": "Test",
+                    "status": 6,
+                    "conclusion": 2
+                }
+            ]
+        }),
+    )
+    .await;
+    assert_eq!(response["ok"], true);
+
+    {
+        let mut inner = state.inner.lock().await;
+        inner.broker_messages.remove(&request_id);
+    }
+    let run = get_run_json(&app, &run_id).await;
+    let steps = run["jobs_list"][0]["steps"].as_array().unwrap();
+    assert_eq!(
+        steps.len(),
+        2,
+        "duplicate names must remain separate: {steps:?}"
+    );
+    assert_eq!(steps[0]["id"], first_id);
+    assert_eq!(steps[1]["id"], second_id);
+
+    write_step_job_logs(
+        &temp,
+        &plan_id,
+        &agent_job_id,
+        &[
+            (&first_id, "first duplicate\n"),
+            (&second_id, "second duplicate\n"),
+        ],
+    )
+    .await;
+    for (step, expected) in [(1, "first duplicate\n"), (2, "second duplicate\n")] {
+        let (status, body) = get_logs(
+            &app,
+            format!("/api/v1/runs/{run_id}/logs?job=build&step={step}"),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(body, expected.as_bytes());
+    }
 }
 
 #[tokio::test]
@@ -11595,6 +15782,12 @@ async fn workflow_steps_update_records_start_on_in_progress_then_finish() {
         (request.plan_id.clone(), request.agent_job_id.to_string())
     };
 
+    // One step, reported twice: a real runner keeps the same `external_id`
+    // across the in-progress and terminal updates, which is what lets the
+    // second report land on the first one's record.
+    let step_id = workflow_step_ids(&state, run_id.parse().unwrap(), "build")
+        .await
+        .remove(0);
     request_json(
         &app,
         Method::POST,
@@ -11603,7 +15796,7 @@ async fn workflow_steps_update_records_start_on_in_progress_then_finish() {
             "workflow_run_backend_id": plan_id,
             "workflow_job_run_backend_id": agent_job_id,
             "steps": [{
-                "external_id": uuid::Uuid::new_v4().to_string(),
+                "external_id": step_id,
                 "number": 2,
                 "name": "Run echo hi",
                 "status": 3,
@@ -11620,7 +15813,7 @@ async fn workflow_steps_update_records_start_on_in_progress_then_finish() {
             "workflow_run_backend_id": plan_id,
             "workflow_job_run_backend_id": agent_job_id,
             "steps": [{
-                "external_id": uuid::Uuid::new_v4().to_string(),
+                "external_id": step_id,
                 "number": 2,
                 "name": "Run echo hi",
                 "status": 6,
@@ -14437,6 +18630,23 @@ async fn generated_server_dag_properties_1000_cases() {
     }
 }
 
+fn commit_workflow_fixture(worktree: &FsPath, paths: &[&str]) -> String {
+    git_fixture_command(worktree, &["init", "-b", "main"]);
+    git_fixture_command(
+        worktree,
+        &["config", "user.email", "preloop-tests@example.invalid"],
+    );
+    git_fixture_command(worktree, &["config", "user.name", "Preloop Tests"]);
+    let mut add = vec!["add"];
+    add.extend_from_slice(paths);
+    git_fixture_command(worktree, &add);
+    git_fixture_command(worktree, &["commit", "-m", "test workflow"]);
+    String::from_utf8(git_fixture_output(worktree, &["rev-parse", "HEAD"]))
+        .unwrap()
+        .trim()
+        .to_owned()
+}
+
 fn git_fixture_command(worktree: &FsPath, args: &[&str]) {
     let output = Command::new("git")
         .arg("-C")
@@ -14663,6 +18873,7 @@ async fn snapshot_drops_unresolvable_gitlinks_but_keeps_registered_submodules() 
     fs::create_dir_all(&nested).unwrap();
     git_fixture_command(&nested, &["init", "-q", "-b", "main"]);
     git_fixture_command(&nested, &["config", "user.email", "nested@example.test"]);
+    git_fixture_command(&nested, &["config", "user.name", "Nested Test"]);
     fs::write(nested.join("payload.txt"), "nested\n").unwrap();
     git_fixture_command(&nested, &["add", "payload.txt"]);
     git_fixture_command(&nested, &["commit", "-qm", "nested"]);
@@ -14771,6 +18982,7 @@ async fn snapshot_gitlink_resolution_matches_git() {
         fs::create_dir_all(&nested).unwrap();
         git_fixture_command(&nested, &["init", "-q", "-b", "main"]);
         git_fixture_command(&nested, &["config", "user.email", "nested@example.test"]);
+        git_fixture_command(&nested, &["config", "user.name", "Nested Test"]);
         fs::write(nested.join("payload.txt"), format!("{path}\n")).unwrap();
         git_fixture_command(&nested, &["add", "payload.txt"]);
         git_fixture_command(&nested, &["commit", "-qm", path]);
@@ -15604,12 +19816,8 @@ jobs:
     let runner_request_id = broker_body["runner_request_id"]
         .as_str()
         .expect("broker message should identify the queued request");
-    let runner_token = state
-        .local_jwt(json!({
-            "sub": "preloop-runner-listen-1",
-            "scp": "ActionsRuntime.RunnerListen",
-        }))
-        .unwrap();
+    let (_runner_id, runner_token) =
+        register_runner_with_token(&app, "remint-runner", &["self-hosted"], None).await;
 
     let acquired = request_json_with_bearer(
         &app,
@@ -15873,12 +20081,8 @@ jobs:
     let runner_request_id = broker_body["runner_request_id"]
         .as_str()
         .expect("broker message should identify the queued request");
-    let runner_token = state
-        .local_jwt(json!({
-            "sub": "preloop-runner-listen-1",
-            "scp": "ActionsRuntime.RunnerListen",
-        }))
-        .unwrap();
+    let (_runner_id, runner_token) =
+        register_runner_with_token(&app, "snapshot-runner", &["self-hosted"], None).await;
     let acquired = request_json_with_bearer(
         &app,
         Method::POST,
@@ -17200,14 +21404,15 @@ async fn control_socket_surface_denies_native_and_test_apis() {
         StatusCode::UNAUTHORIZED,
         "an unsigned upload must be refused once it reaches the auth layer"
     );
-    let sig = crate::auth::sign_replay_upload_ticket(&state, replay_path);
+    let expires_at = crate::auth::replay_ticket_expiry();
+    let sig = crate::auth::sign_replay_upload_ticket(&state, replay_path, expires_at);
     let replay = socket_app
         .clone()
         .oneshot(
             Request::builder()
                 .method(Method::PUT)
                 .uri(format!(
-                    "{replay_path}?sv=2021-08-06&se=2028-01-01T00%3A00%3A00Z&sr=c&sp=rw&sig={sig}"
+                    "{replay_path}?sv=2021-08-06&se={expires_at}&sr=c&sp=rw&sig={sig}"
                 ))
                 .body(Body::from("log bytes"))
                 .unwrap(),
@@ -17261,14 +21466,15 @@ async fn replay_blob_uploads_require_a_ticket_bound_to_the_exact_path() {
     // A ticket minted for a different path must not authorise this one —
     // this is the cross-job overwrite the signature binds away.
     let other_path = format!("/replay/results/{plan}/{job}/job-logs.txt");
-    let other_sig = crate::auth::sign_replay_upload_ticket(&state, &other_path);
+    let expires_at = crate::auth::replay_ticket_expiry();
+    let other_sig = crate::auth::sign_replay_upload_ticket(&state, &other_path, expires_at);
     let mismatched = app
         .clone()
         .oneshot(
             Request::builder()
                 .method(Method::PUT)
                 .uri(format!(
-                    "{path}?sv=2021-08-06&se=2028-01-01T00%3A00%3A00Z&sr=c&sp=rw&sig={other_sig}"
+                    "{path}?sv=2021-08-06&se={expires_at}&sr=c&sp=rw&sig={other_sig}"
                 ))
                 .body(Body::from("overwrite attempt"))
                 .unwrap(),
@@ -17276,16 +21482,37 @@ async fn replay_blob_uploads_require_a_ticket_bound_to_the_exact_path() {
         .await
         .unwrap();
     assert_eq!(mismatched.status(), StatusCode::UNAUTHORIZED);
+    let expired_at = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .as_secs()
+        .saturating_sub(1);
+    let expired_sig = crate::auth::sign_replay_upload_ticket(&state, &path, expired_at);
+    let expired = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method(Method::PUT)
+                .uri(format!(
+                    "{path}?sv=2021-08-06&se={expired_at}&sr=c&sp=rw&sig={expired_sig}"
+                ))
+                .body(Body::from("expired upload"))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(expired.status(), StatusCode::UNAUTHORIZED);
 
     // The runner's own flow: a ticket for the exact path lands the blob.
-    let sig = crate::auth::sign_replay_upload_ticket(&state, &path);
+    let expires_at = crate::auth::replay_ticket_expiry();
+    let sig = crate::auth::sign_replay_upload_ticket(&state, &path, expires_at);
     let uploaded = app
         .clone()
         .oneshot(
             Request::builder()
                 .method(Method::PUT)
                 .uri(format!(
-                    "{path}?sv=2021-08-06&se=2028-01-01T00%3A00%3A00Z&sr=c&sp=rw&sig={sig}"
+                    "{path}?sv=2021-08-06&se={expires_at}&sr=c&sp=rw&sig={sig}"
                 ))
                 .body(Body::from("log bytes"))
                 .unwrap(),
@@ -17370,14 +21597,15 @@ jobs:
         .zip([first_log.as_str(), second_log.as_str()])
     {
         let path = format!("/replay/results/{plan}/{job}/job-logs.txt");
-        let sig = crate::auth::sign_replay_upload_ticket(&state, &path);
+        let expires_at = crate::auth::replay_ticket_expiry();
+        let sig = crate::auth::sign_replay_upload_ticket(&state, &path, expires_at);
         let response = app
             .clone()
             .oneshot(
                 Request::builder()
                     .method(Method::PUT)
                     .uri(format!(
-                        "{path}?sv=2021-08-06&se=2028-01-01T00%3A00%3A00Z&sr=c&sp=rw&sig={sig}"
+                        "{path}?sv=2021-08-06&se={expires_at}&sr=c&sp=rw&sig={sig}"
                     ))
                     .body(Body::from(body.to_owned()))
                     .unwrap(),
@@ -17508,6 +21736,718 @@ async fn replay_blob_urls_are_minted_only_for_the_callers_own_job() {
 }
 
 #[tokio::test]
+async fn results_uuid_spellings_use_canonical_paths_and_metadata_keys() {
+    let temp = tempfile::tempdir().unwrap();
+    let state = AppState::new(temp.path().to_path_buf()).await.unwrap();
+    let app = app(state.clone(), CancellationToken::new());
+    let plan = uuid::Uuid::parse_str("fedcba98-7654-4321-89ab-cdef01234567")
+        .unwrap()
+        .to_string();
+    let job = uuid::Uuid::parse_str("01234567-89ab-4cde-8fab-cdef01234567").unwrap();
+    let canonical = job.to_string();
+    let forms = [
+        canonical.clone(),
+        canonical.to_ascii_uppercase(),
+        format!("{{{canonical}}}"),
+        canonical.replace('-', ""),
+        format!("urn:uuid:{canonical}"),
+    ];
+    let token = state.mint_runtime_token(&plan, &job);
+
+    for form in &forms {
+        let requests = [
+            (
+                "/twirp/results.services.receiver.Receiver/GetJobLogsSignedBlobURL",
+                "logs_url",
+                format!("/replay/results/{plan}/{canonical}/job-logs.txt"),
+            ),
+            (
+                "/twirp/results.services.receiver.Receiver/GetStepLogsSignedBlobURL",
+                "logs_url",
+                format!("/replay/results/{plan}/{canonical}/step-step-1.txt"),
+            ),
+            (
+                "/twirp/results.services.receiver.Receiver/GetStepSummarySignedBlobURL",
+                "summary_url",
+                format!("/replay/results/{plan}/{canonical}/step-step-1-summary.md"),
+            ),
+        ];
+        for (uri, field, expected_path) in requests {
+            let payload = request_json_with_bearer(
+                &app,
+                Method::POST,
+                uri,
+                json!({
+                    "workflow_run_backend_id": plan,
+                    "workflow_job_run_backend_id": form,
+                    "step_backend_id": "step-1",
+                }),
+                &token,
+            )
+            .await;
+            let url = payload[field].as_str().unwrap();
+            assert!(
+                url.contains(&expected_path),
+                "equivalent job spelling must use the canonical path: {url}"
+            );
+        }
+
+        let diag = request_json_with_bearer(
+            &app,
+            Method::POST,
+            "/twirp/results.services.receiver.Receiver/GetJobDiagLogsSignedBlobURL",
+            json!({
+                "workflow_run_backend_id": plan,
+                "workflow_job_run_backend_id": form,
+            }),
+            &token,
+        )
+        .await;
+        assert!(
+            diag["diag_logs_url"]
+                .as_str()
+                .is_some_and(|url| url.contains("/twirp-blob/diag/")),
+            "diagnostic URL must remain a token-only path"
+        );
+
+        let update = request_json_with_bearer(
+            &app,
+            Method::POST,
+            "/twirp/github.actions.results.api.v1.WorkflowStepUpdateService/WorkflowStepsUpdate",
+            json!({
+                "workflow_run_backend_id": plan,
+                "workflow_job_run_backend_id": form,
+                "steps": [],
+            }),
+            &token,
+        )
+        .await;
+        assert_eq!(update["ok"], true);
+
+        request_json_with_bearer(
+            &app,
+            Method::POST,
+            "/twirp/results.services.receiver.Receiver/CreateStepSummaryMetadata",
+            json!({
+                "workflow_run_backend_id": plan,
+                "workflow_job_run_backend_id": form,
+                "step_backend_id": "step-1",
+                "size": 17,
+            }),
+            &token,
+        )
+        .await;
+        request_json_with_bearer(
+            &app,
+            Method::POST,
+            "/twirp/results.services.receiver.Receiver/CreateStepLogsMetadata",
+            json!({
+                "workflow_run_backend_id": plan,
+                "workflow_job_run_backend_id": form,
+                "step_backend_id": "step-1",
+                "line_count": 3,
+            }),
+            &token,
+        )
+        .await;
+        request_json_with_bearer(
+            &app,
+            Method::POST,
+            "/twirp/results.services.receiver.Receiver/CreateJobLogsMetadata",
+            json!({
+                "workflow_run_backend_id": plan,
+                "workflow_job_run_backend_id": form,
+                "line_count": 5,
+            }),
+            &token,
+        )
+        .await;
+    }
+
+    let step_payload = request_json_with_bearer(
+        &app,
+        Method::POST,
+        "/twirp/results.services.receiver.Receiver/GetStepLogsSignedBlobURL",
+        json!({
+            "workflow_run_backend_id": plan,
+            "workflow_job_run_backend_id": format!("{{{canonical}}}"),
+            "step_backend_id": "step-1",
+        }),
+        &token,
+    )
+    .await;
+    let uploaded = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method(Method::PUT)
+                .uri(step_payload["logs_url"].as_str().unwrap())
+                .body(Body::from("canonical path"))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(uploaded.status(), StatusCode::CREATED);
+    assert_eq!(
+        tokio::fs::read_to_string(
+            temp.path()
+                .join("replay")
+                .join("results")
+                .join(&plan)
+                .join(&canonical)
+                .join("step-step-1.txt"),
+        )
+        .await
+        .unwrap(),
+        "canonical path"
+    );
+
+    let inner = state.inner.lock().await;
+    let expected_keys = [
+        format!("results:{plan}:{canonical}:summary:step-1"),
+        format!("results:{plan}:{canonical}:step:step-1"),
+        format!("results:{plan}:{canonical}:job:{canonical}"),
+    ]
+    .into_iter()
+    .collect::<BTreeSet<_>>();
+    let actual_keys = inner.log_metadata.keys().cloned().collect::<BTreeSet<_>>();
+    assert_eq!(
+        actual_keys, expected_keys,
+        "all accepted UUID spellings must share one metadata namespace"
+    );
+    assert_eq!(
+        inner
+            .log_metadata
+            .get(&format!("results:{plan}:{canonical}:summary:step-1"))
+            .map(|meta| (meta.byte_count, meta.line_count)),
+        Some((17, 0))
+    );
+    assert_eq!(
+        inner
+            .log_metadata
+            .get(&format!("results:{plan}:{canonical}:step:step-1"))
+            .map(|meta| (meta.byte_count, meta.line_count)),
+        Some((240, 3))
+    );
+    assert_eq!(
+        inner
+            .log_metadata
+            .get(&format!("results:{plan}:{canonical}:job:{canonical}"))
+            .map(|meta| (meta.byte_count, meta.line_count)),
+        Some((400, 5))
+    );
+}
+
+#[tokio::test]
+async fn alternate_results_job_spelling_preserves_canonical_log_lookup() {
+    let temp = tempfile::tempdir().unwrap();
+    let state = AppState::new(temp.path().to_path_buf()).await.unwrap();
+    let app = app(state.clone(), CancellationToken::new());
+    let (run_id, jobs) = two_job_run_for_log_filters(&app, &state).await;
+    let (_, plan, canonical) = jobs
+        .iter()
+        .find(|(job, _, _)| job == "build")
+        .cloned()
+        .expect("build job must be present");
+    let job = canonical.parse::<uuid::Uuid>().unwrap();
+    let token = state.mint_runtime_token(&plan, &job);
+    let alternate = format!("{{{canonical}}}");
+
+    let payload = request_json_with_bearer(
+        &app,
+        Method::POST,
+        "/twirp/results.services.receiver.Receiver/GetJobLogsSignedBlobURL",
+        json!({
+            "workflow_run_backend_id": plan,
+            "workflow_job_run_backend_id": alternate,
+        }),
+        &token,
+    )
+    .await;
+    let uploaded = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method(Method::PUT)
+                .uri(payload["logs_url"].as_str().unwrap())
+                .body(Body::from("lookup survives"))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(uploaded.status(), StatusCode::CREATED);
+
+    let response = app
+        .oneshot(
+            Request::builder()
+                .method(Method::GET)
+                .uri(format!("/api/v1/runs/{run_id}/logs?job={canonical}"))
+                .header(header::AUTHORIZATION, "Bearer preloop-system-token")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+    assert_eq!(
+        to_bytes(response.into_body(), usize::MAX)
+            .await
+            .unwrap()
+            .as_ref(),
+        b"lookup survives"
+    );
+    assert!(
+        !temp
+            .path()
+            .join("replay")
+            .join("results")
+            .join(&plan)
+            .join(&alternate)
+            .exists(),
+        "alternate spelling must not create a second lookup directory"
+    );
+}
+
+#[tokio::test]
+async fn results_reject_cross_job_and_malformed_uuid_targets() {
+    let temp = tempfile::tempdir().unwrap();
+    let state = AppState::new(temp.path().to_path_buf()).await.unwrap();
+    let app = app(state.clone(), CancellationToken::new());
+    let plan = "plan-1";
+    let own_job = uuid::Uuid::parse_str("01234567-89ab-4cde-8fab-cdef01234567").unwrap();
+    let other_job = uuid::Uuid::parse_str("fedcba98-7654-4321-89ab-cdef01234567").unwrap();
+    let token = state.mint_runtime_token(plan, &own_job);
+    let targets = [
+        format!("{{{other_job}}}"),
+        other_job.to_string().to_ascii_uppercase(),
+        "not-a-uuid".to_owned(),
+    ];
+
+    for target in &targets {
+        for uri in [
+            "/twirp/results.services.receiver.Receiver/GetJobLogsSignedBlobURL",
+            "/twirp/results.services.receiver.Receiver/GetStepLogsSignedBlobURL",
+            "/twirp/results.services.receiver.Receiver/GetStepSummarySignedBlobURL",
+            "/twirp/results.services.receiver.Receiver/GetJobDiagLogsSignedBlobURL",
+        ] {
+            assert_eq!(
+                status_with_bearer(
+                    &app,
+                    &token,
+                    Method::POST,
+                    uri,
+                    json!({
+                        "workflow_run_backend_id": plan,
+                        "workflow_job_run_backend_id": target,
+                        "step_backend_id": "step-1",
+                    }),
+                )
+                .await,
+                StatusCode::FORBIDDEN,
+                "Results target must stay bound to the token's job: {target}"
+            );
+        }
+
+        for (uri, body) in [
+            (
+                "/twirp/results.services.receiver.Receiver/CreateStepSummaryMetadata",
+                json!({
+                    "workflow_run_backend_id": plan,
+                    "workflow_job_run_backend_id": target,
+                    "step_backend_id": "step-1",
+                    "size": 99,
+                }),
+            ),
+            (
+                "/twirp/results.services.receiver.Receiver/CreateStepLogsMetadata",
+                json!({
+                    "workflow_run_backend_id": plan,
+                    "workflow_job_run_backend_id": target,
+                    "step_backend_id": "step-1",
+                    "line_count": 99,
+                }),
+            ),
+            (
+                "/twirp/results.services.receiver.Receiver/CreateJobLogsMetadata",
+                json!({
+                    "workflow_run_backend_id": plan,
+                    "workflow_job_run_backend_id": target,
+                    "line_count": 99,
+                }),
+            ),
+        ] {
+            assert_eq!(
+                status_with_bearer(&app, &token, Method::POST, uri, body).await,
+                StatusCode::FORBIDDEN,
+                "metadata target must stay bound to the token's job: {target}"
+            );
+        }
+    }
+
+    assert_eq!(
+        status_with_bearer(
+            &app,
+            &token,
+            Method::POST,
+            "/twirp/results.services.receiver.Receiver/GetJobLogsSignedBlobURL",
+            json!({
+                "workflow_run_backend_id": "different-plan",
+                "workflow_job_run_backend_id": own_job.to_string(),
+            }),
+        )
+        .await,
+        StatusCode::FORBIDDEN,
+        "a matching UUID under another plan is still a different Results target"
+    );
+
+    let inner = state.inner.lock().await;
+    assert!(
+        inner.log_metadata.is_empty(),
+        "rejected Results targets must not create metadata"
+    );
+}
+
+#[tokio::test]
+async fn system_results_token_preserves_opaque_identifier_compatibility() {
+    let temp = tempfile::tempdir().unwrap();
+    let state = AppState::new(temp.path().to_path_buf()).await.unwrap();
+    let app = app(state.clone(), CancellationToken::new());
+    let payload = request_json_with_bearer(
+        &app,
+        Method::POST,
+        "/twirp/results.services.receiver.Receiver/GetJobLogsSignedBlobURL",
+        json!({
+            "workflow_run_backend_id": "plan-opaque",
+            "workflow_job_run_backend_id": "job-opaque",
+        }),
+        DEFAULT_PRELOOP_SYSTEM_TOKEN,
+    )
+    .await;
+    assert!(
+        payload["logs_url"]
+            .as_str()
+            .is_some_and(|url| url.contains("/replay/results/plan-opaque/job-opaque/job-logs.txt")),
+        "system callers may continue to address opaque backend ids"
+    );
+
+    request_json_with_bearer(
+        &app,
+        Method::POST,
+        "/twirp/results.services.receiver.Receiver/CreateJobLogsMetadata",
+        json!({
+            "workflow_run_backend_id": "plan-opaque",
+            "workflow_job_run_backend_id": "job-opaque",
+            "line_count": 2,
+        }),
+        DEFAULT_PRELOOP_SYSTEM_TOKEN,
+    )
+    .await;
+    let inner = state.inner.lock().await;
+    assert!(
+        inner
+            .log_metadata
+            .contains_key("results:plan-opaque:job-opaque:job:job-opaque"),
+        "opaque system-token metadata ids must retain their existing spelling"
+    );
+}
+
+#[tokio::test]
+async fn results_workflow_steps_require_the_calling_job() {
+    let temp = tempfile::tempdir().unwrap();
+    let state = AppState::new(temp.path().to_path_buf()).await.unwrap();
+    let app = app(state.clone(), CancellationToken::new());
+    let (run_id, jobs) = two_job_run_for_log_filters(&app, &state).await;
+    let (_, plan_a, agent_a) = jobs
+        .iter()
+        .find(|(job, _, _)| job == "build")
+        .cloned()
+        .expect("build job must be present");
+    let (_, plan_b, agent_b) = jobs
+        .iter()
+        .find(|(job, _, _)| job == "test")
+        .cloned()
+        .expect("test job must be present");
+    let a_job = agent_a.parse::<uuid::Uuid>().unwrap();
+    let b_job = agent_b.parse::<uuid::Uuid>().unwrap();
+    let a_step = workflow_step_ids(&state, run_id, "build")
+        .await
+        .into_iter()
+        .next()
+        .expect("job A must have a workflow step");
+    let b_step = workflow_step_ids(&state, run_id, "test")
+        .await
+        .into_iter()
+        .next()
+        .expect("job B must have a workflow step");
+    let token_a = state.mint_runtime_token(&plan_a, &a_job);
+    let token_b = state.mint_runtime_token(&plan_b, &b_job);
+    let uri = "/twirp/github.actions.results.api.v1.WorkflowStepUpdateService/WorkflowStepsUpdate";
+
+    let before = get_run_json(&app, &run_id.to_string()).await;
+    let job_steps = |run: &Value, name: &str| {
+        run["jobs_list"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|job| job["job_id"] == name)
+            .unwrap()["steps"]
+            .clone()
+    };
+    let build_before = job_steps(&before, "build");
+    let test_before = job_steps(&before, "test");
+
+    assert_eq!(
+        status_with_bearer(
+            &app,
+            &token_a,
+            Method::POST,
+            uri,
+            json!({
+                "workflow_run_backend_id": plan_b,
+                "workflow_job_run_backend_id": agent_b,
+                "steps": [{
+                    "external_id": b_step,
+                    "number": 1,
+                    "name": "A must not rewrite B",
+                    "status": 6,
+                    "conclusion": 3
+                }]
+            }),
+        )
+        .await,
+        StatusCode::FORBIDDEN
+    );
+    assert_eq!(
+        status_with_bearer(
+            &app,
+            &token_b,
+            Method::POST,
+            uri,
+            json!({
+                "workflow_run_backend_id": plan_a,
+                "workflow_job_run_backend_id": agent_a,
+                "steps": [{
+                    "external_id": a_step,
+                    "number": 1,
+                    "name": "B must not rewrite A",
+                    "status": 6,
+                    "conclusion": 3
+                }]
+            }),
+        )
+        .await,
+        StatusCode::FORBIDDEN
+    );
+
+    let after_refused = get_run_json(&app, &run_id.to_string()).await;
+    assert_eq!(job_steps(&after_refused, "build"), build_before);
+    assert_eq!(job_steps(&after_refused, "test"), test_before);
+
+    assert_eq!(
+        status_with_bearer(
+            &app,
+            &token_a,
+            Method::POST,
+            uri,
+            json!({
+                "workflow_run_backend_id": plan_a,
+                "workflow_job_run_backend_id": agent_a,
+                "steps": [{
+                    "external_id": a_step,
+                    "number": 1,
+                    "name": "A owns this update",
+                    "status": 6,
+                    "conclusion": 2
+                }]
+            }),
+        )
+        .await,
+        StatusCode::OK
+    );
+    let after_own = get_run_json(&app, &run_id.to_string()).await;
+    assert_eq!(job_steps(&after_own, "test"), test_before);
+    assert_eq!(
+        job_steps(&after_own, "build")[0]["name"],
+        "A owns this update"
+    );
+}
+
+#[tokio::test]
+async fn results_metadata_requires_the_calling_job() {
+    let temp = tempfile::tempdir().unwrap();
+    let state = AppState::new(temp.path().to_path_buf()).await.unwrap();
+    let app = app(state.clone(), CancellationToken::new());
+    let (run_id, jobs) = two_job_run_for_log_filters(&app, &state).await;
+    let (_, plan_a, agent_a) = jobs
+        .iter()
+        .find(|(job, _, _)| job == "build")
+        .cloned()
+        .expect("build job must be present");
+    let (_, plan_b, agent_b) = jobs
+        .iter()
+        .find(|(job, _, _)| job == "test")
+        .cloned()
+        .expect("test job must be present");
+    let a_job = agent_a.parse::<uuid::Uuid>().unwrap();
+    let b_step = workflow_step_ids(&state, run_id, "test")
+        .await
+        .into_iter()
+        .next()
+        .expect("job B must have a workflow step");
+    let token_a = state.mint_runtime_token(&plan_a, &a_job);
+    let keys = [
+        format!("results:{plan_b}:{agent_b}:summary:{b_step}"),
+        format!("results:{plan_b}:{agent_b}:step:{b_step}"),
+        format!("results:{plan_b}:{agent_b}:job:{agent_b}"),
+    ];
+    {
+        let mut inner = state.inner.lock().await;
+        for (index, key) in keys.iter().enumerate() {
+            inner.log_metadata.insert(
+                key.clone(),
+                LogMetadata {
+                    byte_count: index + 1,
+                    line_count: index + 10,
+                },
+            );
+        }
+    }
+    let metadata_before = {
+        let inner = state.inner.lock().await;
+        keys.iter()
+            .map(|key| {
+                inner
+                    .log_metadata
+                    .get(key)
+                    .map(|meta| (meta.byte_count, meta.line_count))
+            })
+            .collect::<Vec<_>>()
+    };
+
+    let requests = [
+        (
+            "/twirp/results.services.receiver.Receiver/CreateStepSummaryMetadata",
+            json!({
+                "step_backend_id": b_step,
+                "workflow_job_run_backend_id": agent_b,
+                "workflow_run_backend_id": plan_b,
+                "size": 999
+            }),
+        ),
+        (
+            "/twirp/results.services.receiver.Receiver/CreateStepLogsMetadata",
+            json!({
+                "step_backend_id": b_step,
+                "workflow_job_run_backend_id": agent_b,
+                "workflow_run_backend_id": plan_b,
+                "line_count": 999
+            }),
+        ),
+        (
+            "/twirp/results.services.receiver.Receiver/CreateJobLogsMetadata",
+            json!({
+                "workflow_job_run_backend_id": agent_b,
+                "workflow_run_backend_id": plan_b,
+                "line_count": 999
+            }),
+        ),
+    ];
+    for (uri, body) in requests {
+        assert_eq!(
+            status_with_bearer(&app, &token_a, Method::POST, uri, body).await,
+            StatusCode::FORBIDDEN,
+            "{uri}"
+        );
+    }
+
+    let metadata_after = {
+        let inner = state.inner.lock().await;
+        keys.iter()
+            .map(|key| {
+                inner
+                    .log_metadata
+                    .get(key)
+                    .map(|meta| (meta.byte_count, meta.line_count))
+            })
+            .collect::<Vec<_>>()
+    };
+    assert_eq!(metadata_after, metadata_before);
+
+    let own_requests = [
+        (
+            "/twirp/results.services.receiver.Receiver/CreateStepSummaryMetadata",
+            json!({
+                "step_backend_id": b_step,
+                "workflow_job_run_backend_id": agent_a,
+                "workflow_run_backend_id": plan_a,
+                "size": 10
+            }),
+        ),
+        (
+            "/twirp/results.services.receiver.Receiver/CreateStepLogsMetadata",
+            json!({
+                "step_backend_id": b_step,
+                "workflow_job_run_backend_id": agent_a,
+                "workflow_run_backend_id": plan_a,
+                "line_count": 2
+            }),
+        ),
+        (
+            "/twirp/results.services.receiver.Receiver/CreateJobLogsMetadata",
+            json!({
+                "workflow_job_run_backend_id": agent_a,
+                "workflow_run_backend_id": plan_a,
+                "line_count": 3
+            }),
+        ),
+    ];
+    for (uri, body) in own_requests {
+        assert_eq!(
+            status_with_bearer(&app, &token_a, Method::POST, uri, body).await,
+            StatusCode::OK,
+            "{uri}"
+        );
+    }
+
+    let inner = state.inner.lock().await;
+    assert_eq!(
+        inner
+            .log_metadata
+            .get(&keys[0])
+            .map(|meta| (meta.byte_count, meta.line_count)),
+        Some((1, 10))
+    );
+    assert_eq!(
+        inner
+            .log_metadata
+            .get(&keys[1])
+            .map(|meta| (meta.byte_count, meta.line_count)),
+        Some((2, 11))
+    );
+    assert_eq!(
+        inner
+            .log_metadata
+            .get(&format!("results:{plan_a}:{agent_a}:summary:{b_step}"))
+            .map(|meta| (meta.byte_count, meta.line_count)),
+        Some((10, 0))
+    );
+    assert_eq!(
+        inner
+            .log_metadata
+            .get(&format!("results:{plan_a}:{agent_a}:step:{b_step}"))
+            .map(|meta| (meta.byte_count, meta.line_count)),
+        Some((160, 2))
+    );
+    assert_eq!(
+        inner
+            .log_metadata
+            .get(&format!("results:{plan_a}:{agent_a}:job:{agent_a}"))
+            .map(|meta| (meta.byte_count, meta.line_count)),
+        Some((240, 3))
+    );
+}
+
+#[tokio::test]
 async fn listen_tokens_are_revoked_when_the_runner_identity_is_purged() {
     let temp = tempfile::tempdir().unwrap();
     let state = AppState::new(temp.path().to_path_buf()).await.unwrap();
@@ -17606,14 +22546,13 @@ async fn listen_tokens_are_revoked_when_the_runner_identity_is_purged() {
     // The same token is now refused at the auth layer.
     assert_eq!(poll(&app).await.status(), StatusCode::UNAUTHORIZED);
 
-    // And the identity resolver no longer treats the bearer as a runner: the
-    // token cannot force a *verified* binding after teardown, so the session
-    // body's own claim wins (legacy unverified session).
+    // The protected session route also rejects the revoked token; a stale
+    // bearer must not fall back to an unverified body-controlled identity.
     let after_session = create_session(&app).await;
     assert_eq!(
         after_session.status(),
-        StatusCode::CREATED,
-        "after purge the token is unverified and cannot force a binding"
+        StatusCode::UNAUTHORIZED,
+        "purged listen token cannot create a session"
     );
 }
 
@@ -17720,6 +22659,53 @@ async fn purge_requeues_claimed_unfinished_job_to_another_runner() {
         delivered["messageType"].as_str().is_some(),
         "machine B receives the requeued job: {delivered}"
     );
+}
+#[tokio::test]
+async fn startup_purge_removes_only_restored_ephemeral_runners() {
+    let temp = tempfile::tempdir().unwrap();
+    let state = pool_managed_state(&temp).await;
+    let app = app(state.clone(), CancellationToken::new());
+
+    let ephemeral = request_json(
+        &app,
+        Method::POST,
+        "/api/v1/runners",
+        json!({
+            "name": "pool-machine",
+            "labels": ["self-hosted"],
+            "ephemeral": true
+        }),
+    )
+    .await;
+    let ephemeral_id = ephemeral["id"].as_i64().unwrap();
+    let (external_id, _) =
+        register_runner_with_token(&app, "external-machine", &["self-hosted"], None).await;
+    {
+        let inner = state.inner.lock().await;
+        assert!(inner.runners[&ephemeral_id].ephemeral);
+        assert!(!inner.runners[&external_id].ephemeral);
+    }
+    drop(app);
+    drop(state);
+
+    let restored_state = AppState::new(temp.path().to_path_buf()).await.unwrap();
+    {
+        let inner = restored_state.inner.lock().await;
+        assert!(inner.runners[&ephemeral_id].ephemeral);
+        assert!(inner.runners.contains_key(&external_id));
+    }
+    let restored_shared = Arc::new(SharedState {
+        state: restored_state.clone(),
+        shutdown: CancellationToken::new(),
+    });
+    crate::runner_lifecycle::purge_restored_ephemeral_runners(&restored_shared).await;
+    drop(restored_shared);
+    drop(restored_state);
+
+    let final_state = AppState::new(temp.path().to_path_buf()).await.unwrap();
+    let inner = final_state.inner.lock().await;
+    assert!(!inner.runners.contains_key(&ephemeral_id));
+    assert!(inner.runners.contains_key(&external_id));
 }
 
 #[tokio::test]
@@ -18038,6 +23024,584 @@ jobs:
             "fan-out job {id} must still be inflight"
         );
     }
+}
+
+#[tokio::test]
+async fn cancelled_deferred_matrix_node_settles_submit_requests() {
+    // MC-3: a needs-deferred matrix node cancelled before its expansion never
+    // dispatches, so no completion, result patch or disconnect ever settles
+    // the submit-time request correlation minted for it. The run-cancel path
+    // must settle those records (result Cancelled, out of inflight, out of
+    // every session) exactly as completion would — the state the
+    // reusable-caller path has from submit, since callers mint nothing.
+    let temp = tempfile::tempdir().unwrap();
+    let state = AppState::new(temp.path().to_path_buf()).await.unwrap();
+    let app = app(state.clone(), CancellationToken::new());
+
+    let accepted = request_json(
+        &app,
+        Method::POST,
+        "/api/v1/runs",
+        json!({
+            "workflow_yaml": r#"
+on: push
+jobs:
+  generator:
+    runs-on: ubuntu-latest
+    steps:
+      - run: echo gen
+  downstream:
+    needs: [generator]
+    runs-on: ubuntu-latest
+    strategy:
+      matrix: ${{ fromJson(needs.generator.outputs.matrix) }}
+    steps:
+      - run: echo dynamic
+"#,
+            "event": "push",
+            "repository": "owner/repo"
+        }),
+    )
+    .await;
+    let run_id: RunId = accepted["run_id"].as_str().unwrap().parse().unwrap();
+    let placeholder = JobId("downstream".to_string());
+
+    let (request_id, plan_id, agent_job_id, timeline_id) = {
+        let inner = state.inner.lock().await;
+        let record = inner
+            .job_requests
+            .values()
+            .find(|r| r.run_id == run_id && r.job_id == placeholder)
+            .expect("deferred-matrix placeholder must have a submit-time request");
+        assert!(
+            inner.inflight_requests.contains_key(&record.request_id),
+            "placeholder request must start out inflight"
+        );
+        (
+            record.request_id,
+            record.plan_id.clone(),
+            record.agent_job_id,
+            record.timeline_id,
+        )
+    };
+
+    let cancelled = request_json(
+        &app,
+        Method::POST,
+        &format!("/api/v1/runs/{run_id}/cancel"),
+        Value::Null,
+    )
+    .await;
+    assert_eq!(cancelled["status"], "cancelled");
+
+    let inner = state.inner.lock().await;
+    let record = inner
+        .job_requests
+        .get(&request_id)
+        .expect("settled placeholder keeps its record, like a completed job");
+    assert_eq!(
+        record.result,
+        Some(ExecutionStatus::Cancelled),
+        "MC-3: cancelled placeholder request must be settled"
+    );
+    assert!(
+        !inner.inflight_requests.contains_key(&request_id),
+        "MC-3: cancelled placeholder must leave inflight_requests"
+    );
+    assert!(
+        !inner
+            .session_active_requests
+            .values()
+            .any(|&rid| rid == request_id),
+        "MC-3: cancelled placeholder must leave session_active_requests"
+    );
+    // The correlation indexes keep resolving to the settled record, exactly
+    // as they do for a job a runner completed.
+    assert_eq!(
+        inner.plan_requests.get(&plan_id),
+        Some(&request_id),
+        "plan_requests must keep resolving to the settled placeholder"
+    );
+    assert_eq!(
+        inner.agent_job_requests.get(&agent_job_id),
+        Some(&request_id),
+        "agent_job_requests must keep resolving to the settled placeholder"
+    );
+    assert_eq!(
+        inner.timeline_requests.get(&timeline_id),
+        Some(&request_id),
+        "timeline_requests must keep resolving to the settled placeholder"
+    );
+    // RenewJob correlation end-state: the broker refuses to renew a request
+    // no session owns, so a cancelled placeholder can neither be renewed nor
+    // resurrected.
+    assert!(
+        crate::broker::ensure_broker_request_owner(&inner, request_id, 1).is_err(),
+        "MC-3: no runner may renew the cancelled placeholder"
+    );
+    // Completion-equivalent grant semantics, verified rather than assumed:
+    // nothing outside the Purge arm ever removes these maps, for any job, so
+    // a settled placeholder keeps its entries exactly like a completed job.
+    assert!(
+        inner
+            .id_token_grants
+            .contains_key(&(run_id, placeholder.clone())),
+        "settled placeholder keeps its id-token grant like a completed job"
+    );
+    assert!(
+        inner
+            .oidc_job_contexts
+            .contains_key(&(run_id, placeholder.clone())),
+        "settled placeholder keeps its OIDC context like a completed job"
+    );
+    drop(inner);
+
+    let run = get_run_json(&app, &run_id.to_string()).await;
+    assert_eq!(run["jobs"]["downstream"], "cancelled");
+}
+
+#[tokio::test]
+async fn cancelled_deferred_matrix_node_job_cancel_settles_requests() {
+    // MC-3: the job-level cancel path (job-level concurrency cancel-in-
+    // progress, holder cancellation) hits the same leak as a run cancel: a
+    // parked deferred-matrix node's submit-time records stay active forever.
+    let temp = tempfile::tempdir().unwrap();
+    let state = AppState::new(temp.path().to_path_buf()).await.unwrap();
+    let app = app(state.clone(), CancellationToken::new());
+
+    let accepted = request_json(
+        &app,
+        Method::POST,
+        "/api/v1/runs",
+        json!({
+            "workflow_yaml": r#"
+on: push
+jobs:
+  generator:
+    runs-on: ubuntu-latest
+    steps:
+      - run: echo gen
+  downstream:
+    needs: [generator]
+    runs-on: ubuntu-latest
+    strategy:
+      matrix: ${{ fromJson(needs.generator.outputs.matrix) }}
+    steps:
+      - run: echo dynamic
+"#,
+            "event": "push",
+            "repository": "owner/repo"
+        }),
+    )
+    .await;
+    let run_id: RunId = accepted["run_id"].as_str().unwrap().parse().unwrap();
+    let placeholder = JobId("downstream".to_string());
+
+    let request_id = {
+        let inner = state.inner.lock().await;
+        inner
+            .job_requests
+            .values()
+            .find(|r| r.run_id == run_id && r.job_id == placeholder)
+            .expect("deferred-matrix placeholder must have a submit-time request")
+            .request_id
+    };
+
+    {
+        let mut inner = state.inner.lock().await;
+        crate::runtime_scheduling::cancel_job_inner(&mut inner, run_id, &placeholder);
+    }
+
+    let inner = state.inner.lock().await;
+    let record = inner
+        .job_requests
+        .get(&request_id)
+        .expect("settled placeholder keeps its record, like a completed job");
+    assert_eq!(
+        record.result,
+        Some(ExecutionStatus::Cancelled),
+        "MC-3: job-cancelled placeholder request must be settled"
+    );
+    assert!(
+        !inner.inflight_requests.contains_key(&request_id),
+        "MC-3: job-cancelled placeholder must leave inflight_requests"
+    );
+    assert_eq!(
+        inner.runs[&run_id].jobs.get(&placeholder),
+        Some(&ExecutionStatus::Cancelled),
+        "job cancel must still mark the node cancelled in the run"
+    );
+}
+
+#[tokio::test]
+async fn overflowed_run_settles_deferred_matrix_node_requests() {
+    // MC-3: a run cancelled at submit by a workflow-concurrency queue
+    // overflow never dispatches anything, yet the deferred-matrix node's
+    // submit-time request records were minted before the gate check. They
+    // must be settled like any other cancellation instead of leaking as
+    // active forever.
+    let temp = tempfile::tempdir().unwrap();
+    let state = AppState::new(temp.path().to_path_buf()).await.unwrap();
+    let app = app(state.clone(), CancellationToken::new());
+    let yaml = r#"
+on: push
+concurrency:
+  group: overflow-group
+  queue: max
+jobs:
+  generator:
+    runs-on: ubuntu-latest
+    steps:
+      - run: echo gen
+  downstream:
+    needs: [generator]
+    runs-on: ubuntu-latest
+    strategy:
+      matrix: ${{ fromJson(needs.generator.outputs.matrix) }}
+    steps:
+      - run: echo dynamic
+"#;
+    // 1 running + 100 pending = 101 holders; 102nd arrival cancelled.
+    let mut ids = Vec::new();
+    for _ in 0..101 {
+        let r = submit_yaml(&app, yaml, "owner/repo").await;
+        ids.push(r["run_id"].as_str().unwrap().to_owned());
+    }
+    let overflow_id = submit_yaml(&app, yaml, "owner/repo").await;
+    let overflow_id = overflow_id["run_id"].as_str().unwrap().to_owned();
+    assert_eq!(
+        get_run_json(&app, &overflow_id).await["status"],
+        "cancelled"
+    );
+
+    let run_id: RunId = overflow_id.parse().unwrap();
+    let inner = state.inner.lock().await;
+    let record = inner
+        .job_requests
+        .values()
+        .find(|r| r.run_id == run_id && r.job_id == JobId("downstream".to_string()))
+        .expect("overflowed run must still have minted the placeholder request");
+    assert_eq!(
+        record.result,
+        Some(ExecutionStatus::Cancelled),
+        "MC-3: overflowed run placeholder request must be settled"
+    );
+    assert!(
+        !inner.inflight_requests.contains_key(&record.request_id),
+        "MC-3: overflowed run placeholder must leave inflight_requests"
+    );
+}
+
+#[tokio::test]
+async fn dependency_skipped_deferred_matrix_node_settles_requests() {
+    // MC-3: a needs-deferred matrix node whose dependency fails is concluded
+    // as Skipped by the dependency-decision arm of the promote sweep — never
+    // dispatched, so no completion path settles its submit-time request
+    // correlation. The skip arm must settle it like any other terminal
+    // conclusion.
+    let temp = tempfile::tempdir().unwrap();
+    let state = AppState::new(temp.path().to_path_buf()).await.unwrap();
+    let app = app(state.clone(), CancellationToken::new());
+
+    let accepted = request_json(
+        &app,
+        Method::POST,
+        "/api/v1/runs",
+        json!({
+            "workflow_yaml": r#"
+on: push
+jobs:
+  generator:
+    runs-on: ubuntu-latest
+    steps:
+      - run: exit 1
+  downstream:
+    needs: [generator]
+    runs-on: ubuntu-latest
+    strategy:
+      matrix: ${{ fromJson(needs.generator.outputs.matrix) }}
+    steps:
+      - run: echo dynamic
+"#,
+            "event": "push",
+            "repository": "owner/repo"
+        }),
+    )
+    .await;
+    let run_id: RunId = accepted["run_id"].as_str().unwrap().parse().unwrap();
+    let placeholder = JobId("downstream".to_string());
+
+    let request_id = {
+        let inner = state.inner.lock().await;
+        inner
+            .job_requests
+            .values()
+            .find(|r| r.run_id == run_id && r.job_id == placeholder)
+            .expect("deferred-matrix placeholder must have a submit-time request")
+            .request_id
+    };
+
+    request_json(
+        &app,
+        Method::POST,
+        "/internal/test/jobs/complete",
+        json!({
+            "run_id": run_id,
+            "job_id": "generator",
+            "status": "failure"
+        }),
+    )
+    .await;
+
+    let inner = state.inner.lock().await;
+    let record = inner
+        .job_requests
+        .get(&request_id)
+        .expect("skipped placeholder keeps its record, like a completed job");
+    assert_eq!(
+        record.result,
+        Some(ExecutionStatus::Skipped),
+        "MC-3: dependency-skipped placeholder request must be settled"
+    );
+    assert!(
+        !inner.inflight_requests.contains_key(&request_id),
+        "MC-3: dependency-skipped placeholder must leave inflight_requests"
+    );
+    assert!(
+        !inner
+            .session_active_requests
+            .values()
+            .any(|&rid| rid == request_id),
+        "MC-3: dependency-skipped placeholder must leave session_active_requests"
+    );
+    assert_eq!(
+        inner.runs[&run_id].jobs.get(&placeholder),
+        Some(&ExecutionStatus::Skipped),
+        "the node itself must be concluded Skipped in the run"
+    );
+}
+
+#[tokio::test]
+async fn dependency_error_deferred_matrix_node_settles_requests() {
+    // MC-3: a needs-deferred matrix node whose `if:` expression fails to
+    // evaluate is concluded as Failure by the dependency-decision arm of the
+    // promote sweep. Its submit-time request correlation must be settled the
+    // same way.
+    let temp = tempfile::tempdir().unwrap();
+    let state = AppState::new(temp.path().to_path_buf()).await.unwrap();
+    let app = app(state.clone(), CancellationToken::new());
+
+    let accepted = request_json(
+        &app,
+        Method::POST,
+        "/api/v1/runs",
+        json!({
+            "workflow_yaml": r#"
+on: push
+jobs:
+  generator:
+    runs-on: ubuntu-latest
+    steps:
+      - run: echo gen
+  downstream:
+    needs: [generator]
+    # Parse-valid but a runtime evaluation error: `format` cannot resolve the
+    # placeholder with no arguments, a genuine condition error rather than a
+    # false value, so the node concludes Failure rather than Skipped.
+    if: ${{ format('{}') }}
+    runs-on: ubuntu-latest
+    strategy:
+      matrix: ${{ fromJson(needs.generator.outputs.matrix) }}
+    steps:
+      - run: echo dynamic
+"#,
+            "event": "push",
+            "repository": "owner/repo"
+        }),
+    )
+    .await;
+    let run_id: RunId = accepted["run_id"].as_str().unwrap().parse().unwrap();
+    let placeholder = JobId("downstream".to_string());
+
+    let request_id = {
+        let inner = state.inner.lock().await;
+        inner
+            .job_requests
+            .values()
+            .find(|r| r.run_id == run_id && r.job_id == placeholder)
+            .expect("deferred-matrix placeholder must have a submit-time request")
+            .request_id
+    };
+
+    request_json(
+        &app,
+        Method::POST,
+        "/internal/test/jobs/complete",
+        json!({
+            "run_id": run_id,
+            "job_id": "generator",
+            "status": "success"
+        }),
+    )
+    .await;
+
+    let inner = state.inner.lock().await;
+    let record = inner
+        .job_requests
+        .get(&request_id)
+        .expect("errored placeholder keeps its record, like a completed job");
+    assert_eq!(
+        record.result,
+        Some(ExecutionStatus::Failure),
+        "MC-3: condition-error placeholder request must be settled"
+    );
+    assert!(
+        !inner.inflight_requests.contains_key(&request_id),
+        "MC-3: condition-error placeholder must leave inflight_requests"
+    );
+    assert_eq!(
+        inner.runs[&run_id].jobs.get(&placeholder),
+        Some(&ExecutionStatus::Failure),
+        "the node itself must be concluded Failure in the run"
+    );
+}
+
+#[tokio::test]
+async fn cancel_preserves_completed_reusable_caller_result() {
+    // MC-3 review follow-up: a nested reusable caller that finished Success
+    // while the run stayed active still sits in `run.caller_plans` with an
+    // unsettled request record (`propagate_reusable_outputs` retires none).
+    // The run-cancel sweep settles every expandable node, so it must settle
+    // this one with its real verdict — Success — not clobber it to Cancelled.
+    let temp = tempfile::tempdir().unwrap();
+    let state = AppState::new(temp.path().to_path_buf()).await.unwrap();
+    let app = app(state.clone(), CancellationToken::new());
+
+    let accepted = request_json(
+        &app,
+        Method::POST,
+        "/api/v1/runs",
+        json!({
+            "workflow_yaml": r#"
+on: push
+jobs:
+  outer:
+    uses: ./.github/workflows/outer.yml
+  keepalive:
+    runs-on: ubuntu-latest
+    steps:
+      - run: echo keepalive
+"#,
+            "event": "push",
+            "repository": "owner/repo",
+            "reusable_workflows": {
+                ".github/workflows/outer.yml": r#"
+on: workflow_call
+jobs:
+  nested:
+    uses: ./.github/workflows/inner.yml
+"#,
+                ".github/workflows/inner.yml": r#"
+on: workflow_call
+jobs:
+  work:
+    runs-on: ubuntu-latest
+    steps:
+      - run: echo work
+"#,
+            }
+        }),
+    )
+    .await;
+    let run_id: RunId = accepted["run_id"].as_str().unwrap().parse().unwrap();
+    let nested_caller = JobId("outer/nested".to_string());
+
+    // The gate-free nested call materializes its whole subtree at submit.
+    let leaf = {
+        let inner = state.inner.lock().await;
+        inner.runs[&run_id]
+            .jobs
+            .keys()
+            .find(|id| id.0.starts_with("outer/nested/"))
+            .expect("nested callee leaf must materialize at submit")
+            .clone()
+    };
+
+    // Drive the nested caller to Success by completing its only leaf, while
+    // `keepalive` stays queued so the run does not conclude.
+    request_json(
+        &app,
+        Method::POST,
+        "/internal/test/jobs/complete",
+        json!({
+            "run_id": run_id,
+            "job_id": leaf.0,
+            "status": "success"
+        }),
+    )
+    .await;
+
+    let caller_request_id = {
+        let inner = state.inner.lock().await;
+        assert_eq!(
+            inner.runs[&run_id].jobs.get(&nested_caller),
+            Some(&ExecutionStatus::Success),
+            "nested caller must aggregate to Success once its leaf completes"
+        );
+        assert!(
+            inner.runs[&run_id]
+                .caller_plans
+                .contains_key(&nested_caller),
+            "completed nested caller stays in caller_plans"
+        );
+        let record = inner
+            .job_requests
+            .values()
+            .find(|r| r.run_id == run_id && r.job_id == nested_caller)
+            .expect("nested caller minted a request record at expansion");
+        // The completion path never settles a caller's own record: this is the
+        // pre-existing unsettled state the cancel sweep must not corrupt.
+        assert_eq!(
+            record.result, None,
+            "nested caller's record is unsettled before cancel"
+        );
+        record.request_id
+    };
+
+    request_json(
+        &app,
+        Method::POST,
+        &format!("/api/v1/runs/{run_id}/cancel"),
+        Value::Null,
+    )
+    .await;
+
+    let inner = state.inner.lock().await;
+    let record = inner
+        .job_requests
+        .get(&caller_request_id)
+        .expect("cancel keeps the settled caller record");
+    assert_eq!(
+        record.result,
+        Some(ExecutionStatus::Success),
+        "MC-3: cancel must settle a completed caller with Success, not Cancelled"
+    );
+    assert!(
+        !inner.inflight_requests.contains_key(&caller_request_id),
+        "MC-3: settled caller record must leave inflight_requests"
+    );
+    assert_eq!(
+        inner.runs[&run_id].jobs.get(&nested_caller),
+        Some(&ExecutionStatus::Success),
+        "the completed caller keeps its Success status through cancellation"
+    );
+    assert_eq!(
+        inner.runs[&run_id]
+            .jobs
+            .get(&JobId("keepalive".to_string())),
+        Some(&ExecutionStatus::Cancelled),
+        "the still-queued keepalive job is cancelled by the run cancel"
+    );
 }
 
 // ---------------------------------------------------------------------------
@@ -18672,6 +24236,8 @@ fn server_config_debug_redacts_store_url_password() {
         oidc_issuer: None,
         enable_scheduler: false,
         pending_registrations: None,
+        pool_status: None,
+        observability: None,
         require_job_assignments: false,
     };
     let debug = format!("{config:?}");
@@ -18924,6 +24490,101 @@ async fn startup_fails_claims_orphaned_by_a_restart() {
     assert!(
         inner.queue.iter().any(|job| job.job_id.0 == "test"),
         "the unclaimed job stays in the queue for a fresh machine"
+    );
+}
+
+/// Versions before the runner-purge fix put the logical job back on the queue
+/// but left its request owned by a dead runner and detached from every session.
+/// Startup must release that persisted correlation for a replacement runner.
+#[tokio::test]
+async fn startup_releases_an_orphaned_request_whose_job_was_requeued() {
+    let temp = tempfile::tempdir().unwrap();
+    let state = AppState::new(temp.path().to_path_buf()).await.unwrap();
+    let app = app(state.clone(), CancellationToken::new());
+    let accepted = submit_simple_run(&app).await;
+    let run_id: RunId = accepted["run_id"].as_str().unwrap().parse().unwrap();
+    let job_id = JobId("build".to_owned());
+
+    let request_id = {
+        let mut inner = state.inner.lock().await;
+        let request_id = inner
+            .job_requests
+            .values()
+            .find(|record| record.run_id == run_id && record.job_id == job_id)
+            .map(|record| record.request_id)
+            .expect("queued job request");
+        let record = inner.job_requests.get_mut(&request_id).unwrap();
+        record.owner_runner_id = Some(99);
+        record.started_at = Some(SystemTime::now() - Duration::from_secs(300));
+        request_id
+    };
+
+    let shared = Arc::new(SharedState {
+        state: state.clone(),
+        shutdown: CancellationToken::new(),
+    });
+    let settled = crate::broker::reconcile_orphaned_claims(&shared).await;
+    assert_eq!(settled, 1);
+
+    {
+        let inner = state.inner.lock().await;
+        let request = &inner.job_requests[&request_id];
+        assert_eq!(
+            request.result, None,
+            "the queued request must remain completable"
+        );
+        assert_eq!(
+            request.owner_runner_id, None,
+            "startup must release the dead runner owner"
+        );
+        assert_eq!(request.started_at, None);
+        assert_eq!(request.last_renewed_at, None);
+        assert!(
+            inner.inflight_requests.contains_key(&request_id),
+            "the request correlation must remain inflight"
+        );
+        assert!(
+            inner
+                .queue
+                .iter()
+                .any(|job| job.run_id == run_id && job.job_id == job_id),
+            "the replacement attempt remains queued"
+        );
+        assert_eq!(
+            inner.runs[&run_id].jobs[&job_id],
+            ExecutionStatus::Queued,
+            "releasing the old owner must not conclude its logical job"
+        );
+        assert!(crate::runtime_scheduling::live_runner_assignments(
+            &inner.job_requests,
+            &inner.session_active_requests,
+            SystemTime::now(),
+        )
+        .is_empty());
+    }
+
+    let (runner_id, token) =
+        register_runner_with_token(&app, "startup-replacement", &["self-hosted"], None).await;
+    let (_, session) = create_disttask_session(&app, &token, runner_id).await;
+    let session_id = session["sessionId"].as_str().unwrap();
+    let delivered = poll_message(&app, &token, session_id).await;
+    assert!(
+        !delivered.is_null(),
+        "replacement must receive restored retry"
+    );
+    request_json_with_bearer(
+        &app,
+        Method::PATCH,
+        &format!("/_apis/v1/AgentRequest/1/{request_id}"),
+        json!({"result": "Succeeded"}),
+        &token,
+    )
+    .await;
+    let inner = state.inner.lock().await;
+    assert_eq!(
+        inner.runs[&run_id].jobs[&job_id],
+        ExecutionStatus::Success,
+        "restored retry must complete through the retained correlation"
     );
 }
 
@@ -19406,4 +25067,219 @@ async fn dirty_push_sync_verifies_the_branch_head_and_reports_checks_on_the_mate
 
     std::env::remove_var("PRELOOP_GITHUB_TOKEN");
     std::env::remove_var("PRELOOP_GITHUB_API_URL");
+}
+#[tokio::test]
+async fn broker_hybrid_poll_rejects_a_foreign_live_runner() {
+    let temp = tempfile::tempdir().unwrap();
+    let state = AppState::new(temp.path().to_path_buf()).await.unwrap();
+    let app = app(state.clone(), CancellationToken::new());
+
+    let runner_a = request_json(
+        &app,
+        Method::POST,
+        "/runner/server/_apis/v1/Agent/1/0",
+        json!({"name": "runner-a", "version": "2.335.1"}),
+    )
+    .await;
+    let runner_b = request_json(
+        &app,
+        Method::POST,
+        "/runner/server/_apis/v1/Agent/1/0",
+        json!({"name": "runner-b", "version": "2.335.1"}),
+    )
+    .await;
+    let runner_a_id = runner_a["id"].as_i64().unwrap();
+    let runner_b_id = runner_b["id"].as_i64().unwrap();
+    let token_a = state
+        .local_jwt(json!({
+            "sub": format!("preloop-runner-listen-{runner_a_id}"),
+            "scp": "ActionsRuntime.RunnerListen",
+        }))
+        .unwrap();
+    let token_b = state
+        .local_jwt(json!({
+            "sub": format!("preloop-runner-listen-{runner_b_id}"),
+            "scp": "ActionsRuntime.RunnerListen",
+        }))
+        .unwrap();
+    request_json(
+        &app,
+        Method::POST,
+        "/api/v1/runs",
+        json!({
+            "workflow_yaml": "on: push\njobs:\n  build:\n    runs-on: ubuntu-latest\n    steps:\n      - run: echo hi\n",
+            "event": "push",
+            "repository": "owner/repo",
+        }),
+    )
+    .await;
+    let session = request_json_with_bearer(
+        &app,
+        Method::POST,
+        "/runner/server/_apis/distributedtask/pools/1/sessions",
+        json!({
+            "agent": {"id": runner_a_id, "name": "runner-a"},
+            "ownerName": "runner-a",
+            "useFipsEncryption": false,
+        }),
+        &token_a,
+    )
+    .await;
+    let session_id = session["sessionId"].as_str().unwrap();
+    let before = {
+        let inner = state.inner.lock().await;
+        (inner.queue.len(), inner.session_active_requests.clone())
+    };
+    let response = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method(Method::GET)
+                .uri(format!(
+                    "/runner/server/_apis/distributedtask/pools/1/messages?sessionId={session_id}&waitSeconds=0"
+                ))
+                .header(header::AUTHORIZATION, format!("Bearer {token_b}"))
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::FORBIDDEN);
+    let after = {
+        let inner = state.inner.lock().await;
+        (inner.queue.len(), inner.session_active_requests.clone())
+    };
+    assert_eq!(
+        after, before,
+        "a foreign poll must not consume queue work or bind an active request"
+    );
+}
+
+#[tokio::test]
+async fn purged_runner_listen_token_cannot_open_a_broker_session() {
+    let temp = tempfile::tempdir().unwrap();
+    let state = AppState::new(temp.path().to_path_buf()).await.unwrap();
+    let app = app(state.clone(), CancellationToken::new());
+    let runner = request_json(
+        &app,
+        Method::POST,
+        "/runner/server/_apis/v1/Agent/1/0",
+        json!({"name": "runner-revocation", "version": "2.335.1"}),
+    )
+    .await;
+    let runner_id = runner["id"].as_i64().unwrap();
+    let token = state
+        .local_jwt(json!({
+            "sub": format!("preloop-runner-listen-{runner_id}"),
+            "scp": "ActionsRuntime.RunnerListen",
+        }))
+        .unwrap();
+    request_json(
+        &app,
+        Method::DELETE,
+        &format!("/runner/server/_apis/distributedtask/pools/1/agents/{runner_id}"),
+        Value::Null,
+    )
+    .await;
+
+    let response = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method(Method::POST)
+                .uri("/runner/server/session")
+                .header(header::AUTHORIZATION, format!("Bearer {token}"))
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
+}
+
+#[tokio::test]
+async fn reporting_rejects_a_runtime_token_for_a_different_job() {
+    let temp = tempfile::tempdir().unwrap();
+    let state = AppState::new(temp.path().to_path_buf()).await.unwrap();
+    let app = app(state.clone(), CancellationToken::new());
+    let workflow = "on: push\njobs:\n  build:\n    runs-on: ubuntu-latest\n    steps:\n      - run: echo report\n";
+    for _ in 0..2 {
+        request_json(
+            &app,
+            Method::POST,
+            "/api/v1/runs",
+            json!({
+                "workflow_yaml": workflow,
+                "event": "push",
+                "repository": "owner/repo",
+            }),
+        )
+        .await;
+    }
+    let mut requests: Vec<_> = state
+        .inner
+        .lock()
+        .await
+        .job_requests
+        .values()
+        .cloned()
+        .collect();
+    requests.sort_by_key(|request| request.request_id);
+    assert!(requests.len() >= 2);
+    let target = &requests[1];
+    let foreign_token = state.mint_runtime_token(&requests[0].plan_id, &requests[0].agent_job_id);
+    let response = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method(Method::PATCH)
+                .uri(format!(
+                    "/runner/server/_apis/v1/Timeline/scope/hub/{}/{}",
+                    target.plan_id, target.timeline_id
+                ))
+                .header(header::AUTHORIZATION, format!("Bearer {foreign_token}"))
+                .header(header::CONTENT_TYPE, "application/json")
+                .body(Body::from(r#"{"count":0,"value":[]}"#))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::FORBIDDEN);
+}
+
+#[tokio::test]
+async fn flow_recording_redacts_credentials() {
+    let temp = tempfile::tempdir().unwrap();
+    let flow_path = temp.path().join("flows.ndjson");
+    let file = fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(&flow_path)
+        .unwrap();
+    let state = AppState::new(temp.path().to_path_buf()).await.unwrap();
+    let system_token = state.system_token.clone();
+    state.inner.lock().await.flows_file = Some(file);
+    let app = app(state, CancellationToken::new());
+    let response = app
+        .oneshot(
+            Request::builder()
+                .method(Method::GET)
+                .uri("/healthz")
+                .header(header::AUTHORIZATION, format!("Bearer {system_token}"))
+                .header("x-preloop-provision-token", "provision-secret")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert!(
+        response.status().is_success(),
+        "status: {}",
+        response.status()
+    );
+    let flow = fs::read_to_string(flow_path).unwrap();
+    assert!(!flow.contains(&system_token));
+    assert!(!flow.contains("system-secret"));
+    assert!(!flow.contains("provision-secret"));
+    assert!(flow.matches("[REDACTED]").count() >= 2);
 }

@@ -2,6 +2,29 @@ use super::*;
 
 // Timeline, logs, completion
 
+/// Whether a timeline record describes a step rather than a container.
+///
+/// Shared by the annotation projection and the manifest reconciliation below,
+/// which disagreed: one keyed on `Step`-or-parent and the other whitelisted
+/// `Task`, so a typed `Task` with no parent was stored as a step while its
+/// issues were reported against the job.
+///
+/// Excluding containers rather than whitelisting a step type is deliberate.
+/// `type` is optional on the wire and the official runner sends `Task` where
+/// preloop's sends `Step`, so an allow-list silently drops real conclusions.
+fn is_step_record(record: &azdo::TimelineRecord) -> bool {
+    match record.record_type {
+        Some(azdo::TimelineRecordType::Task | azdo::TimelineRecordType::Step) => true,
+        Some(
+            azdo::TimelineRecordType::Job
+            | azdo::TimelineRecordType::Phase
+            | azdo::TimelineRecordType::Stage,
+        ) => false,
+        // Untyped: a step always hangs off its job record.
+        None => record.parent_id.is_some(),
+    }
+}
+
 /// PATCH timeline records — runner updates step/job state.
 pub(crate) async fn patch_timeline_records(
     State(shared): State<Arc<SharedState>>,
@@ -42,13 +65,7 @@ pub(crate) async fn patch_timeline_records(
         }
         if let Some(run_id) = run_id {
             for issue in &record.issues {
-                let step_id = if record.record_type == Some(azdo::TimelineRecordType::Step)
-                    || record.parent_id.is_some()
-                {
-                    Some(record.id.to_string())
-                } else {
-                    None
-                };
+                let step_id = is_step_record(record).then(|| record.id.to_string());
                 projected.push(NdjsonEvent::Annotation {
                     run_id,
                     job_id: logical_job_id
@@ -80,6 +97,9 @@ pub(crate) async fn patch_timeline_records(
         }
     }
 
+    // Set when this PATCH reconciled an attempt's step records, so they can be
+    // persisted once the state lock is released.
+    let mut touched_attempt: Option<(RunId, uuid::Uuid, Vec<StepRecord>, u64)> = None;
     let new_change_id = {
         let mut inner = shared.state.inner.lock().await;
         let current = inner
@@ -89,21 +109,40 @@ pub(crate) async fn patch_timeline_records(
         *current += 1;
         let new_id = *current;
 
-        inner
+        let events = inner
             .timeline_events
             .entry(run_id.unwrap_or_else(|| RunId(uuid::Uuid::nil())))
-            .or_default()
-            .extend(projected.clone());
+            .or_default();
+        for event in &projected {
+            if !events.contains(event) {
+                events.push(event.clone());
+            }
+        }
+        trim_timeline_events(
+            &mut inner,
+            run_id.unwrap_or_else(|| RunId(uuid::Uuid::nil())),
+        );
 
         if let (Some(run_id), Some(job_id)) = (run_id, &logical_job_id) {
+            // The manifest is attempt-scoped, so reconciliation needs the
+            // agent job id — the workflow job key alone cannot distinguish
+            // one dispatch of a job from a later re-dispatch.
+            let agent_job_id = callback_job
+                .as_ref()
+                .and_then(|(request_id, _, _)| inner.job_requests.get(request_id))
+                .map(|request| request.agent_job_id);
+            let job_status = inner
+                .runs
+                .get(&run_id)
+                .and_then(|run| run.jobs.get(job_id).copied());
+
             if let Some(run) = inner.runs.get_mut(&run_id) {
-                let job_name = job_id.0.clone();
-                let job_detail =
-                    if let Some(pos) = run.jobs_list.iter().position(|j| j.name == job_name) {
-                        &mut run.jobs_list[pos]
-                    } else {
+                let detail = match JobDetail::find(&mut run.jobs_list, &job_id.0) {
+                    Some(detail) => detail,
+                    None => {
                         run.jobs_list.push(JobDetail {
-                            name: job_name,
+                            job_id: job_id.0.clone(),
+                            name: job_id.0.clone(),
                             // A timeline update means the job started; the run
                             // record's final conclusion comes from the job
                             // status map (projected in the runs GET). Default
@@ -112,25 +151,29 @@ pub(crate) async fn patch_timeline_records(
                             steps: Vec::new(),
                             annotations: Vec::new(),
                         });
-                        run.jobs_list.last_mut().unwrap()
-                    };
-
-                if let Some(status) = run.jobs.get(job_id) {
-                    // The status map is authoritative for terminal states
-                    // only. Its in-flight projection ("inprogress" from the
-                    // raw Debug spelling, or "success" from the run-level
-                    // status_string) lies about a job that is still running —
-                    // keep the truthful "in_progress" default set above.
-                    if *status != ExecutionStatus::InProgress {
-                        job_detail.conclusion = format!("{:?}", status).to_lowercase();
+                        run.jobs_list.last_mut().expect("just pushed")
+                    }
+                };
+                // The status map is authoritative for terminal states only.
+                // Its in-flight projection ("inprogress" from the raw Debug
+                // spelling, or "success" from the run-level status_string)
+                // lies about a job that is still running — keep the truthful
+                // "in_progress" default set above.
+                if let Some(status) = job_status {
+                    if status != ExecutionStatus::InProgress {
+                        detail.conclusion = format!("{:?}", status).to_lowercase();
                     }
                 }
+            }
 
+            if let Some(agent_job_id) = agent_job_id {
+                let observed = chrono::Utc::now();
+                let manifest = inner.job_steps.entry(agent_job_id).or_default();
                 for record in &records {
                     let Some(name) = &record.display_name else {
                         continue;
                     };
-                    if record.id.to_string() == job_id.0 {
+                    if !is_step_record(record) {
                         continue;
                     }
 
@@ -139,7 +182,7 @@ pub(crate) async fn patch_timeline_records(
                             azdo::TaskResult::Succeeded | azdo::TaskResult::SucceededWithIssues,
                         ) => "success",
                         Some(azdo::TaskResult::Failed) => {
-                            if run.jobs.get(job_id) == Some(&ExecutionStatus::Cancelled) {
+                            if job_status == Some(ExecutionStatus::Cancelled) {
                                 "cancelled"
                             } else {
                                 "failure"
@@ -163,29 +206,61 @@ pub(crate) async fn patch_timeline_records(
                         .as_deref()
                         .and_then(|t| chrono::DateTime::parse_from_rfc3339(t).ok())
                         .map(|t| t.with_timezone(&chrono::Utc));
-                    let observed = chrono::Utc::now();
+                    let record_id = record.id.to_string();
 
-                    if let Some(pos) = job_detail.steps.iter().position(|s| s.name == *name) {
-                        job_detail.steps[pos].conclusion = conclusion_str.to_owned();
-                        if let Some(started_at) = started_at {
-                            job_detail.steps[pos].started_at = Some(started_at);
+                    match StepRecord::find_by_id(manifest, &record_id) {
+                        Some(pos) => {
+                            manifest[pos].conclusion = conclusion_str.to_owned();
+                            if let Some(started_at) = started_at {
+                                manifest[pos].started_at = Some(started_at);
+                            }
+                            if let Some(finished_at) = finished_at {
+                                manifest[pos].finished_at = Some(finished_at);
+                            }
+                            manifest[pos].name = name.clone();
                         }
-                        if let Some(finished_at) = finished_at {
-                            job_detail.steps[pos].finished_at = Some(finished_at);
-                        }
-                    } else {
-                        job_detail.steps.push(StepRecord {
+                        // A timeline record with no manifest entry is runner
+                        // bookkeeping, not a workflow step. `TimelineRecord`
+                        // carries no ordinal, so `runner_number` stays unset
+                        // on this path.
+                        None => manifest.push(StepRecord {
+                            id: record_id,
+                            kind: StepKind::Synthetic,
+                            workflow_index: None,
+                            runner_number: None,
+                            context_name: None,
                             name: name.clone(),
                             conclusion: conclusion_str.to_owned(),
                             started_at: started_at.or(Some(observed)),
                             finished_at,
-                        });
+                        }),
                     }
                 }
+                // Captured so the attempt can be persisted after the lock is
+                // released. A PATCH that projects no job-status event emits
+                // nothing, so without this the reconciliation stays
+                // memory-only and a restart loses it.
+                let records = manifest.clone();
+                let revision = {
+                    let counter = inner.job_steps_revision.entry(agent_job_id).or_insert(0);
+                    *counter += 1;
+                    *counter
+                };
+                touched_attempt = Some((run_id, agent_job_id, records, revision));
             }
         }
         new_id
     };
+    if let Some((run_id, agent_job_id, records, revision)) = touched_attempt {
+        if let Err(error) = shared
+            .state
+            .store
+            .store_job_steps(run_id, agent_job_id, &records, revision)
+            .await
+        {
+            warn!(?error, %run_id, "failed to persist timeline step records");
+        }
+    }
     for event in projected {
         shared.state.emit(event).await;
     }
@@ -199,11 +274,22 @@ pub(crate) async fn patch_timeline_records(
     // Persist records (upsert by record ID) and return the full stored set.
     let (response_records, meta) = {
         let mut inner = shared.state.inner.lock().await;
-        let stored = inner.timeline_records.entry(timeline_key).or_default();
+        let stored = inner
+            .timeline_records
+            .entry(timeline_key.clone())
+            .or_default();
+        // Ids just upserted by this PATCH — protect them from eviction so a
+        // low-sorting UUID isn't dropped out of the response/timeline.
+        let patched_ids: Vec<uuid::Uuid> = records.iter().map(|r| r.id).collect();
         for record in records {
             stored.insert(record.id, record);
         }
-        let vals: Vec<_> = stored.values().cloned().collect();
+        trim_timeline_after_patch(&mut inner, &timeline_key, &patched_ids);
+        let vals: Vec<_> = inner
+            .timeline_records
+            .get(&timeline_key)
+            .map(|m| m.values().cloned().collect())
+            .unwrap_or_default();
         (vals, crate::store::build_meta_snapshot(&inner))
     };
     // Persist after the lock is released so a slow backend does not serialize
@@ -244,16 +330,27 @@ pub(crate) async fn create_log(
     Path((_scope, _hub, plan_id)): Path<(String, String, String)>,
     Json(mut log): Json<azdo::TaskLog>,
 ) -> Json<serde_json::Value> {
-    let meta = {
+    let (meta, evicted) = {
         let mut inner = shared.state.inner.lock().await;
         let next_id = inner.next_log_id;
         inner.next_log_id = next_id.wrapping_add(1);
         log.id = next_id as i64;
         let key = format!("{}/{}", plan_id, next_id);
         inner.logs.entry(key.clone()).or_default();
-        inner.log_metadata.entry(key).or_default();
-        crate::store::build_meta_snapshot(&inner)
+        inner.log_metadata.entry(key.clone()).or_default();
+        if !inner.log_order.iter().any(|k| k == &key) {
+            inner.log_order.push_back(key.clone());
+        }
+        let evicted = trim_plan_logs(&mut inner, &plan_id);
+        (crate::store::build_meta_snapshot(&inner), evicted)
     };
+    // Delete durably any logs the caps just evicted from memory, so the
+    // on-disk store never outgrows the in-memory retention (D2).
+    for key in &evicted {
+        if let Err(error) = shared.state.store.delete_log(key).await {
+            warn!(?error, key, "failed to delete evicted log from store");
+        }
+    }
     if let Err(error) = shared.state.store.store_meta_only(&meta).await {
         warn!(?error, "failed to persist created log");
     }
@@ -269,8 +366,9 @@ pub(crate) async fn append_log(
     let key = log_key(&plan_id, &log_id);
     // Hot path: mutate and capture the chunk under the lock, then persist
     // after releasing it.
-    let (masked, chunk_index, byte_count, line_count) = {
+    let (masked, chunk_index, byte_count, line_count, evicted) = {
         let mut inner = shared.state.inner.lock().await;
+        let is_new = !inner.logs.contains_key(&key);
         let masked = mask_log_bytes(&inner, &plan_id, &body);
         let byte_count = masked.len();
         let line_count = masked.iter().filter(|&&b| b == b'\n').count();
@@ -279,21 +377,54 @@ pub(crate) async fn append_log(
             .entry(key.clone())
             .or_default()
             .extend_from_slice(&masked);
-        let meta = inner.log_metadata.entry(key.clone()).or_default();
-        meta.byte_count += byte_count;
-        meta.line_count += line_count;
+        inner.log_bytes_total = inner.log_bytes_total.saturating_add(byte_count);
+        if is_new && !inner.log_order.iter().any(|k| k == &key) {
+            inner.log_order.push_back(key.clone());
+        }
+        // F1: keep only the newest bytes in memory. `log_chunks` is the live
+        // console recovery buffer (read only by restart to refill this map),
+        // bounded to the SAME per-key budget in `store_log_chunk` — see D2.
+        // The complete, permanent logs are the step/job-log blobs the runner
+        // uploads separately, so trimming this tail never drops real log data.
+        if let Some(retained) = inner.logs.get_mut(&key) {
+            // Only trim once the buffer grows a full slack window past the cap,
+            // then drop back down to the cap — amortizes the O(n) front-shift
+            // to O(1) per byte instead of shifting on every append.
+            if retained.len() > MAX_LOG_BYTES_PER_KEY + LOG_KEY_TRIM_SLACK {
+                let excess = retained.len() - MAX_LOG_BYTES_PER_KEY;
+                retained.drain(0..excess);
+                inner.log_bytes_total = inner.log_bytes_total.saturating_sub(excess);
+            }
+        }
+        // Update metadata before trimming so the newest log isn't miscounted,
+        // but release the borrow before calling `trim_plan_logs`.
+        {
+            let meta = inner.log_metadata.entry(key.clone()).or_default();
+            meta.byte_count += byte_count;
+            meta.line_count += line_count;
+        }
+        let evicted = trim_plan_logs(&mut inner, &plan_id);
         // Hot path: write the chunk to `log_chunks` and UPSERT the per-log
         // counter, instead of rewriting the entire meta snapshot for every
         // append. The counter is small and idempotent; the chunk is the
         // append-only event stream. We use the new byte count as the chunk
         // index so each append maps to a unique `(log_key, chunk_index)` row.
+        let meta = inner.log_metadata.get(&key).cloned().unwrap_or_default();
         (
             masked,
             meta.byte_count as i64,
             meta.byte_count as i64,
             meta.line_count as i64,
+            evicted,
         )
     };
+    // Delete durably any logs the caps just evicted from memory (D2). The just
+    // appended key is never in this list — it is the newest.
+    for key in &evicted {
+        if let Err(error) = shared.state.store.delete_log(key).await {
+            warn!(?error, key, "failed to delete evicted log from store");
+        }
+    }
     if let Err(error) = shared
         .state
         .store
@@ -342,15 +473,24 @@ pub(crate) async fn console_log(
     )>,
     body: Bytes,
 ) -> StatusCode {
-    // Parse the body as a LiveLogFeedLinesWrapper and store/broadcast it.
+    // Resolve the callback to the run-scoped agent-job key. Falling back to
+    // the plan id preserves compatibility for callbacks that arrive before a
+    // request record exists.
     if let Ok(wrapper) = serde_json::from_slice::<LiveLogFeedLinesWrapper>(&body) {
-        let job_id = {
+        let resolved = {
             let inner = shared.state.inner.lock().await;
             resolve_callback_job(&inner, &plan_id, None, None)
-                .map(|(_, _, job_id)| job_id.0.clone())
-                .unwrap_or_else(|| plan_id.clone())
+                .map(|(_, run_id, job_id)| (run_id, job_id.0))
         };
-        record_live_log_wrapper(&shared, &job_id, wrapper).await;
+        match resolved {
+            Some((run_id, job_id)) => {
+                crate::live_logs::record_live_log_wrapper_for_run(
+                    &shared, run_id, &job_id, wrapper,
+                )
+                .await;
+            }
+            None => crate::live_logs::record_live_log_wrapper(&shared, &plan_id, wrapper).await,
+        }
     }
     StatusCode::OK
 }
@@ -391,6 +531,11 @@ pub(crate) async fn finish_job(
             Some(JobCompletion {
                 run_id,
                 job_id,
+                // Resolved from the callback's own request record.
+                agent_job_id: inner
+                    .job_requests
+                    .get(&request_id)
+                    .map(|record| record.agent_job_id),
                 status,
                 outputs,
                 annotations: Vec::new(),
@@ -441,10 +586,21 @@ pub(crate) async fn patch_timeline_records_plan(
     .await
 }
 
-/// GET `/_apis/v1/Timeline/:scope/:hub/:plan_id/:timeline_id` — read back full timeline.
+/// F6 — pagination controls for timeline GET. `top` is clamped to
+/// [`MAX_TOP_RECORDS`] server-side; `skip` pages further.
+#[derive(Debug, Deserialize)]
+pub(crate) struct TimelineQuery {
+    #[serde(default)]
+    pub(crate) top: Option<usize>,
+    #[serde(default)]
+    pub(crate) skip: Option<usize>,
+}
+
+/// GET `/_apis/v1/Timeline/:scope/:hub/:plan_id/:timeline_id` — read back the timeline.
 pub(crate) async fn get_timeline_records(
     State(shared): State<Arc<SharedState>>,
     Path((_scope, _hub, plan_id, timeline_id)): Path<(String, String, String, String)>,
+    Query(query): Query<TimelineQuery>,
 ) -> Json<serde_json::Value> {
     let timeline_key = format!("{}/{}", plan_id, timeline_id);
     let inner = shared.state.inner.lock().await;
@@ -453,10 +609,18 @@ pub(crate) async fn get_timeline_records(
         .get(&timeline_key)
         .copied()
         .unwrap_or(0);
+    // When `top` is absent the official runner expects the full timeline
+    // (it does not paginate). Storage itself is already capped at
+    // MAX_TIMELINE_RECORDS=1024, so returning all is bounded. When `top`
+    // is present we clamp to MAX_TOP_RECORDS.
+    let (top, skip) = match query.top {
+        Some(t) => (t.min(MAX_TOP_RECORDS), query.skip.unwrap_or(0)),
+        None => (usize::MAX, query.skip.unwrap_or(0)),
+    };
     let records: Vec<_> = inner
         .timeline_records
         .get(&timeline_key)
-        .map(|m| m.values().cloned().collect())
+        .map(|m| m.values().skip(skip).take(top).cloned().collect())
         .unwrap_or_default();
     Json(json!({
         "id": timeline_id,
@@ -471,10 +635,12 @@ pub(crate) async fn get_timeline_records(
 pub(crate) async fn get_timeline_records_plan(
     State(shared): State<Arc<SharedState>>,
     Path((plan_id, timeline_id)): Path<(String, String)>,
+    Query(query): Query<TimelineQuery>,
 ) -> Json<serde_json::Value> {
     get_timeline_records(
         State(shared),
         Path((String::new(), String::new(), plan_id, timeline_id)),
+        Query(query),
     )
     .await
 }
@@ -558,6 +724,11 @@ pub(crate) async fn finish_job_plan(
             Some(JobCompletion {
                 run_id,
                 job_id,
+                // Resolved from the callback's own request record.
+                agent_job_id: inner
+                    .job_requests
+                    .get(&request_id)
+                    .map(|record| record.agent_job_id),
                 status,
                 outputs,
                 annotations: Vec::new(),
@@ -574,6 +745,148 @@ pub(crate) async fn finish_job_plan(
     Json(serde_json::Value::Null)
 }
 
+pub(crate) async fn authorize_reporting_callback(
+    shared: &Arc<SharedState>,
+    headers: &HeaderMap,
+    plan_id: &str,
+    timeline_id: Option<uuid::Uuid>,
+    agent_job_id: Option<uuid::Uuid>,
+) -> Result<(), ApiError> {
+    let request = {
+        let inner = shared.state.inner.lock().await;
+        let request_id = agent_job_id
+            .and_then(|id| inner.agent_job_requests.get(&id).copied())
+            .or_else(|| timeline_id.and_then(|id| inner.timeline_requests.get(&id).copied()))
+            .or_else(|| inner.plan_requests.get(plan_id).copied());
+        request_id
+            .and_then(|id| inner.job_requests.get(&id).cloned())
+            .filter(|request| request.plan_id == plan_id)
+    };
+    crate::auth::authorize_reporting_request(&shared.state, headers, request.as_ref())
+}
+
+pub(crate) async fn patch_timeline_records_authenticated(
+    State(shared): State<Arc<SharedState>>,
+    Path(path): Path<(String, String, String, String)>,
+    headers: HeaderMap,
+    Json(wrapper): Json<azdo::VssJsonCollectionWrapper<azdo::TimelineRecord>>,
+) -> Result<Json<serde_json::Value>, ApiError> {
+    let timeline_id = path.3.parse().ok();
+    authorize_reporting_callback(&shared, &headers, &path.2, timeline_id, None).await?;
+    Ok(patch_timeline_records(State(shared), Path(path), Json(wrapper)).await)
+}
+
+pub(crate) async fn get_timeline_records_authenticated(
+    State(shared): State<Arc<SharedState>>,
+    Path(path): Path<(String, String, String, String)>,
+    headers: HeaderMap,
+    Query(query): Query<TimelineQuery>,
+) -> Result<Json<serde_json::Value>, ApiError> {
+    let timeline_id = path.3.parse().ok();
+    authorize_reporting_callback(&shared, &headers, &path.2, timeline_id, None).await?;
+    Ok(get_timeline_records(State(shared), Path(path), Query(query)).await)
+}
+
+pub(crate) async fn create_log_authenticated(
+    State(shared): State<Arc<SharedState>>,
+    Path(path): Path<(String, String, String)>,
+    headers: HeaderMap,
+    Json(log): Json<azdo::TaskLog>,
+) -> Result<Json<serde_json::Value>, ApiError> {
+    authorize_reporting_callback(&shared, &headers, &path.2, None, None).await?;
+    Ok(create_log(State(shared), Path(path), Json(log)).await)
+}
+
+pub(crate) async fn append_log_authenticated(
+    State(shared): State<Arc<SharedState>>,
+    Path(path): Path<(String, String, String, String)>,
+    headers: HeaderMap,
+    body: Bytes,
+) -> Result<StatusCode, ApiError> {
+    authorize_reporting_callback(&shared, &headers, &path.2, None, None).await?;
+    Ok(append_log(State(shared), Path(path), body).await)
+}
+
+pub(crate) async fn console_log_authenticated(
+    State(shared): State<Arc<SharedState>>,
+    Path(path): Path<(String, String, String, String, String)>,
+    headers: HeaderMap,
+    body: Bytes,
+) -> Result<StatusCode, ApiError> {
+    let timeline_id = path.3.parse().ok();
+    authorize_reporting_callback(&shared, &headers, &path.2, timeline_id, None).await?;
+    Ok(console_log(State(shared), Path(path), body).await)
+}
+
+pub(crate) async fn finish_job_authenticated(
+    State(shared): State<Arc<SharedState>>,
+    Path(path): Path<(String, String, String)>,
+    headers: HeaderMap,
+    Json(event): Json<azdo::JobCompletedEvent>,
+) -> Result<Json<serde_json::Value>, ApiError> {
+    authorize_reporting_callback(&shared, &headers, &path.2, None, Some(event.job_id)).await?;
+    Ok(finish_job(State(shared), Path(path), Json(event)).await)
+}
+
+pub(crate) async fn finish_job_plan_authenticated(
+    State(shared): State<Arc<SharedState>>,
+    Path(plan_id): Path<String>,
+    headers: HeaderMap,
+    Json(event): Json<serde_json::Value>,
+) -> Result<Json<serde_json::Value>, ApiError> {
+    let agent_job_id = event
+        .get("jobId")
+        .and_then(serde_json::Value::as_str)
+        .and_then(|value| value.parse().ok());
+    authorize_reporting_callback(&shared, &headers, &plan_id, None, agent_job_id).await?;
+    Ok(finish_job_plan(State(shared), Path(plan_id), Json(event)).await)
+}
+
+pub(crate) async fn patch_timeline_records_plan_authenticated(
+    State(shared): State<Arc<SharedState>>,
+    Path((plan_id, timeline_id)): Path<(String, String)>,
+    headers: HeaderMap,
+    Json(wrapper): Json<azdo::VssJsonCollectionWrapper<azdo::TimelineRecord>>,
+) -> Result<Json<serde_json::Value>, ApiError> {
+    let timeline_uuid = timeline_id.parse().ok();
+    authorize_reporting_callback(&shared, &headers, &plan_id, timeline_uuid, None).await?;
+    Ok(
+        patch_timeline_records_plan(State(shared), Path((plan_id, timeline_id)), Json(wrapper))
+            .await,
+    )
+}
+
+pub(crate) async fn get_timeline_records_plan_authenticated(
+    State(shared): State<Arc<SharedState>>,
+    Path((plan_id, timeline_id)): Path<(String, String)>,
+    headers: HeaderMap,
+    Query(query): Query<TimelineQuery>,
+) -> Result<Json<serde_json::Value>, ApiError> {
+    let timeline_uuid = timeline_id.parse().ok();
+    authorize_reporting_callback(&shared, &headers, &plan_id, timeline_uuid, None).await?;
+    Ok(get_timeline_records_plan(State(shared), Path((plan_id, timeline_id)), Query(query)).await)
+}
+
+pub(crate) async fn create_log_plan_authenticated(
+    State(shared): State<Arc<SharedState>>,
+    Path(plan_id): Path<String>,
+    headers: HeaderMap,
+    Json(log): Json<azdo::TaskLog>,
+) -> Result<Json<serde_json::Value>, ApiError> {
+    authorize_reporting_callback(&shared, &headers, &plan_id, None, None).await?;
+    Ok(create_log_plan(State(shared), Path(plan_id), Json(log)).await)
+}
+
+pub(crate) async fn append_log_plan_authenticated(
+    State(shared): State<Arc<SharedState>>,
+    Path((plan_id, log_id)): Path<(String, String)>,
+    headers: HeaderMap,
+    body: Bytes,
+) -> Result<StatusCode, ApiError> {
+    authorize_reporting_callback(&shared, &headers, &plan_id, None, None).await?;
+    Ok(append_log_plan(State(shared), Path((plan_id, log_id)), body).await)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -582,12 +895,17 @@ mod tests {
     use std::collections::BTreeMap;
     use std::sync::Arc;
 
-    /// A timeline PATCH for an in-flight job must keep the truthful
-    /// "in_progress" conclusion. The raw Debug spelling ("inprogress") and
-    /// the run-level status_string projection ("success") both lie about a
-    /// job that is still running.
-    #[tokio::test]
-    async fn timeline_patch_keeps_in_progress_conclusion_for_in_flight_job() {
+    /// Seed a single in-flight run with one job, its plan→request mapping, and
+    /// timeline id. Returns the owned `TempDir` (keeps the store file alive for
+    /// the test's lifetime) alongside the handles tests assert against.
+    async fn seed_inflight_run() -> (
+        tempfile::TempDir,
+        Arc<SharedState>,
+        RunId,
+        JobId,
+        String,
+        uuid::Uuid,
+    ) {
         let temp = tempfile::tempdir().unwrap();
         let state = crate::AppState::new(temp.path().to_path_buf())
             .await
@@ -656,6 +974,7 @@ mod tests {
                     timeline_id,
                     result: None,
                     locked_until: String::new(),
+                    owner_runner_id: None,
                     started_at: None,
                     last_renewed_at: None,
                     timeout_triggered: false,
@@ -663,6 +982,17 @@ mod tests {
                 },
             );
         }
+        (temp, shared, run_id, job_id, plan_id, timeline_id)
+    }
+
+    /// A timeline PATCH for an in-flight job must keep the truthful
+    /// "in_progress" conclusion. The raw Debug spelling ("inprogress") and
+    /// the run-level status_string projection ("success") both lie about a
+    /// job that is still running.
+    #[tokio::test]
+    async fn timeline_patch_keeps_in_progress_conclusion_for_in_flight_job() {
+        let (_temp, shared, run_id, _job_id, plan_id, timeline_id) = seed_inflight_run().await;
+        let state = shared.state.clone();
 
         let _ = patch_timeline_records(
             State(shared),
@@ -690,5 +1020,186 @@ mod tests {
             detail.conclusion, "in_progress",
             "an in-flight job must not read as 'success' or 'inprogress'"
         );
+    }
+
+    /// A job-level Node.js 20 deprecation warning arrives from the runner as a
+    /// `Warning` issue on the job timeline record. The server must preserve it
+    /// on read-back and project it as a job-level annotation (no `step_id`).
+    /// Preloop never synthesizes this warning itself — it only surfaces what
+    /// the runner sends.
+    #[tokio::test]
+    async fn timeline_patch_preserves_node20_deprecation_warning() {
+        let (_temp, shared, run_id, _job_id, plan_id, timeline_id) = seed_inflight_run().await;
+        let state = shared.state.clone();
+
+        let node20_message = "Node.js 20 actions are deprecated. The following actions are \
+             running on Node.js 20 and may not work as expected: actions/checkout@v3, \
+             actions/setup-node@v3."
+            .to_owned();
+
+        let job_record_id = uuid::Uuid::new_v4();
+        let child_task_id = uuid::Uuid::new_v4();
+
+        // Construct raw JSON wire payload with upstream "Task" and "Job" types to exercise serde wire decoding.
+        let raw_json_payload = serde_json::json!({
+                "count": 2,
+                "value": [
+                    {
+                        "id": job_record_id.to_string(),
+                        "parentId": null,
+                        "name": "build",
+                        "displayName": "build",
+                        "type": "Job",
+                        "state": "inProgress",
+                        "issues": [
+                            {
+                                "type": "warning",
+                                "message": node20_message
+        }
+                        ],
+                        "warningCount": 1
+                    },
+                    {
+                        "id": child_task_id.to_string(),
+                        "parentId": job_record_id.to_string(),
+                        "name": "Complete job",
+                        "displayName": "Complete job",
+                        "type": "Task",
+                        "state": "completed",
+                        "result": "succeededWithIssues",
+                        "issues": [
+                            {
+                                "type": "warning",
+                                "message": node20_message
+        }
+                        ]
+        }
+                ]
+            });
+
+        // Verify wire decoding from raw JSON
+        let wrapper: azdo::VssJsonCollectionWrapper<azdo::TimelineRecord> =
+            serde_json::from_value(raw_json_payload.clone()).expect("valid wire JSON payload");
+        assert_eq!(wrapper.value.len(), 2);
+        assert_eq!(
+            wrapper.value[0].record_type,
+            Some(azdo::TimelineRecordType::Job)
+        );
+        assert_eq!(
+            wrapper.value[1].record_type,
+            Some(azdo::TimelineRecordType::Task)
+        );
+
+        // PATCH timeline records (first call)
+        let _ = patch_timeline_records(
+            State(shared.clone()),
+            Path((
+                "scope".to_owned(),
+                "hub".to_owned(),
+                plan_id.clone(),
+                timeline_id.to_string(),
+            )),
+            Json(wrapper),
+        )
+        .await;
+
+        // Preserved on read-back.
+        let response = get_timeline_records(
+            State(shared.clone()),
+            Path((
+                "scope".to_owned(),
+                "hub".to_owned(),
+                plan_id.clone(),
+                timeline_id.to_string(),
+            )),
+            axum::extract::Query(TimelineQuery {
+                top: None,
+                skip: None,
+            }),
+        )
+        .await;
+        let records = response
+            .0
+            .get("records")
+            .and_then(|v| v.as_array())
+            .expect("records array");
+        let stored_job = records
+            .iter()
+            .find(|r| r["id"] == job_record_id.to_string())
+            .expect("job record persisted");
+        let job_issues = stored_job["issues"].as_array().expect("issues preserved");
+        assert_eq!(
+            job_issues.len(),
+            1,
+            "the Node 20 warning issue must survive on job record"
+        );
+        assert_eq!(job_issues[0]["type"], "warning");
+        assert_eq!(job_issues[0]["message"], node20_message);
+
+        let stored_task = records
+            .iter()
+            .find(|r| r["id"] == child_task_id.to_string())
+            .expect("child task record persisted");
+        let task_issues = stored_task["issues"].as_array().expect("issues preserved");
+        assert_eq!(
+            task_issues.len(),
+            1,
+            "the Node 20 warning issue must survive on task record"
+        );
+
+        // Replaying/retrying the exact same PATCH call (Finding 3: deduplication check)
+        let wrapper_retry: azdo::VssJsonCollectionWrapper<azdo::TimelineRecord> =
+            serde_json::from_value(raw_json_payload).expect("valid wire JSON payload");
+        let _ = patch_timeline_records(
+            State(shared.clone()),
+            Path((
+                "scope".to_owned(),
+                "hub".to_owned(),
+                plan_id,
+                timeline_id.to_string(),
+            )),
+            Json(wrapper_retry),
+        )
+        .await;
+
+        let inner = state.inner.lock().await;
+        let events = inner
+            .timeline_events
+            .get(&run_id)
+            .expect("timeline events recorded for the run");
+
+        // Count projected annotations for the Node 20 message
+        let matching_annotations: Vec<_> = events
+            .iter()
+            .filter_map(|event| match event {
+                NdjsonEvent::Annotation {
+                    level,
+                    message,
+                    step_id,
+                    ..
+                } if message == &node20_message => Some((*level, step_id.clone())),
+                _ => None,
+            })
+            .collect();
+
+        // Deduplication check: even after retrying PATCH, there should be exactly one annotation
+        // for the job record (step_id == None) and one for the child task record (step_id == Some(child_task_id)).
+        assert_eq!(
+            matching_annotations.len(),
+            2,
+            "annotations must be deduplicated across repeated PATCH calls"
+        );
+
+        let job_ann = matching_annotations
+            .iter()
+            .find(|(_, step_id)| step_id.is_none())
+            .expect("parentless job record produces step_id == None annotation");
+        assert!(matches!(job_ann.0, AnnotationLevel::Warning));
+
+        let task_ann = matching_annotations
+            .iter()
+            .find(|(_, step_id)| step_id.as_deref() == Some(&child_task_id.to_string()))
+            .expect("child task record produces step_id == Some(task_id) annotation");
+        assert!(matches!(task_ann.0, AnnotationLevel::Warning));
     }
 }

@@ -34,8 +34,57 @@ pub(crate) struct DapPortRegistration {
     pub(crate) job_id: JobId,
 }
 
+/// How a step came to exist, which decides whether `--step N` counts it.
+///
+/// `Workflow` records are built from the job request message before the runner
+/// starts, so their order is the workflow's declared order. `Synthetic` records
+/// are runner bookkeeping discovered at execution time ("Set up job", `Pre`/
+/// `Post` action hooks, container lifecycle, "Complete job"): they own real
+/// logs, but must never shift the numbering a user reads off their YAML.
+///
+/// Verified against the official runner
+/// (`.runner-watch/golden/v2.336.0/06-multi-step`): the three declared steps
+/// echo the message ids back unchanged as `external_id`, while "Set up job"
+/// and "Complete job" carry runner-minted ids absent from the message.
+/// Membership in the manifest is therefore the classifier — never the id's
+/// shape, and never the display name.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub(crate) enum StepKind {
+    /// Declared in the workflow and present in the job request message.
+    Workflow,
+    /// Reported by the runner with no manifest entry. This is the default so a
+    /// run record written before manifests existed answers `--step` with an
+    /// explicit "no workflow manifest" error instead of a guessed blob.
+    #[default]
+    Synthetic,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub(crate) struct StepRecord {
+    /// Stable protocol identity: `TaskStep.id` in the job request message,
+    /// echoed as `external_id` in `WorkflowStepsUpdate`, and the name of the
+    /// durable `step-<id>.txt` blob. Empty only for a record restored from a
+    /// pre-manifest run, which resolution refuses rather than guesses.
+    #[serde(default)]
+    pub(crate) id: String,
+    #[serde(default)]
+    pub(crate) kind: StepKind,
+    /// 0-based position among the job's declared workflow steps. `Some`
+    /// exactly when `kind` is `Workflow`; this is what `--step N` indexes.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(crate) workflow_index: Option<usize>,
+    /// The runner's own 1-based timeline position, which counts synthetic
+    /// steps too — the golden capture reports declared step 1 as `number: 2`
+    /// because "Set up job" takes 1. Presentation and protocol fidelity only;
+    /// never an input to `--step`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(crate) runner_number: Option<u32>,
+    /// Expression-context key (`compile`, `__run_2`). Unlike `id`, this is
+    /// derived from the YAML and so is stable across runs of the same
+    /// workflow, which is what lets one step be correlated over time.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(crate) context_name: Option<String>,
     pub(crate) name: String,
     pub(crate) conclusion: String,
     /// Server-side observation of when the step first appeared (started) and
@@ -46,6 +95,123 @@ pub(crate) struct StepRecord {
     pub(crate) started_at: Option<chrono::DateTime<chrono::Utc>>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub(crate) finished_at: Option<chrono::DateTime<chrono::Utc>>,
+}
+
+impl StepRecord {
+    /// A manifest entry for a declared workflow step, built from the job
+    /// request message before the runner has reported anything.
+    pub(crate) fn workflow(
+        id: String,
+        workflow_index: usize,
+        name: String,
+        context_name: Option<String>,
+    ) -> Self {
+        Self {
+            id,
+            kind: StepKind::Workflow,
+            workflow_index: Some(workflow_index),
+            runner_number: None,
+            context_name,
+            name,
+            conclusion: "pending".to_owned(),
+            started_at: None,
+            finished_at: None,
+        }
+    }
+
+    /// Build one job attempt's manifest from its request message's steps.
+    ///
+    /// The message's `steps` vector *is* the declared workflow order, so the
+    /// index is the order and `TaskStep.id` is the identity. Nothing here
+    /// inspects the filesystem or sorts ids: a v4 UUID sorts randomly, and an
+    /// upload timestamp records when a blob landed, not when a step ran.
+    pub(crate) fn manifest(steps: &[azdo::TaskStep]) -> Vec<Self> {
+        steps
+            .iter()
+            .enumerate()
+            .map(|(index, step)| {
+                Self::workflow(
+                    step.id.to_string(),
+                    index,
+                    step.display_name
+                        .clone()
+                        .or_else(|| step.name.clone())
+                        .unwrap_or_default(),
+                    step.context_name.clone(),
+                )
+            })
+            .collect()
+    }
+
+    /// Sort key placing a step in execution order.
+    ///
+    /// Three tiers, because the two reporting paths carry different evidence:
+    ///
+    /// 1. `runner_number` — the runner's own 1-based timeline position, which
+    ///    counts every step it ran. The broker path reports it, and it is the
+    ///    truth once present.
+    /// 2. `started_at` — when the server first saw the step run. The AzDO
+    ///    timeline path carries no ordinal (`TimelineRecord` has no `order`
+    ///    field), so a synthetic step there has no number; without this tier
+    ///    `Set up job` sorted after every declared step on that path, which is
+    ///    the defect this ordering exists to prevent.
+    /// 3. `workflow_index` — a declared step that has not run yet, ordered as
+    ///    the workflow declares and placed after everything that has run.
+    ///
+    /// A step id is a v4 UUID and sorts randomly, so it is only ever the final
+    /// tie-break for determinism.
+    fn execution_key(&self) -> (u8, i64, usize, &str) {
+        match (self.runner_number, self.started_at) {
+            (Some(number), _) => (0, i64::from(number), 0, self.id.as_str()),
+            (None, Some(started_at)) => (
+                1,
+                started_at.timestamp_micros(),
+                self.workflow_index.unwrap_or(usize::MAX),
+                self.id.as_str(),
+            ),
+            (None, None) => (
+                2,
+                0,
+                self.workflow_index.unwrap_or(usize::MAX),
+                self.id.as_str(),
+            ),
+        }
+    }
+
+    /// Order records as the job executed them.
+    ///
+    /// The in-memory manifest is seeded with declared steps and then appends
+    /// synthetic ones as the runner reports them, so its raw order puts
+    /// `Set up job` after the workflow steps despite it running first. A
+    /// restore adds a third order again. Every surface that shows a whole
+    /// step list goes through this instead.
+    pub(crate) fn sort_execution_order(steps: &mut [Self]) {
+        steps.sort_by(|left, right| left.execution_key().cmp(&right.execution_key()));
+    }
+
+    /// Locate a step by stable identity, and by nothing else.
+    ///
+    /// Display names repeat legitimately — two steps may both be named `Test`
+    /// — so matching on them merged distinct steps and lost one from the run.
+    pub(crate) fn find_by_id(steps: &[Self], id: &str) -> Option<usize> {
+        if id.is_empty() {
+            return None;
+        }
+        steps.iter().position(|step| step.id == id)
+    }
+
+    /// The declared workflow steps, in declared order.
+    ///
+    /// Synthetic steps are excluded, so `Set up job` and `Post <action>` never
+    /// shift what `--step N` selects.
+    pub(crate) fn workflow_steps(steps: &[Self]) -> Vec<&Self> {
+        let mut workflow: Vec<&Self> = steps
+            .iter()
+            .filter(|step| step.kind == StepKind::Workflow)
+            .collect();
+        workflow.sort_by_key(|step| step.workflow_index.unwrap_or(usize::MAX));
+        workflow
+    }
 }
 
 /// Server-side timing for the workspace snapshot created at submission.
@@ -61,6 +227,15 @@ pub(crate) struct SnapshotTiming {
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub(crate) struct JobDetail {
+    /// Stable workflow job key (`build`, `build (ubuntu-latest)`).
+    ///
+    /// Separate from `name` because the run projection overwrites `name` with
+    /// the evaluated GitHub display name, so `name` cannot identify the job it
+    /// belongs to. Empty only for a detail restored from a run written before
+    /// this field existed.
+    #[serde(default)]
+    pub(crate) job_id: String,
+    /// GitHub display name, as shown in a run's job list.
     pub(crate) name: String,
     pub(crate) conclusion: String,
     pub(crate) steps: Vec<StepRecord>,
@@ -68,6 +243,24 @@ pub(crate) struct JobDetail {
     /// infrastructure failures). Kept as raw wire values.
     #[serde(default)]
     pub(crate) annotations: Vec<serde_json::Value>,
+}
+
+impl JobDetail {
+    /// Locate a job's detail by its stable key.
+    ///
+    /// Falls back to the display name only for details restored without a
+    /// `job_id`; new details always carry one.
+    pub(crate) fn find<'a>(details: &'a mut [Self], job_id: &str) -> Option<&'a mut Self> {
+        let index = details
+            .iter()
+            .position(|detail| detail.job_id == job_id)
+            .or_else(|| {
+                details
+                    .iter()
+                    .position(|detail| detail.job_id.is_empty() && detail.name == job_id)
+            })?;
+        details.get_mut(index)
+    }
 }
 
 /// Metadata tracked per log file for results-service Twirp retrieval.
@@ -151,6 +344,9 @@ pub(crate) struct TaskAgentJobRequestRecord {
     pub(crate) timeline_id: uuid::Uuid,
     pub(crate) result: Option<ExecutionStatus>,
     pub(crate) locked_until: String,
+    /// Runner identity that claimed this request. Kept after completion so
+    /// late AgentRequest reads and retries remain bound to the original owner.
+    pub(crate) owner_runner_id: Option<i64>,
     pub(crate) started_at: Option<std::time::SystemTime>,
     pub(crate) last_renewed_at: Option<std::time::SystemTime>,
     pub(crate) timeout_triggered: bool,
@@ -188,6 +384,12 @@ pub(crate) struct QueuedJob {
     pub(crate) run_id: RunId,
     pub(crate) job_id: JobId,
     pub(crate) base_id: String,
+    /// Unix nanoseconds when the job entered the ready queue, used to
+    /// measure true queue latency at claim time. `0` means unknown (a
+    /// snapshot persisted before this field existed); such jobs are not
+    /// recorded, so a restart never fabricates a latency.
+    #[serde(default)]
+    pub(crate) enqueued_at_unix_nanos: i64,
     pub(crate) needs: Vec<JobId>,
     pub(crate) if_condition: Option<String>,
     pub(crate) condition_context: preloop_gha_expressions::Context,
@@ -197,6 +399,9 @@ pub(crate) struct QueuedJob {
     /// Explicit runner group from object-valued `runs-on`.
     pub(crate) runner_group: Option<String>,
     pub(crate) message: azdo::AgentJobRequestMessage,
+    /// Original `environment:` value, retained until `needs` is hydrated.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(crate) environment: Option<serde_json::Value>,
     /// Raw job-level concurrency (evaluated when the job becomes ready).
     pub(crate) concurrency: Option<preloop_gha_parser::Concurrency>,
     /// Matrix values for this expansion (for concurrency expression eval).
@@ -273,6 +478,10 @@ pub(crate) enum WebhookDeliveryState {
 pub(crate) struct PendingCache {
     pub(crate) key: String,
     pub(crate) version: String,
+    #[serde(default)]
+    pub(crate) namespace: String,
+    #[serde(default)]
+    pub(crate) job_backend_id: String,
     pub(crate) bytes: Vec<u8>,
 }
 
@@ -291,6 +500,16 @@ pub(crate) struct ArtifactRecord {
 pub(crate) struct CacheV2Pending {
     pub(crate) key: String,
     pub(crate) version: String,
+    /// Job backend id that reserved the upload, derived from the runtime
+    /// token scope. `#[serde(default)]` keeps old persisted metas restoring
+    /// (an empty value means the entry predates per-job accounting and is
+    /// never billed to any job).
+    #[serde(default)]
+    pub(crate) job_backend_id: String,
+    /// Unix seconds the reservation was made; `0` for restored entries so
+    /// the TTL sweeper leaves them alone.
+    #[serde(default)]
+    pub(crate) created_unix: i64,
 }
 
 /// Pending artifact v2 upload (Twirp ArtifactService).
@@ -298,6 +517,14 @@ pub(crate) struct CacheV2Pending {
 pub(crate) struct ArtifactV2Pending {
     /// Registry key = "{run_backend_id}/{job_backend_id}/{name}".
     pub(crate) registry_key: String,
+    /// Job backend id that reserved the upload, derived from the runtime
+    /// token scope. `#[serde(default)]` keeps old persisted metas restoring.
+    #[serde(default)]
+    pub(crate) job_backend_id: String,
+    /// Unix seconds the reservation was made; `0` for restored entries so
+    /// the TTL sweeper leaves them alone.
+    #[serde(default)]
+    pub(crate) created_unix: i64,
 }
 
 /// Finalized artifact v2 entry.
@@ -312,4 +539,13 @@ pub(crate) struct ArtifactV2Entry {
     pub(crate) digest: Option<String>,
     /// Upload token used to find the assembled blob on disk.
     pub(crate) blob_token: String,
+}
+
+/// Unix nanoseconds now, for queue-latency bookkeeping. `i64` keeps the
+/// field serde-friendly (it travels in persisted job snapshots).
+pub(crate) fn now_unix_nanos() -> i64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_nanos() as i64)
+        .unwrap_or(0)
 }

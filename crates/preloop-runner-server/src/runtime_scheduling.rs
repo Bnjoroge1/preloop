@@ -79,12 +79,13 @@ pub(crate) fn try_enqueue_with_job_concurrency(
     inner: &mut InnerState,
     github: &serde_json::Value,
     submission: &WorkflowSubmission,
-    queued_job: QueuedJob,
+    mut queued_job: QueuedJob,
     statuses: &mut BTreeMap<JobId, ExecutionStatus>,
 ) -> Result<bool, ()> {
     match try_acquire_job_gate(inner, github, submission, &queued_job) {
         JobGateOutcome::Proceed => {
             statuses.insert(queued_job.job_id.clone(), ExecutionStatus::Queued);
+            stamp_ready_enqueue(&mut queued_job);
             on_job_enqueued(inner, &queued_job);
             inner.queue.push_back(queued_job);
             Ok(true)
@@ -129,8 +130,15 @@ pub(crate) fn cancel_run_inner(
     run_id: RunId,
     reason: Option<&str>,
 ) -> usize {
+    // An expandable node (deferred reusable caller or needs-driven matrix)
+    // never dispatches, but its submit-time request correlation is minted
+    // like a real job's. Cancellation must settle it the way the completion
+    // path would: a leaked record stays `result: None` forever and keeps the
+    // request inflight and renewable for the life of the process, resolvable
+    // to a job expansion has already deleted from the run.
+    // Collect the set before the queue retains below drop the nodes.
+    let expandable = expandable_job_ids(inner, run_id);
     let mut in_progress: Vec<JobId> = Vec::new();
-    let mut deferred_nodes: Vec<JobId> = Vec::new();
     {
         let Some(record) = inner.runs.get_mut(&run_id) else {
             return 0;
@@ -145,13 +153,6 @@ pub(crate) fn cancel_run_inner(
                 ExecutionStatus::Queued | ExecutionStatus::Pending | ExecutionStatus::InProgress
             ) {
                 *status = ExecutionStatus::Cancelled;
-                if record
-                    .caller_plans
-                    .get(job_id)
-                    .is_some_and(|plan| plan.deferred_matrix.is_some())
-                {
-                    deferred_nodes.push(job_id.clone());
-                }
             }
         }
     }
@@ -181,16 +182,16 @@ pub(crate) fn cancel_run_inner(
     // of folding cancelled jobs back into the run.
     inner.pending_expansions.retain(|job| job.run_id != run_id);
     inner.expanding.retain(|(id, _)| *id != run_id);
-    // Deferred matrix placeholders have a submit-time request record, but are
-    // never delivered to a runner. No RenewJob/CompleteJob callback can retire
-    // that record after cancellation, so settle it explicitly.
-    for job_id in deferred_nodes {
-        retire_node_requests(
-            inner,
-            run_id,
-            &job_id,
-            RequestRetirement::Settle(ExecutionStatus::Cancelled),
-        );
+    for node_id in expandable {
+        // Settle with the node's own concluded status, never a hardcoded
+        // Cancelled: the status loop above already flipped every non-terminal
+        // node in this run to Cancelled, but an already-terminal expandable
+        // node keeps its verdict. A nested reusable caller that finished
+        // Success while the run stayed active still sits in `caller_plans`
+        // with an unsettled record (`propagate_reusable_outputs` never
+        // retires it); stamping Cancelled would contradict `run.jobs`.
+        let status = node_settle_status(inner, run_id, &node_id);
+        retire_node_requests(inner, run_id, &node_id, RequestRetirement::Settle(status));
     }
 
     // Release any concurrency holders belonging to this run and promote next.
@@ -318,6 +319,10 @@ pub(crate) fn run_stuck_on_external_hosts(inner: &InnerState, run_id: &RunId) ->
 
 /// Cancel a single job (job-level concurrency / fail-fast style).
 pub(crate) fn cancel_job_inner(inner: &mut InnerState, run_id: RunId, job_id: &JobId) -> usize {
+    // MC-3: an expandable node cancelled before it dispatches never reaches
+    // the completion path that settles its request correlation. Settle it
+    // below exactly as completion would, with its own concluded status.
+    let expandable = is_expandable_node(inner, run_id, job_id);
     let was_in_progress = {
         let Some(record) = inner.runs.get_mut(&run_id) else {
             return 0;
@@ -371,19 +376,6 @@ pub(crate) fn cancel_job_inner(inner: &mut InnerState, run_id: RunId, job_id: &J
         .pending_expansions
         .retain(|j| !(j.run_id == run_id && j.job_id == *job_id));
     inner.expanding.remove(&(run_id, job_id.clone()));
-    let deferred_matrix = inner
-        .runs
-        .get(&run_id)
-        .and_then(|run| run.caller_plans.get(job_id))
-        .is_some_and(|plan| plan.deferred_matrix.is_some());
-    if deferred_matrix {
-        retire_node_requests(
-            inner,
-            run_id,
-            job_id,
-            RequestRetirement::Settle(ExecutionStatus::Cancelled),
-        );
-    }
 
     // Cancelling a reusable caller cancels its materialized subtree with it.
     let inner_ids = inner
@@ -396,6 +388,14 @@ pub(crate) fn cancel_job_inner(inner: &mut InnerState, run_id: RunId, job_id: &J
         count += cancel_job_inner(inner, run_id, &JobId(inner_id));
     }
 
+    if expandable {
+        // Settle with the node's own status, not a hardcoded Cancelled: the
+        // was_in_progress block above flipped a live node to Cancelled, but an
+        // already-terminal expandable node (e.g. a completed reusable caller
+        // still in `caller_plans` with an unsettled record) keeps its verdict.
+        let status = node_settle_status(inner, run_id, job_id);
+        retire_node_requests(inner, run_id, job_id, RequestRetirement::Settle(status));
+    }
     release_concurrency_for_job(inner, run_id, job_id);
     count
 }
@@ -667,6 +667,7 @@ pub(crate) fn promote_next_from_group(
                                 if let Some(run) = inner.runs.get_mut(&run_id) {
                                     hydrate_needs_context(&mut job, run);
                                 }
+                                stamp_ready_enqueue(&mut job);
                                 on_job_enqueued(inner, &job);
                                 inner.queue.push_back(job);
                             }
@@ -729,6 +730,7 @@ pub(crate) fn promote_next_from_group(
                 run.jobs.insert(job.job_id.clone(), ExecutionStatus::Queued);
                 hydrate_needs_context(&mut job, run);
             }
+            stamp_ready_enqueue(&mut job);
             on_job_enqueued(inner, &job);
             inner.queue.push_back(job);
         }
@@ -779,6 +781,7 @@ pub(crate) fn promote_next_from_group(
                         run.jobs.insert(job.job_id.clone(), ExecutionStatus::Queued);
                         hydrate_needs_context(&mut job, run);
                     }
+                    stamp_ready_enqueue(&mut job);
                     on_job_enqueued(inner, &job);
                     inner.queue.push_back(job);
                 } else {
@@ -1125,15 +1128,29 @@ pub(crate) fn promote_ready_jobs(inner: &mut InnerState) -> SchedulingOutcome {
                     }
                 }
                 DependencyDecision::Skip | DependencyDecision::Error => {
+                    let status = if decision == DependencyDecision::Skip {
+                        ExecutionStatus::Skipped
+                    } else {
+                        ExecutionStatus::Failure
+                    };
                     if let Some(run) = inner.runs.get_mut(&job.run_id) {
-                        let status = if decision == DependencyDecision::Skip {
-                            ExecutionStatus::Skipped
-                        } else {
-                            ExecutionStatus::Failure
-                        };
                         run.jobs.insert(job.job_id.clone(), status);
                         run.status = summarize_run(run.jobs.values().copied());
                         finalize_run_if_complete(run);
+                    }
+                    // MC-3: a deferred-matrix node concluded here (its needs
+                    // failed or skipped, or its `if:` errored) never
+                    // dispatches, so no completion path ever settles the
+                    // submit-time request correlation minted for it. Settle
+                    // it like any other terminal conclusion; the node stays
+                    // in the run, so Settle mirrors the completion path.
+                    if job.deferred_matrix.is_some() || job.reusable_call.is_some() {
+                        retire_node_requests(
+                            inner,
+                            job.run_id,
+                            &job.job_id,
+                            RequestRetirement::Settle(status),
+                        );
                     }
                     // MC-S2: a run that concludes through this arm (dependency
                     // skip / eval error) never passes through the normal
@@ -1156,6 +1173,9 @@ pub(crate) fn promote_ready_jobs(inner: &mut InnerState) -> SchedulingOutcome {
         }
 
         outcome.promoted += promoted.len();
+        for job in &mut promoted {
+            stamp_ready_enqueue(job);
+        }
         inner.pending_jobs = remaining;
         inner.queue.extend(promoted);
         if !settled {
@@ -1603,6 +1623,18 @@ pub(crate) fn on_job_enqueued(inner: &mut InnerState, job: &QueuedJob) {
     }
 }
 
+/// Stamp the instant a job actually enters the ready queue.
+///
+/// `enqueued_at_unix_nanos` is deliberately not stamped at job construction:
+/// a job held for needs, workflow/job concurrency, or max-parallel would
+/// otherwise report dependency time as queue wait. Only the promotion sites —
+/// where the job is pushed into `inner.queue` — stamp it. Requeues (a claimed
+/// job bouncing off a purged runner) preserve the original stamp so total
+/// queue time is still measured.
+fn stamp_ready_enqueue(job: &mut QueuedJob) {
+    job.enqueued_at_unix_nanos = crate::models::now_unix_nanos();
+}
+
 /// Pair a just-registered pool runner with the earliest pending job it can
 /// serve. Called from the registration path; the returned runner then claims
 /// the job by polling.
@@ -1720,6 +1752,37 @@ pub(crate) fn clear_assignment(inner: &mut InnerState, run_id: RunId, job_id: &J
         .any(|job| job.run_id == run_id && job.job_id == *job_id)
 }
 
+/// Live runner -> job pairings for status reporting, sorted by runner id.
+///
+/// Iterate only active session requests, not the historical request table.
+/// The latter retains completed records for late protocol reads and grows for
+/// the process lifetime.
+pub(crate) fn live_runner_assignments(
+    requests: &std::collections::BTreeMap<i64, crate::models::TaskAgentJobRequestRecord>,
+    active_requests: &std::collections::BTreeMap<String, i64>,
+    now: std::time::SystemTime,
+) -> Vec<preloop_observability::status::RunnerAssignment> {
+    let mut out: Vec<preloop_observability::status::RunnerAssignment> = active_requests
+        .values()
+        .filter_map(|request_id| requests.get(request_id))
+        .filter(|record| record.result.is_none())
+        .filter_map(|record| record.owner_runner_id.map(|runner_id| (runner_id, record)))
+        .map(
+            |(runner_id, record)| preloop_observability::status::RunnerAssignment {
+                runner_id,
+                run_id: record.run_id.to_string(),
+                job_id: record.job_id.0.clone(),
+                assigned_seconds_ago: record
+                    .started_at
+                    .and_then(|at| now.duration_since(at).ok())
+                    .map(|d| d.as_secs_f64())
+                    .unwrap_or(0.0),
+            },
+        )
+        .collect();
+    out.sort_by_key(|a| a.runner_id);
+    out
+}
 pub(crate) fn capabilities_of(runner: &RegisteredRunner) -> RunnerCapabilities {
     RunnerCapabilities {
         known: true,
@@ -1832,6 +1895,47 @@ pub(crate) fn hydrate_needs_context(job: &mut QueuedJob, run: &RunRecord) {
     job.message
         .context_data
         .insert("needs".to_owned(), azdo::PipelineContextData::Dict(needs));
+
+    // The environment name is the one field the runner never evaluates: it
+    // ships as a plain string, so a name reading `needs.*` was deliberately
+    // left as a template by the job builder and is finished here, now that the
+    // context is complete. Everything else needing `needs` travels as a
+    // template token and is evaluated in-VM against the map installed above.
+    let Some(environment) = job.environment.as_ref() else {
+        return;
+    };
+    let Some(name) = (match environment {
+        serde_json::Value::String(name) => Some(name.as_str()),
+        serde_json::Value::Object(map) => map.get("name").and_then(serde_json::Value::as_str),
+        _ => None,
+    }) else {
+        return;
+    };
+    if !preloop_gha_parser::eval::resolves_after_job_build(name) {
+        // Already resolved at build time against a complete context.
+        return;
+    }
+    let Some(actions_environment) = job.message.actions_environment.as_mut() else {
+        return;
+    };
+    let mut context = preloop_gha_expressions::Context::new();
+    for (key, value) in &job.message.context_data {
+        context.insert(key, value.to_json());
+    }
+    match preloop_gha_parser::eval::resolve_string(name, &context) {
+        Ok(resolved) => actions_environment.name = resolved,
+        Err(error) => {
+            // Nothing downstream re-resolves this, so a raw template would
+            // become the deployment's name in the environment record.
+            tracing::error!(
+                run_id = %job.run_id.0,
+                job = %job.job_id.0,
+                environment = %name,
+                %error,
+                "deployment environment expression failed to evaluate after needs completed"
+            );
+        }
+    }
 }
 pub(crate) fn needs_json_context(run: &RunRecord, needs: &[JobId]) -> serde_json::Value {
     let values = needs
@@ -2376,6 +2480,13 @@ fn register_expanded_jobs(
         inner
             .timeline_requests
             .insert(job_request.timeline_id, job_request.request_id);
+        // A reusable callee or dynamic matrix leg only exists once its gate
+        // passes, so its manifest is seeded here rather than at submission.
+        // Every concrete attempt gets one before dispatch either way.
+        inner.job_steps.insert(
+            job_request.agent_job_id,
+            crate::models::StepRecord::manifest(&artifacts.agent_msg.steps),
+        );
         // Per-inner-job, so a wide matrix logs this once per leg: a 12k-leg
         // callee emitted 12k warnings for the ordinary no-GitHub-App setup and
         // buried every real diagnostic. Absence of a token request is the
@@ -2426,12 +2537,17 @@ fn register_expanded_jobs(
             run_id,
             job_id: plan.id.clone(),
             base_id: plan.base_id.clone(),
+            // Stamped by the promotion sites when the job enters the ready
+            // queue, never here: a job delayed by needs, concurrency, or
+            // max-parallel must not count dependency time as queue wait.
+            enqueued_at_unix_nanos: 0,
             needs: plan.needs.clone(),
             if_condition: plan.if_condition.clone(),
             condition_context,
             max_parallel: plan.max_parallel,
             runs_on: plan.runs_on.clone(),
             runner_group: plan.runner_group.clone(),
+            environment: plan.environment.clone(),
             message: artifacts.agent_msg,
             concurrency: concurrency::concurrency_from_plan_fields(
                 plan.concurrency_group.as_deref(),
@@ -2482,14 +2598,135 @@ fn fail_expansion_node(
 
 /// How to retire the request correlation an expandable node minted at submit.
 #[derive(Clone, Copy)]
-enum RequestRetirement {
+pub(crate) enum RequestRetirement {
     /// The node stays in the run as a terminal job: record the result and drop
-    /// the live claim state, exactly as the completion path does for a job a
-    /// runner actually finished.
+    /// the live claim state (inflight + session claims), exactly as the
+    /// completion path does for a job a runner actually finished.
+    ///
+    /// `id_token_grants` and `oidc_job_contexts` are deliberately kept: no
+    /// path outside the Purge arm ever removes them, for any job — completed
+    /// and cancelled real jobs keep theirs for the life of the process and
+    /// the store, so a settled placeholder keeps the same shape.
     Settle(ExecutionStatus),
     /// The node no longer exists in the run, so nothing can reference it
     /// again: every correlation entry goes.
     Purge,
+}
+
+/// The status to settle an expandable node's leaked request record with during
+/// cancellation: the node's own concluded verdict from `run.jobs`, falling
+/// back to `Cancelled` for a node the run no longer records.
+///
+/// The cancel paths flip live nodes to `Cancelled` before settling, so a
+/// placeholder that never ran settles `Cancelled`. An already-terminal
+/// expandable node — most notably a nested reusable caller that finished
+/// `Success` while the run stayed active and still carries an unsettled record
+/// (`propagate_reusable_outputs` retires none) — keeps its real verdict rather
+/// than being clobbered to `Cancelled`.
+fn node_settle_status(inner: &InnerState, run_id: RunId, node_id: &JobId) -> ExecutionStatus {
+    inner
+        .runs
+        .get(&run_id)
+        .and_then(|run| run.jobs.get(node_id).copied())
+        .unwrap_or(ExecutionStatus::Cancelled)
+}
+
+/// Whether a single job is an expandable node: a deferred reusable caller or
+/// a needs-driven dynamic-matrix node.
+///
+/// Membership test for the per-job paths ([`cancel_job_inner`]), which need
+/// one answer rather than the run-wide set [`expandable_job_ids`] builds.
+fn is_expandable_node(inner: &InnerState, run_id: RunId, job_id: &JobId) -> bool {
+    inner
+        .pending_jobs
+        .iter()
+        .chain(inner.pending_expansions.iter())
+        .chain(inner.queue.iter())
+        .chain(inner.concurrency_blocked.iter())
+        .chain(inner.held_runs.get(&run_id).into_iter().flatten())
+        .any(|job| {
+            job.run_id == run_id
+                && job.job_id == *job_id
+                && (job.deferred_matrix.is_some() || job.reusable_call.is_some())
+        })
+        || inner.expanding.contains(&(run_id, job_id.clone()))
+        || inner
+            .runs
+            .get(&run_id)
+            .is_some_and(|run| run.caller_plans.contains_key(job_id))
+}
+
+/// The ids of every expandable node in a run: deferred reusable callers and
+/// needs-driven dynamic-matrix nodes.
+///
+/// These nodes never dispatch — submit mints their request correlation
+/// records anyway (a deferred-matrix node is non-caller), so the cancellation
+/// paths use this set to settle those records. Reusable callers mint nothing,
+/// so retiring them is a no-op; settling a matrix node leaves exactly the
+/// state a reusable caller has from submit.
+fn expandable_job_ids(inner: &InnerState, run_id: RunId) -> BTreeSet<JobId> {
+    let mut ids = BTreeSet::new();
+    for job in inner
+        .pending_jobs
+        .iter()
+        .chain(inner.pending_expansions.iter())
+        .chain(inner.queue.iter())
+        .chain(inner.concurrency_blocked.iter())
+        .chain(inner.held_runs.get(&run_id).into_iter().flatten())
+    {
+        if job.run_id == run_id && (job.deferred_matrix.is_some() || job.reusable_call.is_some()) {
+            ids.insert(job.job_id.clone());
+        }
+    }
+    for (id, job_id) in &inner.expanding {
+        if *id == run_id {
+            ids.insert(job_id.clone());
+        }
+    }
+    if let Some(run) = inner.runs.get(&run_id) {
+        // `register_expanded_jobs` keeps a deferred node's plan in
+        // `caller_plans` when the node lives inside a reusable callee; nested
+        // nodes are found here even after they left every queue.
+        ids.extend(run.caller_plans.keys().cloned());
+    }
+    ids
+}
+
+/// Settle one request whose logical job is terminal.
+///
+/// Completed request records remain addressable for late runner reads, but
+/// lose every live-session and renewable-credential association.
+pub(crate) fn settle_request(inner: &mut InnerState, request_id: i64, status: ExecutionStatus) {
+    inner
+        .session_active_requests
+        .retain(|_, &mut rid| rid != request_id);
+    inner.inflight_requests.remove(&request_id);
+    inner.github_token_requests.remove(&request_id);
+    if let Some(record) = inner.job_requests.get_mut(&request_id) {
+        if record.result.is_none() {
+            record.result = Some(status);
+        }
+    }
+}
+/// Release an interrupted claim so the same request can be delivered again.
+///
+/// The queued job retains this request id and agent-job correlation. Keep its
+/// inflight and token records, but remove the dead owner before requeueing:
+/// the old runner is then rejected until a replacement session claims it, and
+/// that replacement can renew and complete the original request normally.
+pub(crate) fn release_request_for_retry(inner: &mut InnerState, request_id: i64) {
+    inner
+        .session_active_requests
+        .retain(|_, &mut rid| rid != request_id);
+    if let Some(record) = inner.job_requests.get_mut(&request_id) {
+        if record.result.is_none() {
+            record.owner_runner_id = None;
+            record.started_at = None;
+            record.last_renewed_at = None;
+            record.timeout_triggered = false;
+            record.locked_until = crate::distributed_task::agent_request_locked_until();
+        }
+    }
 }
 
 /// Retire the request records an expandable node acquired at submit.
@@ -2497,11 +2734,12 @@ enum RequestRetirement {
 /// MC-2: `runs.rs` mints a full set of correlation records for every
 /// non-caller job, and a deferred-matrix node is non-caller — but such a node
 /// is routed to expansion and never dispatched to a runner. No completion,
-/// result patch or disconnect ever fires for it, and those are the only paths
-/// that clear `inflight_requests`. Without this the node's request stays
-/// inflight for the life of the process, resolvable to a job that expansion
-/// has already deleted from the run.
-fn retire_node_requests(
+/// result patch or disconnect ever fires for it — completion, result patch,
+/// disconnect, and the expandable-node retirement paths here are the only
+/// things that clear `inflight_requests`. Without this the node's request
+/// stays inflight and renewable for the life of the process, resolvable to a
+/// job that expansion has already deleted from the run.
+pub(crate) fn retire_node_requests(
     inner: &mut InnerState,
     run_id: RunId,
     node_id: &JobId,
@@ -2514,23 +2752,16 @@ fn retire_node_requests(
         .map(|(id, _)| *id)
         .collect();
     for request_id in request_ids {
-        inner
-            .session_active_requests
-            .retain(|_, &mut rid| rid != request_id);
-        inner.inflight_requests.remove(&request_id);
-        // Terminal either way: a settled node stays in the run as a finished
-        // job and a purged one no longer exists, and neither can be claimed
-        // again. The deferred App-token request must not survive either.
-        inner.github_token_requests.remove(&request_id);
         match retirement {
             RequestRetirement::Settle(status) => {
-                if let Some(record) = inner.job_requests.get_mut(&request_id) {
-                    if record.result.is_none() {
-                        record.result = Some(status);
-                    }
-                }
+                settle_request(inner, request_id, status);
             }
             RequestRetirement::Purge => {
+                inner
+                    .session_active_requests
+                    .retain(|_, &mut rid| rid != request_id);
+                inner.inflight_requests.remove(&request_id);
+                inner.github_token_requests.remove(&request_id);
                 let Some(record) = inner.job_requests.remove(&request_id) else {
                     continue;
                 };
@@ -2549,6 +2780,18 @@ fn retire_node_requests(
                 let agent_key = record.agent_job_id.to_string();
                 inner.live_log_lines.remove(&agent_key);
                 inner.live_log_tx.remove(&agent_key);
+                inner.live_log_closed.remove(&agent_key);
+                // The step manifest is attempt-scoped, so it belongs to the
+                // request being purged. A deferred-matrix placeholder gets one
+                // seeded at dispatch and is then purged when expansion
+                // replaces it, so without this every dynamic expansion leaves
+                // an entry no run projection can reach.
+                //
+                // Durable rows cannot leak the same way: seeding is not
+                // persisted, and a placeholder never reports, so it never
+                // reaches `store_job_steps`. Rows for attempts that did report
+                // are removed with their run through the `runs` foreign key.
+                inner.job_steps.remove(&record.agent_job_id);
             }
         }
     }
@@ -2849,32 +3092,83 @@ mod runner_group_tests {
             &runner(Some(2), Some("Release")),
         ));
     }
-
-    #[test]
-    fn group_is_not_treated_as_a_label() {
-        let mut capabilities = runner(Some(2), Some("build"));
-        capabilities.labels.push("release".to_owned());
-        assert!(!job_matches_runner_group(Some("deploy"), &capabilities));
-    }
-
-    #[test]
-    fn missing_group_metadata_uses_default_group() {
-        let default_runner = runner(None, None);
-        assert!(job_matches_runner_group(Some("Default"), &default_runner));
-        let custom_name_only = runner(None, Some("private"));
-        assert!(!job_matches_runner_group(Some("1"), &custom_name_only));
-        assert!(job_matches_runner_group(Some("1"), &default_runner));
-        assert!(job_matches_runner_group(None, &default_runner));
-        assert!(!job_matches_runner_group(
-            Some("private"),
-            &RunnerCapabilities::default(),
-        ));
-    }
 }
 
 #[cfg(test)]
 mod assignment_tests {
     use super::*;
+
+    /// Status pairings come from claimed job requests carrying their runner,
+    /// not from the pre-claim assignment table: finished requests and
+    /// unclaimed ones must not appear, and output is runner-sorted.
+    #[test]
+    fn live_assignments_reflect_claimed_requests() {
+        use crate::models::TaskAgentJobRequestRecord;
+        use std::collections::BTreeMap;
+
+        fn record(
+            run_id: RunId,
+            job: &str,
+            owner: Option<i64>,
+            result: Option<preloop_gha_protocol::ExecutionStatus>,
+            started_ago_secs: u64,
+        ) -> TaskAgentJobRequestRecord {
+            TaskAgentJobRequestRecord {
+                request_id: 0,
+                run_id,
+                job_id: JobId(job.to_owned()),
+                agent_job_id: uuid::Uuid::nil(),
+                plan_id: String::new(),
+                plan_type: String::new(),
+                timeline_id: uuid::Uuid::nil(),
+                result,
+                locked_until: String::new(),
+                owner_runner_id: owner,
+                started_at: std::time::SystemTime::now()
+                    .checked_sub(std::time::Duration::from_secs(started_ago_secs)),
+                last_renewed_at: None,
+                timeout_triggered: false,
+                debug_token_issued: false,
+            }
+        }
+
+        let run_a = RunId::new();
+        let mut table: BTreeMap<i64, TaskAgentJobRequestRecord> = BTreeMap::new();
+        // Finished requests stay in the map (late reads stay bound) but must
+        // not report as live; unclaimed ones have no runner yet.
+        table.insert(
+            1,
+            record(
+                run_a,
+                "done",
+                Some(3),
+                Some(preloop_gha_protocol::ExecutionStatus::Success),
+                90,
+            ),
+        );
+        table.insert(2, record(RunId::new(), "queued", None, None, 10));
+        // Insert out of runner order; output must still be runner-sorted.
+        table.insert(3, record(RunId::new(), "build", Some(7), None, 90));
+        let run_test = RunId::new();
+        table.insert(4, record(run_test, "test", Some(3), None, 30));
+
+        let active = BTreeMap::from([
+            ("finished".to_owned(), 1),
+            ("build".to_owned(), 3),
+            ("test".to_owned(), 4),
+        ]);
+        let now = std::time::SystemTime::now();
+        let live = live_runner_assignments(&table, &active, now);
+
+        assert_eq!(live.len(), 2);
+        assert_eq!(live[0].runner_id, 3);
+        assert_eq!(live[0].run_id, run_test.to_string());
+        assert_eq!(live[0].job_id, "test");
+        assert!((live[0].assigned_seconds_ago - 30.0).abs() < 5.0);
+        assert_eq!(live[1].runner_id, 7);
+        assert_eq!(live[1].job_id, "build");
+        assert!(live_runner_assignments(&BTreeMap::new(), &BTreeMap::new(), now).is_empty());
+    }
 
     fn self_hosted_caps() -> RunnerCapabilities {
         RunnerCapabilities {
@@ -2890,12 +3184,14 @@ mod assignment_tests {
             run_id: RunId::new(),
             job_id: JobId(job_id.to_owned()),
             base_id: job_id.to_owned(),
+            enqueued_at_unix_nanos: 0,
             needs: Vec::new(),
             if_condition: None,
             condition_context: preloop_gha_expressions::Context::default(),
             max_parallel: None,
             runs_on: vec!["self-hosted".to_owned()],
             runner_group: None,
+            environment: None,
             message: serde_json::from_value(serde_json::json!({
                 "jobId": "00000000-0000-0000-0000-000000000001",
                 "requestId": 1,

@@ -11,6 +11,141 @@ Releases before v0.27.0 predate the changelog.
 
 ### Fixed
 
+- Runner teardown now releases stale job bindings immediately, status snapshots
+  expose active runs and stalled claimable queues, and GitHub Check Run updates
+  report every annotation in API-sized batches.
+- CI jobs target the cpane microVM pool; only release packaging and the
+  aarch64 golden bake use GitHub-hosted runners.
+- A restart no longer leaves the pool full of phantom capacity or fails old
+  queued jobs while replacement VMs are warming. Persisted ephemeral runner
+  identities are purged before the server accepts traffic, unfinished request
+  correlations are released from dead runner ownership before redelivery, and
+  pre-provisioned successors without polling sessions are no longer reported as idle. A run
+  left `in_progress` with nothing executing it raises a
+  `run_in_progress_without_execution` condition instead of vanishing from the
+  operator's view.
+
+## [0.32.7] - 2026-09-10
+
+### Fixed
+
+- The release golden bake works again. `SMOLVM_MAX_IMAGE_BYTES` had been
+  dropped from both architecture steps by a comment-only cleanup, so every
+  `build-golden` attempt aborted in `smolvm create`: the pinned runner-large
+  base unpacks to roughly 17 GiB through `docker save`, over smolvm's 8 GiB
+  default local-archive cap. No golden had been produced since 2026-08-10.
+- The aarch64 golden builds on hosted Apple Silicon again. It had been
+  repointed at a `[self-hosted, macOS, ARM64]` runner that was never
+  registered, so the job was never dispatched and GitHub cancelled it at the
+  24-hour ceiling on every release since 2026-08-09.
+- CI Rust jobs install the pinned 1.97 toolchain and `lld` again. The
+  prebaked-golden change that removed them landed while the bake was broken,
+  leaving jobs to fail immediately with `cargo: command not found`. The
+  toolchain step now precedes `rust-cache`, whose `rustc -vV` probe needs it.
+- Legacy runner compatibility aliases now require runner-management or
+  one-time provisioning credentials for registration in strict production mode,
+  bind sessions and message polling to the verified runner identity, and reject
+  unauthenticated reporting traffic. The JSON OAuth compatibility path now
+  requires the trusted system credential instead of treating a client id as
+  proof; permissive registration remains an explicit TCP-only conformance
+  opt-in, and the mounted socket stays strict.
+
+### Changed
+
+- Both golden bake jobs carry an explicit `timeout-minutes`, so a job that is
+  never dispatched fails in minutes rather than occupying a runner slot for a
+  full day.
+
+## [0.32.5] - 2026-09-02
+
+### Added
+
+- `preloop logs` gained working `--job`/`--step` selection and `--follow`.
+  Step selection resolves through the job's step manifest rather than the
+  order log blobs happen to land in, so `--step N` names the step a user can
+  point at in their YAML. A job still streaming has no durable per-step
+  blobs, so `--step` against a live job now answers 409 instead of guessing
+  from raw console blocks; the whole-job read still serves the stream.
+- Conformance coverage for `actions/runner` v2.337.0: golden captures, the
+  server wire-compatibility fixes they exposed, and a second five-repo
+  real-world campaign.
+- A supply-chain gate in CI: `cargo vet`, `cargo audit`, `cargo deny`, Node
+  externals OSV scanning with SBOM emission, and action-pin parity checks.
+  Renovate now enforces a seven-day `minimumReleaseAge` and every action pin
+  is resolvable, with a `zizmor` check that pin comments match their SHAs.
+- Batch `ActionDownloadInfo` resolution with bearer-token codeload auth.
+- `runner-watch` gained a structured gate, value normalizers, a coverage map,
+  and tree-sitter-based deltas.
+
+### Changed
+
+- The runner warns on node20 usage ahead of deprecation, and the node
+  externals pins moved to current releases.
+
+### Fixed
+
+- Step identity and order now come from the job request message, which is
+  the only record of what the server actually dispatched. Previously the
+  server inferred both from whatever the runner reported, so a job's step
+  list depended on report arrival order and a re-dispatch could overwrite the
+  mapping the previous attempt's `step-<id>.txt` blobs are named after. Step
+  records live in a dedicated per-attempt table keyed by `agent_job_id`, are
+  seeded at dispatch in workflow order, and reconcile — rather than
+  rebuild — as reports arrive.
+
+  Several consequences were fixed with it: a completion is reconciled against
+  the attempt that reported it instead of the oldest matching one; one
+  ordering rule (the runner's reported position, else declared position)
+  replaced three inconsistent ones across the run projection, whole-job log
+  concatenation and both restore queries; step rows persist per attempt from
+  the paths that change them, instead of every run event resealing the whole
+  run; `GET /api/v1/runs` hydrates step records instead of returning empty
+  arrays; a manifest left behind by a purged deferred-matrix placeholder is
+  removed with its request; and an attempt dispatched but never reported has
+  its manifest rebuilt at startup from the persisted request message, so a
+  restart in that window no longer loses the job's declared steps.
+
+- `preloop debug` reported step positions a user could not find in their
+  workflow, because runner-generated steps — `Set up job`, action pre/post
+  hooks, container lifecycle, host hooks, `Complete job` — were counted as
+  workflow steps, and `--from N` selected the wrong one. A step is now
+  classified as synthetic exactly when its id is absent from the job request
+  message's step list, which is decidable rather than inferred from name
+  prefixes. `--from-start` past the failing step is rejected with an explicit
+  message instead of advertising an unreachable step.
+
+- Node externals are validated on install: manifest shape and archive
+  checksum are verified, with refresh hooks when either is stale. The test
+  fixtures now derive their expected digests from the same pinned table the
+  installer verifies against, so bumping a node version cannot leave the
+  fixture asserting a previous release's checksum on one architecture only.
+
+- The orchestrator no longer runs its starvation sweep while warm-pool
+  runners are still booting, which cancelled work that had not had a chance
+  to start.
+
+- Snapshot fetch honours the `Git-Protocol` v2 header.
+
+- `cargo audit` respects an explicitly configured LOW/MODERATE database
+  severity instead of overriding it.
+
+### Security
+
+- Action archives are extracted through `cap-std` capability handles, so a
+  crafted archive cannot escape the extraction root by path traversal.
+- Debugger welcome text supplied by the server is masked and sanitized
+  before display.
+- Authenticated-runner sinks are memory-bound, so a registered runner cannot
+  drive unbounded server-side allocation.
+- CVSS v3 base scores are computed to the standard, with a fail-closed
+  fallback when a vector cannot be parsed.
+
+## [0.32.0] - 2026-08-28
+
+<!-- preloop:skip-golden -->
+
+### Fixed
+
 - Cancelling a job no longer leaves background processes running on the
   runner host. Cancellation signalled the process group through the child
   handle, but the wait loop reaps the shell as soon as it exits, and a reaped
@@ -37,6 +172,17 @@ Releases before v0.27.0 predate the changelog.
   two-thirds through, `preloop serve` reported the official golden as
   "unavailable", and the run fell through to a local bake. The budget is
   now one hour, which covers any link above ~21 Mbps.
+
+- The GitHub App webhook-subscription check no longer warns about events
+  GitHub can never report. `pull_request_target` is a workflow trigger
+  synthesized from the `pull_request` webhook, not a deliverable event, and
+  `check_run`/`check_suite` are auto-subscribed for Apps holding `checks:
+  write` and so never appear in `GET /app`'s `events`. Both made the startup
+  warning fire forever on a correctly configured App. The check now also
+  reads the App's permissions from the same response and separates events
+  that can be ticked today from those whose checkbox GitHub does not render
+  until the gating permission is granted — the previous message sent
+  operators looking for controls that were not on the page.
 
 ### Changed
 
@@ -612,7 +758,9 @@ live-logs (8), and golden (8).
 Bootstrap the cargo-dist release pipeline for `preloop-cli` (binary
 installers for macOS and Linux).
 
-[Unreleased]: https://github.com/preloopdev/preloop/compare/v0.30.3...HEAD
+[Unreleased]: https://github.com/preloopdev/preloop/compare/v0.32.7...HEAD
+[0.32.7]: https://github.com/preloopdev/preloop/compare/v0.32.5...v0.32.7
+[0.32.5]: https://github.com/preloopdev/preloop/compare/v0.32.0...v0.32.5
 [0.30.3]: https://github.com/preloopdev/preloop/compare/v0.30.2...v0.30.3
 [0.29.8]: https://github.com/preloopdev/preloop/compare/v0.29.7...v0.29.8
 [0.29.7]: https://github.com/preloopdev/preloop/compare/v0.29.6...v0.29.7

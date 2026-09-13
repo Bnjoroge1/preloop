@@ -57,14 +57,18 @@ test-ci: fmt-check clippy zizmor
     just conform
     @echo CI: all checks passed
 
-# Supply-chain gate: dependency version-change policing (vet), RustSec
-# advisories (audit), and license/ban/source policy (deny). Local runs are on
-# trusted code; CI (supply-chain.yml) additionally drops any PR-shipped
-# .cargo/config.toml and rejects PRs that touch the policy files.
+# Supply-chain gate: cargo vet (supply-chain/audits.toml), cargo audit (RustSec),
+# cargo deny check all (licenses/bans/sources), and Node externals OSV/SBOM audit.
+# Local runs are on trusted code (report-only for Node externals). CI gate is
+# .github/workflows/supply-chain.yml (runs-on: ubuntu-latest; triggers: pull_request,
+# push to main, weekly schedule) — it drops any PR-shipped .cargo/config*, rejects
+# mixed policy PRs, runs the Node externals OSV+SBOM audit, and enforces upstream
+# pin parity.
 supply-chain:
     cargo vet
     cargo audit
     cargo deny check all
+    ./scripts/audit-node-externals.sh --report-only
 
 #lint (ast-grep structural rules)
 
@@ -89,21 +93,22 @@ bench-preloop-quick:
 
 # e2e redirect (one-time setup) 
 
-#serve
+# Local runner-client commands discover the persisted token in this same
+# engine home. Set PRELOOP_SYSTEM_TOKEN explicitly for a different server.
 
 serve:
-    PRELOOP_LOCAL_WORKSPACE="${PRELOOP_LOCAL_WORKSPACE:-$PWD}" cargo run --release -p preloop-runner-server -- serve --listen 127.0.0.1:9090
+    PRELOOP_HOME="${PRELOOP_HOME:-$PWD/.preloop}" PRELOOP_LOCAL_WORKSPACE="${PRELOOP_LOCAL_WORKSPACE:-$PWD}" cargo run --release -p preloop-runner-server -- serve --listen 127.0.0.1:9090
 
 serve-dev:
-    PRELOOP_LOCAL_WORKSPACE="${PRELOOP_LOCAL_WORKSPACE:-$PWD}" cargo run --release -p preloop-runner-server -- serve --listen 127.0.0.1:9090 --enable-test-api --test-api-token dev-token
+    PRELOOP_HOME="${PRELOOP_HOME:-$PWD/.preloop}" PRELOOP_LOCAL_WORKSPACE="${PRELOOP_LOCAL_WORKSPACE:-$PWD}" cargo run --release -p preloop-runner-server -- serve --listen 127.0.0.1:9090 --enable-test-api --test-api-token dev-token
 
-#submit 
+#submit
 
 submit-ci:
-    cargo run -p preloop-runner-client -- --server {{server}} submit -W .github/workflows/ci.yml --repository {{repo}}
+    PRELOOP_HOME="${PRELOOP_HOME:-$PWD/.preloop}" cargo run -p preloop-runner-client -- --server {{server}} submit -W .github/workflows/ci.yml --repository {{repo}}
 
 submit-dogfood:
-    cargo run -p preloop-runner-client -- --server {{server}} submit -W fixtures/workflows/dogfood.yml
+    PRELOOP_HOME="${PRELOOP_HOME:-$PWD/.preloop}" cargo run -p preloop-runner-client -- --server {{server}} submit -W fixtures/workflows/dogfood.yml
 
 #runner 
 

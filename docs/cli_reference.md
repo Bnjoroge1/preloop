@@ -54,6 +54,35 @@ Behavior notes:
   changes included) — the run never depends on what was pushed.
 - Local reusable workflows (`uses: ./.github/workflows/…`) are uploaded with
   the submission automatically.
+- **Simulated event context**: a local run stands in for a webhook delivery, so
+  the CLI fills in the parts of that delivery git can answer for. Nothing else
+  is invented — see below.
+
+### What a local run derives
+
+GitHub sends a webhook body; `preloop run` has git instead. These are derived
+automatically, and an explicit `--payload` field always wins:
+
+| Field | Derived from | Why it is safe |
+|---|---|---|
+| changed files (`paths` / `paths-ignore` filters) | `git diff --name-only <base>...HEAD` plus uncommitted changes | The run tests the working tree, so the filter should judge the same files |
+| PR activity type (`types:` filters) | defaults to `synchronize` | One of GitHub's default `pull_request` types |
+| target branch (`branches:` filters on `pull_request`) | `--base`, else the branch's tracking ref | GitHub applies PR branch filters to the **target** branch, not the head branch |
+| branch / tag | the current checkout | It is the ref being tested |
+
+The base for the diff is `--base` when given, otherwise the branch's tracking
+ref, then each remote's default branch, then local `main`/`master`. A candidate
+is only used if it shares history with `HEAD`, so a fork remote with unrelated
+history is skipped rather than picked and then failing to diff.
+
+Nothing else is synthesized. PR number, actor, labels, review state, and
+`workflow_run` upstream results have no local truth, and guessing them would
+flip `if:` conditions on fabricated data — pass `--payload` when a workflow
+needs them.
+
+If no usable base is found, the change set stays *unknown* rather than empty:
+an empty known list would make every `paths:` filter reject the run. Path-
+filtered workflows then fail with an error naming what to pass.
 
 ## `preloop plan [OPTIONS]`
 
@@ -77,8 +106,40 @@ No flags.
 
 | Flag | Description |
 |---|---|
-| `--job <JOB>` | Filter by job ID |
-| `--step <STEP>` | Filter by step number |
+| `--job <JOB>` | Narrow to one job: the workflow job key (`build`) or its agent job UUID |
+| `--step <STEP>` | Narrow to one 1-based step within the job, in execution order |
+| `-f`, `--follow` | Stream one job's output and exit when that job finishes |
+
+Without flags, every job's log is merged in job-request order.
+
+`--step` counts the steps *declared in the workflow* from 1, matching
+`preloop debug --from`. It needs `--job` when a run has more than one job,
+because numbering restarts per job.
+
+Numbering comes from the step list in the job's request message, recorded when
+the job was dispatched. Steps the runner adds on its own — `Set up job`,
+`Pre`/`Post` action hooks, container setup and teardown, `Complete job` — own
+their logs and appear in the whole-job output, but never take a `--step`
+position. Two steps sharing a `name:` stay distinct, because a step is
+identified by its stable id rather than its display name.
+
+Asking for a step fails with `409` rather than guessing when the order cannot
+be recovered: a job whose runner uploaded a single merged log has no step
+boundaries, and a job dispatched before its step list was recorded has no
+declared order to index.
+
+`--follow` tracks one job's live console feed, so it needs `--job` unless the
+run has exactly one job. It replays the retained buffer before going live, then
+exits when that selected job completes. If the job is already complete, it
+returns the available durable log instead. It cannot be combined with `--step`
+(the feed carries whole steps as they stream).
+
+```bash
+preloop logs                          # whole latest run
+preloop logs --job test               # just the `test` job
+preloop logs --job test --step 3      # just that job's third step
+preloop logs -f --job test            # tail it live
+```
 
 ## `preloop cancel [RUN_ID]`
 
@@ -257,6 +318,7 @@ steps.
 | `PRELOOP_HOME` | State directory (default `~/.config/preloop`) |
 | `PRELOOP_RUNNER_POOL_ENABLED` | Enable the local microVM runner pool (default off) |
 | `PRELOOP_RUNNER_POOL_SIZE` | Pool size (warm forks/VMs) |
+| `PRELOOP_RUNNER_CPUS` | vCPUs allocated to each runner VM (default 4) |
 | `PRELOOP_USE_FORK` | Run the pool as forked microVMs (default true with a packed golden) |
 | `PRELOOP_USE_PACKED_GOLDEN` | Use a release or locally cached packed golden (default on; set `false` for cold OCI provisioning) |
 | `PRELOOP_GOLDEN_URL` | Override the packed golden URL; checksum URL is this value plus `.sha256` |
@@ -270,12 +332,22 @@ steps.
 | `PRELOOP_RUNNER_LABELS` | Extra `runs-on` labels the pool's runners declare |
 | `PRELOOP_RUNNER_USER` / `PRELOOP_RUNNER_UID` | Guest runner account (default `runner`/1001); `root` restores root; empty disables switching |
 | `PRELOOP_WORKSPACE` | Workspace context for daemon deployments; not a package or toolchain installation input |
-| `AKSH_URL` | Server URL for the client commands (default `http://127.0.0.1:9090`) |
-| `AKSH_SYSTEM_TOKEN` | Native API bearer token (also `AKSH_TOKEN`) |
-| `AKSH_PUBLIC_URL` | Public URL used in check-run details links |
-| `AKSH_GITHUB_TOKEN` | PAT fallback for GitHub API calls (check runs need the App) |
-| `AKSH_GITHUB_API_URL` | Override the GitHub API base (tests, GHES) |
-| `AKSH_WEBHOOK_SECRET` | Webhook signature secret (the server's only source of truth for repo hooks) |
+| `PRELOOP_URL` | Server URL for the client commands (default `http://127.0.0.1:9090`) |
+| `PRELOOP_SYSTEM_TOKEN` | Native API bearer token (also `PRELOOP_TOKEN`) |
+| `PRELOOP_PUBLIC_URL` | Public URL used in check-run details links |
+| `PRELOOP_GITHUB_TOKEN` | PAT fallback for GitHub API calls (check runs need the App) |
+| `PRELOOP_GITHUB_API_URL` | Override the GitHub API base (tests, GHES) |
+| `PRELOOP_WEBHOOK_SECRET` | Webhook signature secret (the server's only source of truth for repo hooks) |
+
+### Engine token storage
+
+The native API administrator token is generated on first engine startup when
+`PRELOOP_SYSTEM_TOKEN` is not set. Preloop stores it in the operating system's
+credential store, scoped to the engine home. On hosts without an available or
+readable OS credential service, it uses `$PRELOOP_HOME/engine.token` with private
+permissions instead. Managed CLI commands read this token automatically; do
+not commit or print the file. Set `PRELOOP_SYSTEM_TOKEN` explicitly for a
+separate client or service.
 
 ## Quick examples
 

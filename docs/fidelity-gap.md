@@ -152,19 +152,34 @@ those details.
 
 ## 1. Current fidelity scorecard
 
-**Evidence basis (latest, 2026-07-28):** runner-watch conformance replay of all 24
-official-runner v2.336.0 golden scenarios against preloop. All 24 pass: status codes,
-request body schemas, and acquirejob response schemas match on every
-conformance-checked endpoint. `benchmarks/conformance/check_corpus.py` fails closed
-when any scenario definition lacks a non-empty, version-matched capture.
+**Evidence basis (latest, 2026-09-11):** runner-watch conformance replay of the
+36 gated official-runner v2.336.0 golden scenarios against preloop. Three
+further captures (`102-mask-and-secret-propagation`,
+`115-cache-v2-restore-fallback`, `163-reusable-caller`) are quarantined in
+`.runner-watch/quarantine.toml`: the recorder acquired another scenario's job,
+so those captures describe a job their own workflow never declares.
+`benchmarks/conformance/check_corpus.py` fails closed when a capture is
+missing, version-mismatched, or contaminated — the latter via two invariants
+(no orchestration plan GUID may appear in two captures; a capture's acquired
+job must be declared by its own workflow).
+
+> **Correction (2026-09-11).** This section previously claimed "all 24
+> v2.336.0 golden scenarios … All 24 pass" dated 2026-07-28. No 24-scenario
+> v2.336.0 corpus ever existed: the golden directory was empty until
+> `fd8f62fa` (2026-07-30) imported all 39 captures at once, and the revision
+> of `conformance-report.md` immediately prior (`d93e1fd7`, 2026-07-23)
+> recorded "10 of 11 scenario(s) diverged". `fd8f62fa` also wrote
+> "✅ All 39 scenario(s) matched" in the same commit that created the corpus,
+> which is why six real divergences stayed invisible until #243. The report is
+> generated output and must not be hand-edited.
 
 **Evidence basis (live E2E, 2026-07-10):** official `actions/runner` v2.335.1 run against both
 GitHub Actions and preloop server in independent smolVMs. 12 conformance scenarios tested.
 Job-level match: 11/12 (92%). Full match (job + step): 6/12 (50%).
 See `benchmarks/real-world/results/server-compare/COMPARISON-REPORT.md` for details.
 
-- Golden scenarios: all 24 definitions under `experiments/mitm/scenarios/`, all
-passing conformance replay.
+- Golden scenarios: 39 definitions under `experiments/mitm/scenarios/`; 36
+gated and passing, 3 quarantined pending re-record against a drained queue.
 
 Rough completeness against "100% faithful control plane (v2.336.0)": **~95%**
 (v2.336.0 runner deltas and protocol corpus current; BackgroundStepCoordinator incomplete).
@@ -192,11 +207,11 @@ deprecation warnings, job-level annotations, and background step control-flow.
 | Encrypted message queue (`TaskAgentMessage`)                    | older direct-message path remains AES-CBC encrypted; current v2.335.x broker-ref path is covered by a current-runner E2E test                                                                                                                                                                                                                                                                                                                                                        | ✅ good                                               |
 | `AgentJobRequestMessage`                                        | full DTO with plan, request, context, steps; reused by current broker acquire responses and covered by current-runner registration→broker E2E                                                                                                                                                                                                                                                                                                                                        | ✅ good                                               |
 | `connectionData` / location services                            | v2.335.1 replay returns `200`; preloop includes 28 service definitions covering broker/OAuth/pipelines resource locations and query-aware fresh-cache responses                                                                                                                                                                                                                                                                                                                         | ⚠️ runner-compatible, not full hosted-service parity |
-| GitHub runner registration endpoint                             | route exists and replays as `200`; response now returns JWT-shaped local `OAuthAccessToken` plus preloop service URL instead of echoing GitHub repo URL                                                                                                                                                                                                                                                                                                                                 | ⚠️ local token, runner-compatible                    |
-| OAuth token endpoint                                            | route exists and replays as `200`; response now uses `token_type = JWT`, `expires_in = 2999`, and local signed JWT-shaped tokens                                                                                                                                                                                                                                                                                                                                                     | ⚠️ local token, runner-compatible                    |
+| GitHub runner registration endpoint                             | route exists; strict mode requires the system credential while explicit `PRELOOP_REGISTRATION_POLICY=permissive` replay returns `200`; response now returns JWT-shaped local `OAuthAccessToken` plus preloop service URL instead of echoing GitHub repo URL                                                                                                                                                                                                                           | ⚠️ local token, runner-compatible                    |
+| OAuth token endpoint                                             | route exists and replays as `200`; in strict mode, signed client-assertion flow verifies the registered runner key, while JSON compatibility minting requires the trusted system credential rather than a client id alone; `PRELOOP_REGISTRATION_POLICY=permissive` remains an explicit conformance-only opt-in for upstream registration tokens | ⚠️ local token, runner-compatible                    |
 | DistributedTask pool/agent replay                               | runner-watch mapping is fixed and the latest replay returns `200` for pool discovery / agent lookup / agent registration                                                                                                                                                                                                                                                                                                                                                             | ✅ good                                               |
-| DistributedTask session/message replay                          | mapped requests now reach preloop; session status matches `201`; incomplete Busy long-polls are filtered as non-comparable capture artifacts                                                                                                                                                                                                                                                                                                                                            | ⚠️ partial                                           |
-| AgentRequest acknowledgement                                    | endpoint exists and now returns `200` like official v2.335.1                                                                                                                                                                                                                                                                                                                                                                                                                         | ✅ good                                               |
+| DistributedTask session/message replay                          | mapped requests now reach preloop; session status matches `201`; in strict mode, legacy aliases require a registered runner credential or a fresh one-time pool provision credential, and bind sessions/message polling to that runner; incomplete Busy long-polls are filtered as non-comparable capture artifacts                                                                 | ⚠️ partial                                           |
+| AgentRequest acknowledgement                                    | endpoint exists and now returns `200` like official v2.335.1; legacy aliases require a registered runner credential and retain the claimed runner owner across active/completed reads, renewals, acknowledgements, and completion                                                                                                                                            | ✅ good                                               |
 | Broker acquire/renew/complete                                   | queue-backed routes pass targeted E2E; runner-watch now materializes replay state and rewrites captured broker IDs so acquire/renew/complete statuses match official                                                                                                                                                                                                                                                                                                                 | ✅ good                                               |
 | Broker message types                                            | 9 types handled: `RunnerJobRequest`, `PipelineAgentJobRequest`, `JobCancellation`, `AgentRefresh`, `BrokerMigration`, `ForceTokenRefresh`, `RunnerShutdown`, `RunnerRefresh`, `RunnerRefreshConfig`                                                                                                                                                                                                                                                                                  | ✅ good                                               |
 | Job cancellation wire shape                                     | `JobCancelMessage` now uses GUID `jobId` + `Timeout` TimeSpan; fire-and-forget cancel with `CancellationTiming` (clamped ≥60 s, hard-kill at timeout−15 s)                                                                                                                                                                                                                                                                                                                           | ✅ good (resolved)                                    |
@@ -229,19 +244,60 @@ deprecation warnings, job-level annotations, and background step control-flow.
 | Runner config refresh                                           | `RunnerRefreshConfig` acknowledged with log; dynamic config updates not implemented                                                                                                                                                                                                                                                                                                                                                                                                  | ❌ missing                                            |
 | Server-enforced runner settings                                 | `RunnerServerSettings` DTO; `GET /_apis/v1/settings/runner` endpoint; broker acquire injects `runnerSettings` defaults                                                                                                                                                                                                                                                                                                                                                               | ✅ good                                               |
 | `run-name` expressions                                          | parsed via `Workflow.run_name`; evaluated with `github`/`inputs`/`vars` contexts at submit time; stored in `RunRecord`                                                                                                                                                                                                                                                                                                                                                               | ✅ good                                               |
-| Reusable workflows                                              | parsing, `secrets: inherit`, required secrets/inputs, input type validation, OIDC `environment` propagation, `oidc_job_workflow_ref`; depth limit = 4                                                                                                                                                                                                                                                                                                                                | ✅ good                                               |
+| Reusable workflows                                              | parsing, `secrets: inherit`, required secrets/inputs, input type validation, OIDC `environment` propagation, `oidc_job_workflow_ref`; 10 connected workflow levels, max 50 unique reusable workflows per run tree                                                                                                                                                                                                                                                                                                                                | ✅ good                                               |
 | Node 20→24 migration/deprecation warnings                       | implemented: flag source precedence, conflict warning, ARM32 fallback (Plan 008)                                                                                                                                                                                                                                                                                                                                                                                                     | ✅ good                                               |
+
+> **Externals pin divergence (v2.336.0 vs v2.337.0):** preloop ships `node24_externals_version = 24.19.0` and `node20_externals_version = 20.20.2` (the final Node 20 release) while the `v2.336.0` golden pins Node 24 `24.18.0`. The `24.19.0` patch is a secure forward-port matching the `v2.337.0` externals with no wire-protocol change; conformance is unaffected.
 
 
 ---
 
-## 1a. v2.336.0 conformance replay status (2026-07-28)
+## 1. v2.337.0 live conformance campaign (2026-08-31)
+
+Four-cell campaign over 27 edge-case scenarios (201–227 in
+`benchmarks/real-world/results/v2337-conformance/`), official `actions/runner`
+v2.337.0 and `preloop-runner`, each against github.com (private capture repo)
+and the local preloop server — every runner process inside a dedicated smolvm
+microVM. Full report: `benchmarks/real-world/results/v2337-conformance/REPORT.md`.
+
+**Official vs preloop runner against github.com: 23/27 exact match** (run +
+per-job conclusions). Divergences:
+
+| Scenario | Divergence | Owner |
+|---|---|---|
+| 213-oidc-token-claims | preloop-runner does not populate `ACTIONS_ID_TOKEN_REQUEST_TOKEN/URL` against github.com servers | preloop-runner |
+| 216-summaries-env-cascade | preloop-runner spawns steps in `working-directory` before the workspace directory exists | preloop-runner |
+| 208-timeout-graceful-kill | timed-out job conclusion bookkeeping (cancelled vs failure) | preloop-runner |
+| 224-matrix-include-exclude | fail-fast cancellation race: in-flight shard allowed to finish | preloop-runner |
+
+Server-side gaps found by pointing the official runner at the local preloop
+server (fixed during the campaign, commits 5a36f431, 35acfe20, 2e358fc4):
+
+1. Strategy expressions could not see dispatch inputs (`inputs` /
+   `github.event.inputs` absent from top-level expansion contexts).
+2. `environmentVariables` wire shape must be TemplateToken maps
+   (`{type:2,map:[{Key,Value}]}`); plain JSON objects crash the official
+   runner's schema evaluator ("The template is not valid. Unexpected value '').
+3. `system.orchestrationId` must be an RFC product token — reusable-call job
+   ids contain `/`, which .NET's `ProductHeaderValue` rejects.
+4. Agent-lookup `authorization.clientId` must parse as `System.Guid`.
+
+New open server gap (found, not yet fixed): artifact
+`CreateArtifact`/`ListArtifacts` scoping uses per-job plan ids, so a build job's
+artifact is invisible to a consumer job in the same run ("Artifact not found
+for name: build-output" in scenario 206).
+
+Pre-existing on main (unrelated): preloop-orchestrator
+`published_node_externals_are_traversable_by_other_users` fails — its mock
+SHASUMS still pin node-v20.19.0 while the pin moved to v20.20.2 (48386439).
+
+## 1a. v2.336.0 conformance replay status (2026-09-11)
 
 ### 1a.1 What the conformance replay proves
 
-runner-watch replays all 24 golden scenarios against preloop and compares wire output.
-**All 24 scenarios pass**: status codes match, request body schemas match, and
-acquirejob response body schemas match for all conformance-checked endpoints.
+runner-watch replays the 36 gated golden scenarios against preloop and
+compares wire output. Status codes, request body schemas, and acquirejob
+response body schemas match on every conformance-checked endpoint.
 
 The conformance gate checks:
 
@@ -250,6 +306,34 @@ The conformance gate checks:
 3. **Acquirejob response schema** — the job payload structure must match the golden
 
 Body-value diffs (different URLs, IDs, tokens) are expected and not gated.
+
+> **Resolved (2026-09-11), previously "stale as of 2026-09-02".** The
+> `conformance failed for 6 scenario(s)` that CI reported was correctly
+> identified as pre-existing rather than a regression, but the six were never
+> named because `conformance-fail.toml` — the only file listing them — was
+> not part of the uploaded artifact, and the replay log prints just the count.
+> Both are fixed: the workflow now echoes the failing scenarios into the log
+> (which outlives the ephemeral runner VM) and uploads that manifest.
+>
+> The six split two ways. Three were real, never-implemented protocol gaps,
+> now fixed: `actionsEnvironment` was absent entirely (110), `timeout-minutes`
+> was never parsed so step timeouts were silently ignored (114), and
+> `defaults` was hardcoded empty so workflow-level `defaults.run` never
+> reached the runner (104). Fixing the wire was not sufficient — the runner
+> independently mis-read two of them in ways that also broke it against
+> github.com, not just preloop.
+>
+> The other three were contaminated captures, not divergences, and are now
+> quarantined: see `.runner-watch/quarantine.toml`.
+>
+> Fixing the v2.336.0 gate exposed a second failure it had been masking:
+> `run.sh` uses `set -e`, so it aborted before reaching the optional
+> `v2.337.0/gh-official` cell. All 27 of those captures were committed
+> without the scenario manifests they replay from — no
+> `experiments/mitm/scenarios/2xx-*/scenario.toml` has ever existed in any
+> commit — so that cell errors on its first scenario. It is now skipped with
+> a loud notice rather than failing the build or being silently counted as
+> covered. Committing the 27 definitions brings it back into the gate.
 
 ### 1a.2 Scenario coverage
 
@@ -622,7 +706,7 @@ Paths are in this repo. Updated 2026-07-18 after deep source review.
   - ✅ `permissions` parsed at workflow and job level; `id-token: write` evaluated for OIDC.
   - ✅ `environment` parsed at job level with matrix expression resolution.
   - ✅ `container` / `services` parsed as raw `Value`.
-  - ✅ Reusable workflows with `secrets: inherit`, input types, depth limit = 4.
+  - ✅ Reusable workflows with `secrets: inherit`, input types, 10 connected workflow levels, max 50 unique per run tree.
   - ✅ `run-name` parsed via `Workflow.run_name` (`#[serde(rename = "run-name")]`); evaluated with expression contexts at submit time.
 - `preloop-gha-expressions/src/`
   - ✅ Pratt parser + evaluator; all 12 functions.
@@ -665,7 +749,7 @@ Paths are in this repo. Updated 2026-07-18 after deep source review.
 - `runner-watch`
   - ✅ Records/diffs upstream runner releases and emits `.runner-watch/delta.json`.
   - ✅ Generates protocol-sync specs under `.runner-watch/specs/v{version}/`.
-  - ✅ Replays the complete v2.336.0 corpus into preloop: all 24 scenarios pass.
+  - ✅ Replays the gated v2.336.0 corpus into preloop: 36 scenarios pass, 3 quarantined (see `.runner-watch/quarantine.toml`).
 
 ### 3a. Concurrency &amp; cancellation audit (2026-07-13, resolved 2026-07-18)
 

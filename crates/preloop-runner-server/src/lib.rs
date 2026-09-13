@@ -10,6 +10,7 @@ use std::sync::Arc;
 
 pub mod concurrency;
 pub mod config;
+pub mod credential_store;
 mod errors;
 pub mod events;
 pub mod github;
@@ -39,6 +40,7 @@ mod live_logs;
 mod openapi;
 use live_logs::*;
 mod debug;
+mod http_metrics;
 use debug::*;
 mod debug_sessions;
 mod runner_lifecycle;
@@ -83,6 +85,8 @@ mod blob_store;
 use blob_store::*;
 mod connection;
 use connection::*;
+mod memory_caps;
+use memory_caps::*;
 
 /// Pure job-graph scheduler model and property tests.
 pub mod scheduling;
@@ -131,10 +135,10 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use tokio::net::TcpListener;
 use tokio::sync::{broadcast, Mutex, Notify};
 use tokio_util::sync::CancellationToken;
-use tower_http::trace::TraceLayer;
 use tracing::{debug, error, info, warn};
 
-/// Default local token used when `PRELOOP_SYSTEM_TOKEN` is not configured.
+#[cfg(test)]
+/// Deterministic administrator token used only by in-process tests.
 const DEFAULT_PRELOOP_SYSTEM_TOKEN: &str = "preloop-system-token";
 #[cfg(test)]
 const TEST_LOCAL_JWT_KEY: &[u8] = b"preloop-test-local-jwt-signing-key";

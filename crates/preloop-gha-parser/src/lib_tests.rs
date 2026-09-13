@@ -14,6 +14,363 @@ fn glob_match_handles_multiple_wildcards() {
     assert!(glob_match("src/**", "src/bin/main.rs"));
 }
 
+/// `**` matches "zero or more of any character", so a literal `/` written
+/// after it still has to match a real separator. GitHub documents `**.md` —
+/// not `**/*.md` — as "any file in the repository with the .md extension",
+/// and the difference decides whether a root-level file is filtered.
+///
+/// Pinned because a `paths-ignore: ["**/*.md"]` that silently stopped
+/// covering (or started covering) `README.md` would change which workflows
+/// run on a docs-only change, with nothing else failing.
+#[test]
+fn glob_match_double_star_requires_a_real_separator_before_a_literal_slash() {
+    // `**/` needs at least one directory: a root-level file has no `/`.
+    assert!(
+        !glob_match("**/*.md", "README.md"),
+        "`**/*.md` must not match a root-level file"
+    );
+    assert!(
+        glob_match("**/*.md", "docs/cli_reference.md"),
+        "`**/*.md` matches inside a directory"
+    );
+    assert!(
+        glob_match("**/*.md", "docs/adr/0001-title.md"),
+        "`**` spans multiple directories"
+    );
+
+    // `**.md` is the documented "any .md anywhere" form and covers both.
+    assert!(
+        glob_match("**.md", "README.md"),
+        "`**.md` must match a root-level file"
+    );
+    assert!(
+        glob_match("**.md", "docs/cli_reference.md"),
+        "`**.md` must match a nested file"
+    );
+
+    // A non-`.md` path is unaffected by either form.
+    assert!(!glob_match("**.md", "crates/preloop-cli/src/main.rs"));
+    assert!(!glob_match("**/*.md", "crates/preloop-cli/src/main.rs"));
+}
+
+/// A single `*` stops at a separator; `**` crosses it.
+#[test]
+fn glob_match_single_star_does_not_cross_separators() {
+    assert!(glob_match("*.md", "README.md"));
+    assert!(!glob_match("*.md", "docs/cli_reference.md"));
+    assert!(glob_match("docs/*.md", "docs/cli_reference.md"));
+    assert!(!glob_match("docs/*.md", "docs/adr/0001-title.md"));
+    assert!(glob_match("docs/**", "docs/adr/0001-title.md"));
+}
+
+/// `match_event` is the single source of truth; `matches_with_context` is its
+/// boolean face. Pin that so a future change to one cannot silently diverge.
+#[test]
+fn match_event_agrees_with_matches_with_context() {
+    let workflow = parse_workflow(
+        r#"
+on:
+  push:
+    branches: [main]
+    paths: ["src/**"]
+jobs:
+  j:
+    runs-on: ubuntu-latest
+    steps:
+      - run: echo hi
+"#,
+    )
+    .unwrap();
+    let cases: &[(&str, Option<&str>, &[&str])] = &[
+        ("push", Some("main"), &["src/lib.rs"]),
+        ("push", Some("main"), &["docs/x.md"]),
+        ("push", Some("other"), &["src/lib.rs"]),
+        ("pull_request", Some("main"), &["src/lib.rs"]),
+    ];
+    for (event, branch, paths) in cases {
+        let paths: Vec<String> = paths.iter().map(|p| (*p).to_owned()).collect();
+        let boolean = workflow
+            .on
+            .matches_with_context(event, *branch, None, &paths, None, &[]);
+        let structured = workflow
+            .on
+            .match_event(event, *branch, None, &paths, None, &[])
+            .is_ok();
+        assert_eq!(boolean, structured, "{event} {branch:?} {paths:?}");
+    }
+}
+
+#[test]
+fn match_event_reports_undeclared_event_with_the_declared_list() {
+    let workflow = parse_workflow(
+        r#"
+on:
+  push:
+    branches: [main]
+  workflow_dispatch:
+jobs:
+  j:
+    runs-on: ubuntu-latest
+    steps:
+      - run: echo hi
+"#,
+    )
+    .unwrap();
+    let error = workflow
+        .on
+        .match_event("pull_request", Some("main"), None, &[], None, &[])
+        .expect_err("pull_request is not declared");
+    match &error {
+        TriggerMismatch::EventNotDeclared { declared } => {
+            assert_eq!(
+                declared,
+                &["push".to_owned(), "workflow_dispatch".to_owned()]
+            );
+        }
+        other => panic!("expected EventNotDeclared, got {other:?}"),
+    }
+    // The rendered text must name what to pass instead.
+    let rendered = error.to_string();
+    assert!(rendered.contains("push"), "{rendered}");
+    assert!(rendered.contains("workflow_dispatch"), "{rendered}");
+}
+
+#[test]
+fn match_event_reports_missing_and_rejected_activity_types() {
+    let workflow = parse_workflow(
+        r#"
+on:
+  pull_request:
+    types: [opened, reopened]
+jobs:
+  j:
+    runs-on: ubuntu-latest
+    steps:
+      - run: echo hi
+"#,
+    )
+    .unwrap();
+    let missing = workflow
+        .on
+        .match_event("pull_request", Some("main"), None, &[], None, &[])
+        .expect_err("no activity type supplied");
+    assert_eq!(
+        missing,
+        TriggerMismatch::ActivityTypeMissing {
+            accepted: vec!["opened".to_owned(), "reopened".to_owned()]
+        }
+    );
+
+    let rejected = workflow
+        .on
+        .match_event(
+            "pull_request",
+            Some("main"),
+            None,
+            &[],
+            Some("synchronize"),
+            &[],
+        )
+        .expect_err("synchronize is not in types");
+    assert_eq!(
+        rejected,
+        TriggerMismatch::ActivityTypeRejected {
+            got: "synchronize".to_owned(),
+            accepted: vec!["opened".to_owned(), "reopened".to_owned()]
+        }
+    );
+
+    // An accepted type still matches.
+    assert!(workflow
+        .on
+        .match_event("pull_request", Some("main"), None, &[], Some("opened"), &[])
+        .is_ok());
+}
+
+/// A bare `pull_request:` still applies GitHub's default activity types, so a
+/// caller that supplies none gets a reason naming them.
+#[test]
+fn match_event_reports_default_pr_activity_types() {
+    let workflow = parse_workflow(
+        "on:\n  pull_request:\njobs:\n  j:\n    runs-on: ubuntu-latest\n    steps:\n      - run: echo hi\n",
+    )
+    .unwrap();
+    let error = workflow
+        .on
+        .match_event("pull_request", Some("main"), None, &[], None, &[])
+        .expect_err("default types still require an activity type");
+    match error {
+        TriggerMismatch::ActivityTypeMissing { accepted } => {
+            assert_eq!(
+                accepted,
+                vec![
+                    "opened".to_owned(),
+                    "synchronize".to_owned(),
+                    "reopened".to_owned(),
+                ]
+            );
+        }
+        other => panic!("expected ActivityTypeMissing, got {other:?}"),
+    }
+}
+
+#[test]
+fn match_event_reports_ref_and_path_filters() {
+    let workflow = parse_workflow(
+        r#"
+on:
+  push:
+    branches: [main]
+    paths: ["src/**"]
+jobs:
+  j:
+    runs-on: ubuntu-latest
+    steps:
+      - run: echo hi
+"#,
+    )
+    .unwrap();
+
+    let ref_filtered = workflow
+        .on
+        .match_event(
+            "push",
+            Some("feature/x"),
+            None,
+            &["src/lib.rs".to_owned()],
+            None,
+            &[],
+        )
+        .expect_err("branch is filtered out");
+    match &ref_filtered {
+        TriggerMismatch::RefFiltered {
+            branch, filters, ..
+        } => {
+            assert_eq!(branch.as_deref(), Some("feature/x"));
+            assert_eq!(filters, &[("branches".to_owned(), vec!["main".to_owned()])]);
+        }
+        other => panic!("expected RefFiltered, got {other:?}"),
+    }
+    assert!(ref_filtered.to_string().contains("feature/x"));
+
+    let unmatched = workflow
+        .on
+        .match_event(
+            "push",
+            Some("main"),
+            None,
+            &["docs/readme.md".to_owned()],
+            None,
+            &[],
+        )
+        .expect_err("no changed path matches src/**");
+    assert_eq!(
+        unmatched,
+        TriggerMismatch::PathsUnmatched {
+            changed: 1,
+            filters: vec!["src/**".to_owned()]
+        }
+    );
+    assert!(unmatched.to_string().contains("src/**"));
+}
+
+#[test]
+fn match_event_reports_all_paths_ignored() {
+    let workflow = parse_workflow(
+        r#"
+on:
+  pull_request:
+    types: [synchronize]
+    paths-ignore: ["**.md"]
+jobs:
+  j:
+    runs-on: ubuntu-latest
+    steps:
+      - run: echo hi
+"#,
+    )
+    .unwrap();
+    let error = workflow
+        .on
+        .match_event(
+            "pull_request",
+            Some("main"),
+            None,
+            &["README.md".to_owned(), "docs/a.md".to_owned()],
+            Some("synchronize"),
+            &[],
+        )
+        .expect_err("every changed file is ignored");
+    assert_eq!(
+        error,
+        TriggerMismatch::PathsAllIgnored {
+            changed: 2,
+            filters: vec!["**.md".to_owned()]
+        }
+    );
+
+    // A mixed change set still runs — paths-ignore only suppresses when all
+    // changed files are ignored.
+    assert!(workflow
+        .on
+        .match_event(
+            "pull_request",
+            Some("main"),
+            None,
+            &["README.md".to_owned(), "src/lib.rs".to_owned()],
+            Some("synchronize"),
+            &[],
+        )
+        .is_ok());
+}
+
+#[test]
+fn match_event_reports_unmatched_upstream_workflow() {
+    let workflow = parse_workflow(
+        r#"
+on:
+  workflow_run:
+    types: [completed]
+    workflows: ["CI"]
+jobs:
+  j:
+    runs-on: ubuntu-latest
+    steps:
+      - run: echo hi
+"#,
+    )
+    .unwrap();
+    let error = workflow
+        .on
+        .match_event(
+            "workflow_run",
+            Some("main"),
+            None,
+            &[],
+            Some("completed"),
+            &[],
+        )
+        .expect_err("no upstream workflow name supplied");
+    assert_eq!(
+        error,
+        TriggerMismatch::UpstreamWorkflowUnmatched {
+            filters: vec!["CI".to_owned()]
+        }
+    );
+
+    assert!(workflow
+        .on
+        .match_event(
+            "workflow_run",
+            Some("main"),
+            None,
+            &[],
+            Some("completed"),
+            &["CI".to_owned()],
+        )
+        .is_ok());
+}
+
 #[test]
 fn parses_workflow_run_name() {
     let workflow = parse_workflow(
@@ -1106,6 +1463,53 @@ jobs:
 }
 
 #[test]
+fn reusable_workflow_up_to_max_depth_succeeds() {
+    let caller = parse_workflow(
+        r#"
+on: push
+jobs:
+  call1:
+    uses: ./.github/workflows/level1.yml
+"#,
+    )
+    .unwrap();
+
+    let mut reusable = BTreeMap::new();
+    for i in 1..9 {
+        reusable.insert(
+            format!(".github/workflows/level{i}.yml"),
+            format!("on: {{ workflow_call: {{}} }}\njobs:\n  call{}:\n    uses: ./.github/workflows/level{}.yml", i + 1, i + 1),
+        );
+    }
+    // Level 9 is the 9th nested reusable workflow (10th level overall) — it has leaf steps.
+    reusable.insert(
+        ".github/workflows/level9.yml".to_owned(),
+        "on: { workflow_call: {} }\njobs:\n  test:\n    runs-on: ubuntu-latest\n    steps:\n      - run: echo leaf"
+            .to_owned(),
+    );
+
+    let root = expand_jobs_with_reusables(&caller, &reusable).unwrap();
+    assert_eq!(root.jobs.len(), 1);
+    let mut node = root.jobs[0].clone();
+
+    for level in 1..=8 {
+        let called =
+            parse_workflow(&reusable[&format!(".github/workflows/level{level}.yml")]).unwrap();
+        let expanded =
+            crate::expand_reusable_call(&called, &node, &reusable, &BTreeMap::new()).unwrap();
+        node = expanded.jobs[0].clone();
+        assert!(node.reusable_call.is_some());
+    }
+
+    // Expand level 9 leaf jobs
+    let level9 = parse_workflow(&reusable[".github/workflows/level9.yml"]).unwrap();
+    let expanded =
+        crate::expand_reusable_call(&level9, &node, &reusable, &BTreeMap::new()).unwrap();
+    assert_eq!(expanded.jobs.len(), 1);
+    assert!(expanded.jobs[0].reusable_call.is_none());
+}
+
+#[test]
 fn reusable_workflow_max_depth_exceeded() {
     let caller = parse_workflow(
         r#"
@@ -1118,53 +1522,153 @@ jobs:
     .unwrap();
 
     let mut reusable = BTreeMap::new();
-    reusable.insert(
-        ".github/workflows/level1.yml".to_owned(),
-        "on: { workflow_call: {} }\njobs:\n  call2:\n    uses: ./.github/workflows/level2.yml"
-            .to_owned(),
-    );
-    reusable.insert(
-        ".github/workflows/level2.yml".to_owned(),
-        "on: { workflow_call: {} }\njobs:\n  call3:\n    uses: ./.github/workflows/level3.yml"
-            .to_owned(),
-    );
-    reusable.insert(
-        ".github/workflows/level3.yml".to_owned(),
-        "on: { workflow_call: {} }\njobs:\n  call4:\n    uses: ./.github/workflows/level4.yml"
-            .to_owned(),
-    );
-    reusable.insert(
-        ".github/workflows/level4.yml".to_owned(),
-        "on: { workflow_call: {} }\njobs:\n  call5:\n    uses: ./.github/workflows/level5.yml"
-            .to_owned(),
-    );
-    reusable.insert(
-            ".github/workflows/level5.yml".to_owned(),
-            "on: { workflow_call: {} }\njobs:\n  test:\n    runs-on: ubuntu-latest\n    steps:\n      - run: echo leaf".to_owned(),
+    for i in 1..10 {
+        reusable.insert(
+            format!(".github/workflows/level{i}.yml"),
+            format!("on: {{ workflow_call: {{}} }}\njobs:\n  call{}:\n    uses: ./.github/workflows/level{}.yml", i + 1, i + 1),
         );
+    }
+    reusable.insert(
+        ".github/workflows/level10.yml".to_owned(),
+        "on: { workflow_call: {} }\njobs:\n  test:\n    runs-on: ubuntu-latest\n    steps:\n      - run: echo leaf"
+            .to_owned(),
+    );
 
-    // Deferred materialization: the root expansion emits a single caller node.
-    // Depth is enforced when each nested caller's subtree is expanded at
-    // runtime — the fifth nested call exceeds the limit of four.
-    let root = expand_jobs_with_reusables(&caller, &reusable).unwrap();
-    assert_eq!(root.jobs.len(), 1);
-    let mut node = root.jobs[0].clone();
+    // 10 levels of nested reusable workflows means 11 workflow levels total, which exceeds the max depth of 10.
+    let root_res = expand_jobs_with_reusables(&caller, &reusable);
+    assert!(matches!(
+        root_res.unwrap_err(),
+        ParserError::MaxNestingDepthExceeded
+    ));
+}
 
-    for level in 1..=3 {
-        let called =
-            parse_workflow(&reusable[&format!(".github/workflows/level{level}.yml")]).unwrap();
-        let expanded =
-            crate::expand_reusable_call(&called, &node, &reusable, &BTreeMap::new()).unwrap();
-        node = expanded.jobs[0].clone();
-        assert!(node.reusable_call.is_some());
+#[test]
+fn reusable_workflow_max_unique_succeeds() {
+    // Caller references 50 unique reusable workflows across 50 jobs.
+    let mut caller_yaml = "on: push\njobs:\n".to_owned();
+    let mut reusable = BTreeMap::new();
+    for i in 1..=50 {
+        caller_yaml.push_str(&format!(
+            "  job{i}:\n    uses: ./.github/workflows/sub{i}.yml\n"
+        ));
+        reusable.insert(
+            format!(".github/workflows/sub{i}.yml"),
+            "on: { workflow_call: {} }\njobs:\n  leaf:\n    runs-on: ubuntu-latest\n    steps:\n      - run: echo ok".to_owned(),
+        );
     }
 
-    let level4 = parse_workflow(&reusable[".github/workflows/level4.yml"]).unwrap();
-    let res = crate::expand_reusable_call(&level4, &node, &reusable, &BTreeMap::new());
+    let caller = parse_workflow(&caller_yaml).unwrap();
+    let root = expand_jobs_with_reusables(&caller, &reusable);
+    assert!(root.is_ok(), "50 unique reusable workflows must be allowed");
+    assert_eq!(root.unwrap().jobs.len(), 50);
+}
+
+#[test]
+fn reusable_workflow_max_unique_exceeded() {
+    // Caller references 51 unique reusable workflows across 51 jobs.
+    let mut caller_yaml = "on: push\njobs:\n".to_owned();
+    let mut reusable = BTreeMap::new();
+    for i in 1..=51 {
+        caller_yaml.push_str(&format!(
+            "  job{i}:\n    uses: ./.github/workflows/sub{i}.yml\n"
+        ));
+        reusable.insert(
+            format!(".github/workflows/sub{i}.yml"),
+            "on: { workflow_call: {} }\njobs:\n  leaf:\n    runs-on: ubuntu-latest\n    steps:\n      - run: echo ok".to_owned(),
+        );
+    }
+
+    let caller = parse_workflow(&caller_yaml).unwrap();
+    let res = expand_jobs_with_reusables(&caller, &reusable);
+    assert!(matches!(
+        res.unwrap_err(),
+        ParserError::MaxReusableWorkflowsExceeded {
+            count: 51,
+            limit: 50
+        }
+    ));
+}
+
+#[test]
+fn reusable_workflow_duplicate_calls_do_not_count_towards_unique_limit() {
+    // Caller calls 2 unique reusable workflows across 60 jobs.
+    let mut caller_yaml = "on: push\njobs:\n".to_owned();
+    let mut reusable = BTreeMap::new();
+    reusable.insert(
+        ".github/workflows/subA.yml".to_owned(),
+        "on: { workflow_call: {} }\njobs:\n  leaf:\n    runs-on: ubuntu-latest\n    steps:\n      - run: echo A".to_owned(),
+    );
+    reusable.insert(
+        ".github/workflows/subB.yml".to_owned(),
+        "on: { workflow_call: {} }\njobs:\n  leaf:\n    runs-on: ubuntu-latest\n    steps:\n      - run: echo B".to_owned(),
+    );
+    for i in 1..=60 {
+        let target = if i % 2 == 0 { "subA" } else { "subB" };
+        caller_yaml.push_str(&format!(
+            "  job{i}:\n    uses: ./.github/workflows/{target}.yml\n"
+        ));
+    }
+
+    let caller = parse_workflow(&caller_yaml).unwrap();
+    let root = expand_jobs_with_reusables(&caller, &reusable);
+    assert!(root.is_ok(), "60 calls to 2 unique workflows must succeed");
+    assert_eq!(root.unwrap().jobs.len(), 60);
+}
+
+#[test]
+fn reusable_workflow_cycle_detected() {
+    let caller = parse_workflow(
+        r#"
+on: push
+jobs:
+  call1:
+    uses: ./.github/workflows/cycleA.yml
+"#,
+    )
+    .unwrap();
+
+    let mut reusable = BTreeMap::new();
+    reusable.insert(
+        ".github/workflows/cycleA.yml".to_owned(),
+        "on: { workflow_call: {} }\njobs:\n  callB:\n    uses: ./.github/workflows/cycleB.yml"
+            .to_owned(),
+    );
+    reusable.insert(
+        ".github/workflows/cycleB.yml".to_owned(),
+        "on: { workflow_call: {} }\njobs:\n  callA:\n    uses: ./.github/workflows/cycleA.yml"
+            .to_owned(),
+    );
+
+    let res = expand_jobs_with_reusables(&caller, &reusable);
     assert!(matches!(
         res.unwrap_err(),
         ParserError::MaxNestingDepthExceeded
     ));
+}
+
+#[test]
+fn reusable_workflow_dollar_slash_alias_canonicalized() {
+    // Caller calls 50 workflows, mixing `./` and `$/` prefixes for the same 50 workflow files.
+    // E.g., 50 called with `./` and 50 with `$/` across 100 jobs, referring to 50 distinct files.
+    let mut caller_yaml = "on: push\njobs:\n".to_owned();
+    let mut reusable = BTreeMap::new();
+    for i in 1..=50 {
+        caller_yaml.push_str(&format!(
+            "  job_dot_{i}:\n    uses: ./.github/workflows/sub{i}.yml\n  job_dollar_{i}:\n    uses: $/.github/workflows/sub{i}.yml\n"
+        ));
+        reusable.insert(
+            format!(".github/workflows/sub{i}.yml"),
+            "on: { workflow_call: {} }\njobs:\n  leaf:\n    runs-on: ubuntu-latest\n    steps:\n      - run: echo ok".to_owned(),
+        );
+    }
+
+    let caller = parse_workflow(&caller_yaml).unwrap();
+    let root = expand_jobs_with_reusables(&caller, &reusable);
+    assert!(
+        root.is_ok(),
+        "Mixing ./ and $/ for the same 50 files must canonicalize to 50 unique workflows, not 100"
+    );
+    assert_eq!(root.unwrap().jobs.len(), 100);
 }
 
 #[test]
@@ -1505,34 +2009,156 @@ jobs:
 }
 
 #[test]
-fn job_defaults_run_working_directory_rejects_secrets_and_accepts_matrix() {
-    let invalid = parse_workflow(
-        r#"on: push
+fn job_defaults_run_rejects_all_expressions() {
+    for expression in ["secrets.WORKING_DIR", "matrix.directory"] {
+        let result = parse_workflow(&format!(
+            r#"on: push
 jobs:
   build:
     runs-on: ubuntu-latest
     defaults:
       run:
-        working-directory: ${{ secrets.WORKING_DIR }}
+        working-directory: ${{{{ {expression} }}}}
+    steps:
+      - run: echo ok
+"#
+        ));
+        match result {
+            Err(ParserError::InvalidExpression(message)) => {
+                assert!(
+                    message.contains("working-directory"),
+                    "working-directory field context missing from error: {message}"
+                );
+            }
+            other => panic!("expected invalid defaults expression, got {other:?}"),
+        }
+    }
+}
+
+#[test]
+fn workflow_defaults_run_working_directory_rejects_secrets() {
+    let result = parse_workflow(
+        r#"on: push
+defaults:
+  run:
+    working-directory: ${{ secrets.WORKING_DIR }}
+jobs:
+  build:
+    runs-on: ubuntu-latest
     steps:
       - run: echo ok
 "#,
     );
 
-    match invalid {
+    match result {
+        Err(ParserError::InvalidExpression(message)) => {
+            assert!(message.contains("workflow defaults.run.working-directory"));
+            assert!(message.contains("secrets"));
+        }
+        other => panic!("expected invalid workflow defaults expression, got {other:?}"),
+    }
+}
+
+#[test]
+fn workflow_defaults_run_rejects_matrix_expressions() {
+    let result = parse_workflow(
+        r#"on: push
+defaults:
+  run:
+    shell: ${{ matrix.shell }}
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - run: echo ok
+"#,
+    );
+    assert!(
+        matches!(result, Err(ParserError::InvalidExpression(message)) if
+        message.contains("workflow defaults.run.shell"))
+    );
+}
+
+/// Workflow-level `defaults.run` must reach each `StepPlan`, not only the wire
+/// `defaults` field: preloop's own runner executes from the flattened plan, so
+/// omitting it runs scripts with the wrong shell and working directory.
+/// Precedence is step > job defaults > workflow defaults, per key.
+#[test]
+fn workflow_defaults_run_flattens_onto_steps_beneath_job_defaults() {
+    let workflow = parse_workflow(
+        r#"on: push
+defaults:
+  run:
+    shell: bash
+    working-directory: /workflow
+jobs:
+  inherits:
+    runs-on: ubuntu-latest
+    steps:
+      - run: echo hi
+  overrides:
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: /job
+    steps:
+      - run: echo hi
+      - run: echo hi
+        working-directory: /step
+"#,
+    )
+    .unwrap();
+    let plans = expand_jobs(&workflow).unwrap();
+    let job = |id: &str| plans.iter().find(|plan| plan.base_id == id).unwrap();
+
+    let inherited = &job("inherits").steps[0];
+    assert_eq!(inherited.shell.as_deref(), Some("bash"));
+    assert_eq!(inherited.working_directory.as_deref(), Some("/workflow"));
+
+    // The job overrides only `working-directory`; `shell` still falls through.
+    let overridden = &job("overrides").steps[0];
+    assert_eq!(overridden.shell.as_deref(), Some("bash"));
+    assert_eq!(overridden.working_directory.as_deref(), Some("/job"));
+
+    assert_eq!(
+        job("overrides").steps[1].working_directory.as_deref(),
+        Some("/step")
+    );
+}
+
+/// The official schema types `timeout-minutes` as `number`
+/// (`workflow-v1.0.json`: `step-timeout-minutes` → `"number": {}`), and a
+/// template number is a double — so generated YAML rendering `5` as `5.0` is
+/// valid input. Rejecting it at deserialization failed the *entire* workflow,
+/// not just the field.
+#[test]
+fn decimal_step_timeout_is_accepted_and_fractions_are_rejected() {
+    let workflow_with = |timeout: &str| {
+        format!(
+            "on: push\njobs:\n  build:\n    runs-on: ubuntu-latest\n    steps:\n      - run: echo ok\n        timeout-minutes: {timeout}\n"
+        )
+    };
+
+    let workflow = parse_workflow(&workflow_with("5.0")).expect("`5.0` is a valid number");
+    let jobs = expand_jobs(&workflow).unwrap();
+    assert_eq!(jobs[0].steps[0].timeout_in_minutes, Some(5));
+
+    // A fraction is not a whole number of minutes; reject it rather than
+    // truncating a `2.5` into a two-minute timeout.
+    let workflow = parse_workflow(&workflow_with("2.5")).expect("`2.5` still parses as a number");
+    match expand_jobs(&workflow) {
         Err(ParserError::InvalidExpression(message)) => {
             assert!(
-                message.contains("working-directory"),
-                "working-directory field context missing from error: {message}"
-            );
-            assert!(
-                message.contains("secrets"),
-                "forbidden context missing from error: {message}"
+                message.contains("2.5"),
+                "error must name the value: {message}"
             );
         }
-        other => panic!("expected invalid defaults expression, got {other:?}"),
+        other => panic!("expected a whole-number rejection, got {other:?}"),
     }
+}
 
+#[test]
+fn step_timeout_expression_resolves_and_range_is_checked() {
     let workflow = parse_workflow(
         r#"on: push
 jobs:
@@ -1540,24 +2166,29 @@ jobs:
     runs-on: ubuntu-latest
     strategy:
       matrix:
-        directory: [workspace]
-    defaults:
-      run:
-        working-directory: ${{ matrix.directory }}
+        timeout: [5]
     steps:
-      - run: echo ok
+      - name: bounded
+        timeout-minutes: ${{ matrix.timeout }}
+        run: echo ok
 "#,
     )
-    .expect("matrix context is allowed in job defaults.run.working-directory");
+    .unwrap();
+    let jobs = expand_jobs(&workflow).unwrap();
+    assert_eq!(jobs[0].steps[0].timeout_in_minutes, Some(5));
 
-    assert_eq!(
-        workflow.jobs["build"]
-            .defaults
-            .as_ref()
-            .and_then(|defaults| defaults.run.as_ref())
-            .and_then(|run| run.working_directory.as_deref()),
-        Some("${{ matrix.directory }}")
-    );
+    for (value, expected) in [(0, "1 through 360"), (361, "1 through 360")] {
+        let workflow = parse_workflow(&format!(
+            "on: push\njobs:\n  build:\n    runs-on: ubuntu-latest\n    steps:\n      - name: bounded\n        timeout-minutes: {value}\n        run: echo ok\n"
+        ))
+        .unwrap();
+        match expand_jobs(&workflow) {
+            Err(ParserError::InvalidStepTimeout { message, .. }) => {
+                assert!(message.contains(expected));
+            }
+            other => panic!("expected invalid timeout for {value}, got {other:?}"),
+        }
+    }
 }
 
 #[test]

@@ -9,6 +9,9 @@ pub(crate) async fn next_message(
         .get("sessionId")
         .cloned()
         .unwrap_or_else(|| "default".to_owned());
+    let verified = identity
+        .as_ref()
+        .and_then(|axum::Extension(id)| id.runner_id);
 
     let wait_seconds = params
         .get("waitSeconds")
@@ -17,6 +20,11 @@ pub(crate) async fn next_message(
 
     loop {
         let mut inner = shared.state.inner.lock().await;
+        if let Some(runner_id) = verified {
+            if inner.runner_id_for_session(&session_id) != Some(runner_id) {
+                return (StatusCode::FORBIDDEN, Json(None));
+            }
+        }
         inner.mark_session_seen(&session_id);
         if let Some(message) = inner
             .inflight_messages
@@ -24,19 +32,6 @@ pub(crate) async fn next_message(
             .and_then(|messages| messages.values().next().cloned())
         {
             return (StatusCode::ACCEPTED, Json(Some(message)));
-        }
-
-        if let Some(cancellation) = inner.cancellation_queue.pop_front() {
-            let body_json = concurrency::job_cancel_body(cancellation.agent_job_id);
-            match build_task_agent_message(
-                &mut inner,
-                &session_id,
-                azdo::message_type::JOB_CANCELLED,
-                body_json,
-            ) {
-                Ok(message) => return (StatusCode::OK, Json(Some(message))),
-                Err(_) => return (StatusCode::ACCEPTED, Json(None)),
-            }
         }
 
         if let Some(request_id) = inner.session_active_requests.get(&session_id).copied() {
@@ -47,6 +42,28 @@ pub(crate) async fn next_message(
             if request_finished {
                 inner.session_active_requests.remove(&session_id);
             } else {
+                let cancellation_pos = inner.job_requests.get(&request_id).and_then(|request| {
+                    inner.cancellation_queue.iter().position(|cancellation| {
+                        cancellation.run_id == request.run_id
+                            && cancellation.job_id == request.job_id
+                    })
+                });
+                if let Some(pos) = cancellation_pos {
+                    let cancellation = inner
+                        .cancellation_queue
+                        .remove(pos)
+                        .expect("cancellation position was found in the queue");
+                    let body_json = concurrency::job_cancel_body(cancellation.agent_job_id);
+                    match build_task_agent_message(
+                        &mut inner,
+                        &session_id,
+                        azdo::message_type::JOB_CANCELLED,
+                        body_json,
+                    ) {
+                        Ok(message) => return (StatusCode::OK, Json(Some(message))),
+                        Err(_) => return (StatusCode::ACCEPTED, Json(None)),
+                    }
+                }
                 drop(inner);
                 if wait_seconds == 0 {
                     return (StatusCode::OK, Json(None));
@@ -135,10 +152,12 @@ pub(crate) async fn next_message(
             Err(_) => return (StatusCode::ACCEPTED, Json(None)),
         };
         let request_id = queued.message.request_id;
+        let owner_runner_id = verified.or_else(|| inner.runner_id_for_session(&session_id));
         inner
             .session_active_requests
             .insert(session_id.clone(), request_id);
         if let Some(request) = inner.job_requests.get_mut(&request_id) {
+            request.owner_runner_id = owner_runner_id;
             request.started_at = Some(std::time::SystemTime::now());
         }
         let message = build_task_agent_message(
@@ -240,9 +259,16 @@ pub(crate) fn build_broker_plaintext_message(
 pub(crate) async fn delete_pool_message(
     State(shared): State<Arc<SharedState>>,
     Path((_pool_id, message_id)): Path<(i64, i64)>,
+    identity: Option<axum::Extension<RunnerIdentity>>,
     Query(params): Query<std::collections::HashMap<String, String>>,
 ) -> StatusCode {
     let session_id = params.get("sessionId").map(String::as_str).unwrap_or("");
+    if let Some(runner_id) = identity.and_then(|axum::Extension(id)| id.runner_id) {
+        let inner = shared.state.inner.lock().await;
+        if inner.runner_id_for_session(session_id) != Some(runner_id) {
+            return StatusCode::FORBIDDEN;
+        }
+    }
     ack_message(shared, session_id, message_id).await
 }
 
@@ -284,6 +310,9 @@ pub(crate) async fn complete_job_compat(
         JobCompletion {
             run_id,
             job_id: JobId(job_id),
+            // The compat route is addressed by logical job only, so the
+            // server resolves the newest attempt itself.
+            agent_job_id: None,
             status,
             outputs: Default::default(),
             annotations: Vec::new(),
@@ -292,29 +321,85 @@ pub(crate) async fn complete_job_compat(
     )
     .await
 }
+pub(crate) async fn complete_job_compat_authenticated(
+    State(shared): State<Arc<SharedState>>,
+    Path(path): Path<(RunId, String)>,
+    headers: HeaderMap,
+    Json(body): Json<serde_json::Value>,
+) -> Result<Json<RunRecord>, ApiError> {
+    let target = {
+        let inner = shared.state.inner.lock().await;
+        inner
+            .job_requests
+            .values()
+            .filter(|request| request.run_id == path.0 && request.job_id.0 == path.1)
+            .max_by_key(|request| request.request_id)
+            .cloned()
+    };
+    crate::auth::authorize_reporting_request(&shared.state, &headers, target.as_ref())?;
+    complete_job_compat(State(shared), Path(path), Json(body)).await
+}
+
+fn runner_owns_agent_request(inner: &InnerState, request_id: i64, runner_id: i64) -> bool {
+    if let Some(owner) = inner
+        .job_requests
+        .get(&request_id)
+        .and_then(|request| request.owner_runner_id)
+    {
+        return owner == runner_id;
+    }
+    inner
+        .session_active_requests
+        .iter()
+        .any(|(session_id, active_id)| {
+            *active_id == request_id && inner.runner_id_for_session(session_id) == Some(runner_id)
+        })
+}
 
 /// GET /_apis/v1/AgentRequest/:pool_id/:request_id to query a job request lease/result.
 ///
 /// The official listener calls this when another job arrives while the previous
 /// worker process may still be unwinding. Returning a completed `result` lets it
-/// safely move on; 404/405 makes it cancel the worker and can poison matrix runs.
+/// safely move on; the request's retained owner keeps this post-completion read
+/// bound to the runner that handled the attempt. 404/405 makes it cancel the
+/// worker and can poison matrix runs.
 pub(crate) async fn agent_request_get(
     State(shared): State<Arc<SharedState>>,
     Path((pool_id, request_id)): Path<(i64, i64)>,
+    identity: Option<axum::Extension<RunnerIdentity>>,
 ) -> Result<Json<serde_json::Value>, ApiError> {
     let inner = shared.state.inner.lock().await;
     let request = inner
         .job_requests
         .get(&request_id)
         .ok_or_else(|| ApiError::not_found("agent request not found"))?;
+    if let Some(runner_id) = identity.and_then(|axum::Extension(id)| id.runner_id) {
+        if !runner_owns_agent_request(&inner, request_id, runner_id) {
+            return Err(ApiError::forbidden(
+                "agent request belongs to another runner",
+            ));
+        }
+    }
     Ok(Json(agent_request_json(pool_id, request)))
 }
 
 /// POST /_apis/v1/AgentRequest/:pool_id/:request_id — best-effort request ack.
 pub(crate) async fn agent_request_ack(
-    Path((_pool_id, _request_id)): Path<(i64, i64)>,
-) -> StatusCode {
-    StatusCode::OK
+    State(shared): State<Arc<SharedState>>,
+    Path((_pool_id, request_id)): Path<(i64, i64)>,
+    identity: Option<axum::Extension<RunnerIdentity>>,
+) -> Result<StatusCode, ApiError> {
+    if let Some(runner_id) = identity.and_then(|axum::Extension(id)| id.runner_id) {
+        let inner = shared.state.inner.lock().await;
+        if inner.job_requests.contains_key(&request_id)
+            && !runner_owns_agent_request(&inner, request_id, runner_id)
+        {
+            return Err(ApiError::forbidden(
+                "agent request belongs to another runner",
+            ));
+        }
+    }
+    Ok(StatusCode::OK)
 }
 
 /// PATCH /_apis/v1/AgentRequest/:pool_id/:request_id — renew or complete job request.
@@ -322,8 +407,9 @@ pub(crate) async fn agent_request_ack(
 pub(crate) async fn agent_request_patch(
     State(shared): State<Arc<SharedState>>,
     Path((pool_id, request_id)): Path<(i64, i64)>,
+    identity: Option<axum::Extension<RunnerIdentity>>,
     Json(body): Json<serde_json::Value>,
-) -> Json<serde_json::Value> {
+) -> Result<Json<serde_json::Value>, ApiError> {
     // `result` is untyped request content; never log it raw. Derive a fixed
     // label from the status mapping instead ("success"/"failure"/…, or
     // "unknown"/"renew").
@@ -350,6 +436,7 @@ pub(crate) async fn agent_request_patch(
     // If this is a completion (has result), delegate to complete_job_inner
     // so summarize_run, promote_ready_jobs, and notify_waiters all fire.
     // The result field is only present on the final PATCH; renewals have no result.
+    let verified_runner_id = identity.and_then(|axum::Extension(id)| id.runner_id);
     if let Some(result) = body.get("result").and_then(|v| v.as_str()) {
         let new_status = match execution_status_from_runner_result(result) {
             Some(status) => status,
@@ -359,66 +446,103 @@ pub(crate) async fn agent_request_patch(
                         result = %result_hint,
                         "unknown agent_request_patch result; skipping completion"
                 );
-                return Json(
+                return Ok(Json(
                     json!({ "requestId": request_id, "lockedUntil": agent_request_locked_until() }),
-                );
+                ));
             }
         };
         // Look up (run_id, job_id) under the inner lock, then drop it before calling
         // complete_job_inner which acquires the lock itself.
         let completion = {
             let mut inner = shared.state.inner.lock().await;
-            let mut already_completed = false;
-            if let Some(request) = inner.job_requests.get_mut(&request_id) {
-                already_completed = request.result.is_some();
-                request.result = Some(new_status);
-                request.locked_until = agent_request_locked_until();
+            if let Some(runner_id) = verified_runner_id {
+                if inner.job_requests.contains_key(&request_id)
+                    && !runner_owns_agent_request(&inner, request_id, runner_id)
+                {
+                    return Err(ApiError::forbidden(
+                        "agent request belongs to another runner",
+                    ));
+                }
             }
+            let already_completed = inner
+                .job_requests
+                .get(&request_id)
+                .is_some_and(|request| request.result.is_some());
             if already_completed {
-                inner.inflight_requests.remove(&request_id);
                 info!(
                     request_id,
                     result = %result_hint,
-                    "agent request already completed; refreshing result only"
+                    "agent request already completed; ignoring duplicate completion"
                 );
                 None
-            } else if let Some((run_id, job_id)) = inner.inflight_requests.remove(&request_id) {
-                info!(
-                    %run_id,
-                    %job_id,
-                    result = %result_hint,
-                    "job completed via agent_request_patch"
-                );
-                Some(JobCompletion {
-                    run_id,
-                    job_id,
-                    status: new_status,
-                    outputs: Default::default(),
-                    annotations: Vec::new(),
-                    step_results: Vec::new(),
-                })
             } else {
-                info!(
-                    request_id,
-                    "no inflight job for request_id; ignoring result"
-                );
-                None
+                if let Some(request) = inner.job_requests.get_mut(&request_id) {
+                    request.result = Some(new_status);
+                    request.locked_until = agent_request_locked_until();
+                }
+                if let Some((run_id, job_id)) = inner.inflight_requests.remove(&request_id) {
+                    info!(
+                        %run_id,
+                        %job_id,
+                        result = %result_hint,
+                        "job completed via agent_request_patch"
+                    );
+                    Some(JobCompletion {
+                        run_id,
+                        job_id,
+                        // The patched request is the attempt that reported.
+                        agent_job_id: inner
+                            .job_requests
+                            .get(&request_id)
+                            .map(|record| record.agent_job_id),
+                        status: new_status,
+                        outputs: Default::default(),
+                        annotations: Vec::new(),
+                        step_results: Vec::new(),
+                    })
+                } else {
+                    info!(
+                        request_id,
+                        "no inflight job for request_id; ignoring result"
+                    );
+                    None
+                }
             }
         };
         if let Some(c) = completion {
             let _ = complete_job_inner(shared.clone(), c).await;
         }
-        return Json(agent_request_response(&shared, pool_id, request_id).await);
+        return Ok(Json(
+            agent_request_response(&shared, pool_id, request_id).await,
+        ));
     }
-    // Renewal — runner is still working; just extend the lock.
+    // Renewal — runner is still working; just extend the lock. Completed
+    // requests are immutable, so a late duplicate cannot rewrite their timing.
     {
         let mut inner = shared.state.inner.lock().await;
-        if let Some(request) = inner.job_requests.get_mut(&request_id) {
-            request.locked_until = agent_request_locked_until();
-            request.last_renewed_at = Some(std::time::SystemTime::now());
+        if let Some(runner_id) = verified_runner_id {
+            if inner.job_requests.contains_key(&request_id)
+                && !runner_owns_agent_request(&inner, request_id, runner_id)
+            {
+                return Err(ApiError::forbidden(
+                    "agent request belongs to another runner",
+                ));
+            }
+        }
+        let request_active = inner
+            .job_requests
+            .get(&request_id)
+            .is_some_and(|request| request.result.is_none());
+        if request_active {
+            if let Some(request) = inner.job_requests.get_mut(&request_id) {
+                request.locked_until = agent_request_locked_until();
+                request.last_renewed_at = Some(std::time::SystemTime::now());
+            }
         }
     }
-    Json(agent_request_response(&shared, pool_id, request_id).await)
+    Ok(Json(
+        agent_request_response(&shared, pool_id, request_id).await,
+    ))
 }
 
 pub(crate) async fn agent_request_response(
@@ -639,46 +763,22 @@ pub(crate) async fn complete_job_inner(
         };
         run.jobs.insert(completion.job_id.clone(), effective);
         let job_name = completion.job_id.0.clone();
-        if let Some(pos) = run.jobs_list.iter().position(|j| j.name == job_name) {
-            run.jobs_list[pos].conclusion = format!("{:?}", effective).to_lowercase();
-            // A worker can terminate through ForceFailJob before it sends the
-            // final WorkflowStepsUpdate. Do not leave the last reported step
-            // in_progress after its job is terminal.
-            //
-            // The official runner carries the authoritative per-step
-            // conclusions in CompleteJob.stepResults (status=TimelineRecordState,
-            // conclusion=TaskResult); apply them first. A crashed worker sends
-            // none, and any step still in_progress after that is reconciled to
-            // the job's effective status — the same view GitHub's server
-            // presents for orphaned steps.
-            for step in &mut run.jobs_list[pos].steps {
-                let Some(wire) = completion
-                    .step_results
-                    .iter()
-                    .find(|result| result.name.as_deref() == Some(step.name.as_str()))
-                else {
-                    continue;
-                };
-                if let Some(conclusion) = completion_step_conclusion(wire) {
-                    step.conclusion = conclusion;
-                }
-            }
-            let step_conclusion = status_string(effective);
-            for step in &mut run.jobs_list[pos].steps {
-                if step.conclusion == "in_progress" {
-                    step.conclusion = step_conclusion.clone();
-                    step.finished_at = step.finished_at.or(Some(chrono::Utc::now()));
-                }
-            }
+        // Masked up front: `mask_completion_annotations` reads the run's
+        // secrets, which cannot be borrowed while a job detail inside the same
+        // run is held mutably.
+        let annotations = mask_completion_annotations(run, &completion);
+        if let Some(detail) = JobDetail::find(&mut run.jobs_list, &job_name) {
+            detail.conclusion = format!("{:?}", effective).to_lowercase();
             if !completion.annotations.is_empty() {
-                run.jobs_list[pos].annotations = mask_completion_annotations(run, &completion);
+                detail.annotations = annotations;
             }
         } else {
             run.jobs_list.push(JobDetail {
+                job_id: job_name.clone(),
                 name: job_name,
                 conclusion: format!("{:?}", effective).to_lowercase(),
                 steps: Vec::new(),
-                annotations: mask_completion_annotations(run, &completion),
+                annotations,
             });
         }
         run.job_outputs.insert(
@@ -710,12 +810,93 @@ pub(crate) async fn complete_job_inner(
             newly_terminal_success = run.status == ExecutionStatus::Success;
         }
     }
+    // Close only after the run and job were validated and the completion was
+    // projected. Invalid callbacks must not terminate another job's feed.
+    //
+    // Same attempt selection as the manifest reconciliation below: a
+    // re-dispatched job has several matching requests, and closing the oldest
+    // one's feed leaves the attempt that actually finished streaming forever
+    // while a follower on the dead key waits for output that never comes.
+    let live_log_key = completion
+        .agent_job_id
+        .or_else(|| {
+            inner
+                .job_requests
+                .values()
+                .filter(|record| {
+                    record.run_id == completion.run_id && record.job_id == completion.job_id
+                })
+                .max_by_key(|record| record.request_id)
+                .map(|record| record.agent_job_id)
+        })
+        .map(|agent_job_id| agent_job_id.to_string())
+        .unwrap_or_else(|| completion.job_id.0.clone());
+    crate::live_logs::close_live_log(&mut inner, &live_log_key);
     // Use the status actually stored (may differ from completion if terminal-locked).
     let effective_status = inner
         .runs
         .get(&completion.run_id)
         .and_then(|r| r.jobs.get(&completion.job_id).copied())
         .unwrap_or(completion.status);
+    // Reconcile the attempt's step manifest against the completion report.
+    //
+    // The official runner carries the authoritative per-step conclusions in
+    // `CompleteJob.stepResults` (status=TimelineRecordState,
+    // conclusion=TaskResult) keyed by `external_id` — the same identity the
+    // manifest uses, so this no longer matches on display names. A crashed
+    // worker sends none, and any step left `in_progress` afterwards is
+    // reconciled to the job's effective status, the view GitHub presents for
+    // orphaned steps. A step still `pending` was never reached, which stays
+    // truthful rather than inheriting the job's failure.
+    //
+    // The attempt comes from the callback itself. Deriving it from
+    // `(run_id, job_id)` picked whichever request the map yielded first, and
+    // `job_requests` is keyed by monotonic request id — so a re-dispatched job
+    // reconciled the *newest* attempt's report into the *oldest* attempt's
+    // manifest, where its ids match nothing, and terminalized that older
+    // attempt's steps while the run view still projected the newer one as
+    // in-flight. When the caller could not resolve an attempt, the newest
+    // request is the only defensible guess.
+    let mut completed_attempt: Option<(uuid::Uuid, Vec<StepRecord>)> = None;
+    let mut completion_revision = 0_u64;
+    if let Some(agent_job_id) = completion.agent_job_id.or_else(|| {
+        inner
+            .job_requests
+            .values()
+            .filter(|record| {
+                record.run_id == completion.run_id && record.job_id == completion.job_id
+            })
+            .max_by_key(|record| record.request_id)
+            .map(|record| record.agent_job_id)
+    }) {
+        if let Some(manifest) = inner.job_steps.get_mut(&agent_job_id) {
+            for wire in &completion.step_results {
+                let Some(external_id) = wire.external_id.as_deref() else {
+                    continue;
+                };
+                let Some(pos) = StepRecord::find_by_id(manifest, external_id) else {
+                    continue;
+                };
+                if let Some(conclusion) = completion_step_conclusion(wire) {
+                    manifest[pos].conclusion = conclusion;
+                }
+                if let Some(number) = wire.number.and_then(|n| u32::try_from(n).ok()) {
+                    manifest[pos].runner_number = Some(number);
+                }
+            }
+            let orphan_conclusion = status_string(effective_status);
+            for step in manifest.iter_mut() {
+                if step.conclusion == "in_progress" {
+                    step.conclusion = orphan_conclusion.clone();
+                    step.finished_at = step.finished_at.or(Some(chrono::Utc::now()));
+                }
+            }
+            completed_attempt = Some((agent_job_id, manifest.clone()));
+            let counter = inner.job_steps_revision.entry(agent_job_id).or_insert(0);
+            *counter += 1;
+            completion_revision = *counter;
+        }
+    }
     let cancelled_siblings = if effective_status == ExecutionStatus::Failure {
         apply_matrix_fail_fast(&mut inner, completion.run_id, &completion.job_id)
     } else {
@@ -783,20 +964,27 @@ pub(crate) async fn complete_job_inner(
         // unreachable — the job is out of every dispatchable collection.
         inner.github_token_requests.remove(request_id);
     }
-    // Evict live-log state for this job to prevent unbounded memory growth.
-    // The durable step-log blob has already been uploaded by the runner.
-    if let Some(agent_key) = inner
-        .job_requests
-        .values()
-        .find(|r| r.run_id == completion.run_id && r.job_id == completion.job_id)
-        .map(|r| r.agent_job_id.to_string())
-    {
-        inner.live_log_lines.remove(&agent_key);
-        inner.live_log_tx.remove(&agent_key);
-    }
     inner.dap_ports.remove(&completion.run_id);
     let queue_nonempty = !inner.queue.is_empty() || !inner.cancellation_queue.is_empty();
     drop(inner);
+    // Best-effort, outside the lock: the completion's own step conclusions
+    // must survive a restart, and the run-event projection deliberately no
+    // longer carries step rows.
+    if let Some((agent_job_id, records)) = completed_attempt {
+        if let Err(error) = shared
+            .state
+            .store
+            .store_job_steps(
+                completion.run_id,
+                agent_job_id,
+                &records,
+                completion_revision,
+            )
+            .await
+        {
+            warn!(?error, run_id = %completion.run_id, "failed to persist completion step records");
+        }
+    }
 
     // Any reusable-caller or dynamic-matrix node the sweep above unblocked was
     // deferred rather than expanded under the lock. Build those subtrees now

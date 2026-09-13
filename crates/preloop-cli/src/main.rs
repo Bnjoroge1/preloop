@@ -7,8 +7,8 @@ use futures_util::StreamExt;
 use preloop_gha_protocol::{ExecutionStatus, NdjsonEvent, RunAccepted, RunId, WorkflowSubmission};
 use preloop_orchestrator::environment::{is_stock_base_image, DEFAULT_BASE_IMAGE};
 use preloop_orchestrator::{artifact_payload, RunnerPool, RunnerPoolConfig};
+use preloop_runner_server::credential_store::{CredentialStore, OsCredentialStore};
 use preloop_vm::SmolVmProvider;
-use rand::RngCore;
 use std::collections::BTreeMap;
 use std::collections::HashSet;
 use std::io::Read;
@@ -357,10 +357,23 @@ pub(crate) fn api_token() -> Option<String> {
         .or_else(|_| std::env::var("PRELOOP_SYSTEM_TOKEN"))
         .ok()
         .or_else(|| {
-            std::fs::read_to_string(preloop_home().join("engine.token"))
+            preloop_runner_server::credential_store::load_engine_token(&preloop_home())
                 .ok()
-                .map(|token| token.trim().to_owned())
-                .filter(|token| !token.is_empty())
+                .flatten()
+        })
+        .or_else(|| {
+            // Standalone `serve` without PRELOOP_HOME stores under its
+            // state dir (default `./.preloop` in the server's cwd), while
+            // preloop_home() prefers `$HOME/.preloop`. Try the cwd default
+            // so a CLI run from the same directory finds it.
+            let home = preloop_home();
+            let cwd_default = std::path::PathBuf::from(".preloop");
+            if home == cwd_default {
+                return None;
+            }
+            preloop_runner_server::credential_store::load_engine_token(&cwd_default)
+                .ok()
+                .flatten()
         })
 }
 
@@ -478,12 +491,9 @@ enum Command {
     /// Show the expanded job DAG without executing.
     Plan(PlanArgs),
 
-    /// Show active and recent runs, or the live status of one run (prints a
-    /// single machine-readable status word for scripting).
-    Status {
-        #[arg(value_name = "RUN_ID")]
-        run_id: Option<String>,
-    },
+    /// Show operational status, queue health, and recent runs — or, with a
+    /// RUN_ID, a single machine-readable status word for scripts.
+    Status(StatusArgs),
 
     Logs(LogsArgs),
 
@@ -709,17 +719,44 @@ struct PlanArgs {
 }
 
 #[derive(Debug, Parser)]
+struct StatusArgs {
+    /// Run ID: print a single machine-readable status word for scripts
+    /// (the historical `preloop status <run_id>` mode).
+    #[arg(value_name = "RUN_ID")]
+    run_id: Option<String>,
+
+    /// Print the raw status JSON (no prose) for jq/scripting.
+    #[arg(long)]
+    json: bool,
+
+    /// Number of recent runs to show in the table.
+    #[arg(long, default_value = "20")]
+    limit: usize,
+}
+
+#[derive(Debug, Parser)]
 struct LogsArgs {
     /// Run ID. Defaults to the most recent run.
     run_id: Option<String>,
 
-    /// Filter by job ID.
+    /// Filter by job: the workflow job key (`build`) or its agent job UUID.
     #[arg(long)]
     job: Option<String>,
 
-    /// Filter by step number.
+    /// Filter by 1-based step number within the job, in execution order.
+    ///
+    /// Needs `--job` when the run has more than one job, because step
+    /// numbering restarts per job.
     #[arg(long)]
-    step: Option<u32>,
+    step: Option<usize>,
+
+    /// Stream output as it arrives, like `tail -f`, and exit when the run
+    /// reaches a terminal state.
+    ///
+    /// Follows one job's live console feed, so it needs `--job` unless the run
+    /// has exactly one job. Cannot be combined with `--step`.
+    #[arg(short = 'f', long)]
+    follow: bool,
 }
 
 #[derive(Debug, Parser)]
@@ -736,18 +773,17 @@ struct ShellArgs {
 
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
-    // `fmt::init()` alone filters to ERROR when `RUST_LOG` is unset, which hid
-    // a runner pool that failed to provision 77 times in a row: every
-    // provisioning fault logs at `warn` or `info`, so the operator saw a server
-    // that accepted webhooks and silently never ran anything. Default to `info`
-    // and let `RUST_LOG` override as usual.
-    tracing_subscriber::fmt()
-        .with_env_filter(
-            tracing_subscriber::EnvFilter::try_from_default_env()
-                .unwrap_or_else(|_| tracing_subscriber::EnvFilter::new("info")),
-        )
-        .init();
-
+    // Unified observability init: one handle for the process, shared
+    // with `AppState` and `RunnerPoolConfig` later. `PRELOOP_LOG_FORMAT` now
+    // controls pretty/json/auto (auto = pretty on TTY, JSON when piped), and
+    // `RUST_LOG` defaults to `info` (the old `fmt::init()` default of ERROR hid
+    // pool provisioning faults). The runtime is held for the life of `main`
+    // and flushed with a bounded 2s shutdown on exit.
+    let obs_config = preloop_observability::ObservabilityConfig::from_env()
+        .with_service_version(env!("CARGO_PKG_VERSION"));
+    let (observability, observability_runtime) =
+        preloop_observability::Observability::from_config(obs_config);
+    observability_runtime.install_fmt_subscriber();
     let cli = Cli::parse();
     // One config path for the whole process. `setup`/`doctor`/`secret` return
     // before `cmd_engine` runs, so pinning this only inside the engine let a
@@ -762,55 +798,64 @@ async fn main() -> anyhow::Result<()> {
     }
     // Both run the daemon in this process, so neither may bootstrap another
     // one underneath itself.
-    match cli.command {
+    let result = match cli.command {
         Command::Version => {
             println!(
                 "preloop {} ({})",
                 env!("CARGO_PKG_VERSION"),
                 env!("PRELOOP_BUILD_COMMIT")
             );
-            return Ok(());
+            Ok(())
         }
-        Command::Serve(args) => return cmd_engine(args).await,
-        Command::Engine => return cmd_engine(ServeArgs::default()).await,
-        Command::BuildGolden(args) => return cmd_build_golden(args).await,
-        Command::Update(args) => return update::run(args).await,
+        Command::Serve(args) => cmd_engine(args, observability.clone()).await,
+        Command::Engine => cmd_engine(ServeArgs::default(), observability.clone()).await,
+        Command::BuildGolden(args) => cmd_build_golden(args).await,
+        Command::Update(args) => update::run(args).await,
         // Local configuration commands must not spawn the engine.
-        Command::Setup(args) => return github_setup::cmd_setup(args).await,
-        Command::Doctor(args) => return github_setup::cmd_doctor(args).await,
-        Command::Secret(args) => return github_setup::cmd_secret(args).await,
-        Command::Server(args) => return server_install::run(args),
+        Command::Setup(args) => github_setup::cmd_setup(args).await,
+        Command::Doctor(args) => github_setup::cmd_doctor(args).await,
+        Command::Secret(args) => github_setup::cmd_secret(args).await,
+        Command::Server(args) => server_install::run(args),
         // Planning parses local workflow files only; do not bootstrap the
         // control-plane engine for a command that never contacts it.
-        Command::Plan(args) => return cmd_plan(args).await,
-        _ => {}
-    }
-    ensure_engine_running().await?;
-
-    match cli.command {
-        Command::Run(args) => cmd_run(args).await,
-        Command::Plan(_) => unreachable!("plan is handled before engine bootstrap"),
-        Command::Status { run_id } => cmd_status(run_id).await,
-        Command::Logs(args) => cmd_logs(args).await,
-        Command::Cancel(args) => cmd_cancel(args).await,
-        Command::Shell(args) => cmd_shell(args).await,
-        Command::Debug(args) => {
-            debug_session::run(args, build_client(), server_url(), api_token()).await
+        Command::Plan(args) => cmd_plan(args).await,
+        _ => {
+            // Bootstrap the engine for client commands, but bind the outcome
+            // instead of `?` so the telemetry flush below still runs when
+            // engine startup fails.
+            match ensure_engine_running().await {
+                Ok(()) => match cli.command {
+                    Command::Run(args) => cmd_run(args).await,
+                    Command::Plan(_) => unreachable!("plan is handled before engine bootstrap"),
+                    Command::Status(args) => cmd_status(args).await,
+                    Command::Logs(args) => cmd_logs(args).await,
+                    Command::Cancel(args) => cmd_cancel(args).await,
+                    Command::Shell(args) => cmd_shell(args).await,
+                    Command::Debug(args) => {
+                        debug_session::run(args, build_client(), server_url(), api_token()).await
+                    }
+                    Command::Dap(args) => dap_client::run(args, server_url(), api_token()).await,
+                    Command::Push(args) => cmd_push(args).await,
+                    Command::Update(_)
+                    | Command::Serve(_)
+                    | Command::Engine
+                    | Command::BuildGolden(_)
+                    | Command::Version
+                    | Command::Setup(_)
+                    | Command::Doctor(_)
+                    | Command::Secret(_)
+                    | Command::Server(_) => {
+                        unreachable!("daemon commands handled before client startup")
+                    }
+                },
+                Err(error) => Err(error),
+            }
         }
-        Command::Dap(args) => dap_client::run(args, server_url(), api_token()).await,
-        Command::Push(args) => cmd_push(args).await,
-        Command::Update(_)
-        | Command::Serve(_)
-        | Command::Engine
-        | Command::BuildGolden(_)
-        | Command::Version
-        | Command::Setup(_)
-        | Command::Doctor(_)
-        | Command::Secret(_)
-        | Command::Server(_) => {
-            unreachable!("daemon commands handled before client startup")
-        }
-    }
+    };
+    // Bounded 2s flush of buffered telemetry on every exit path; a clean
+    // shutdown must not drop the last flush window's records.
+    observability_runtime.shutdown().await;
+    result
 }
 
 fn systemd_socket_activation_requested() -> bool {
@@ -883,7 +928,7 @@ async fn cmd_build_golden(args: BuildGoldenArgs) -> anyhow::Result<()> {
             "Linux".into(),
             std::env::consts::ARCH.into(),
         ],
-        cpus: RUNNER_CPUS,
+        cpus: runner_cpus(),
         memory_mib: runner_memory_mib(),
         storage_gib: args.storage_gib.unwrap_or_else(runner_storage_gib),
         overlay_gib: std::env::var("PRELOOP_RUNNER_OVERLAY_GB")
@@ -904,6 +949,8 @@ async fn cmd_build_golden(args: BuildGoldenArgs) -> anyhow::Result<()> {
         next_job_runs_on: None,
         pending_registrations: None,
         preparing_signal: None,
+        pool_status: None,
+        observability: None,
     };
     let payload = artifact_payload(&output, &config.base_image);
     RunnerPool::new(std::sync::Arc::new(SmolVmProvider::default()), config)?
@@ -1065,26 +1112,18 @@ async fn ensure_engine_running() -> anyhow::Result<()> {
     eprintln!("[preloop] Starting local background engine...");
 
     let preloop_dir = preloop_home();
-
     let state_dir = preloop_dir.join("state");
     let pid_path = preloop_dir.join("preloop.pid");
-    let token_path = preloop_dir.join("engine.token");
 
     std::fs::create_dir_all(&state_dir)?;
     set_private_directory_permissions(&preloop_dir)?;
 
-    let token = if let Ok(existing) = std::fs::read_to_string(&token_path) {
-        existing.trim().to_owned()
-    } else {
-        let mut bytes = [0_u8; 32];
-        rand::thread_rng().fill_bytes(&mut bytes);
-        let token = bytes
-            .iter()
-            .map(|byte| format!("{byte:02x}"))
-            .collect::<String>();
-        write_private_file(&token_path, token.as_bytes())?;
-        token
-    };
+    let store = OsCredentialStore;
+    let token = prepare_engine_token(
+        &preloop_dir,
+        std::env::var("PRELOOP_SYSTEM_TOKEN").ok(),
+        &store,
+    )?;
 
     let engine_bin = std::env::current_exe().context("resolve preloop executable")?;
 
@@ -1178,32 +1217,166 @@ pub(crate) fn write_private_file(path: &std::path::Path, contents: &[u8]) -> any
 fn prepare_engine_token(
     home: &std::path::Path,
     configured: Option<String>,
+    store: &dyn CredentialStore,
 ) -> anyhow::Result<String> {
-    std::fs::create_dir_all(home)
-        .with_context(|| format!("create PRELOOP_HOME {}", home.display()))?;
-    set_private_directory_permissions(home)?;
+    preloop_runner_server::credential_store::resolve_engine_token_with_store(
+        home, configured, store,
+    )
+}
 
-    let token_path = home.join("engine.token");
-    if let Some(token) = configured {
-        anyhow::ensure!(!token.trim().is_empty(), "PRELOOP_SYSTEM_TOKEN is empty");
-        write_private_file(&token_path, token.as_bytes())?;
-        return Ok(token);
-    }
-    if let Ok(existing) = std::fs::read_to_string(&token_path) {
-        let token = existing.trim().to_owned();
-        anyhow::ensure!(!token.is_empty(), "{} is empty", token_path.display());
-        set_private_file_permissions(&token_path)?;
-        return Ok(token);
+/// Move any inline GitHub credential in `config` into the OS credential
+/// store, returning whether anything moved.
+///
+/// Only the `legacy_*` fields are inspected, and those are populated purely
+/// from disk — [`resolve_credential_references`] fills the separate
+/// `resolved_*` fields instead. That is what makes this idempotent: once a
+/// credential has moved, its legacy field is empty on the next load and the
+/// migration is a no-op rather than a rewrite on every startup.
+///
+/// A credential that cannot be namespaced (an App key or webhook secret with
+/// no `github.app_id`) is left inline and reported. Failing here would take
+/// down `preloop serve` for a config `preloop setup github --webhook-secret`
+/// itself produces.
+///
+/// Mutates `config` only; the caller persists it, and does so once every
+/// credential has landed in the store. A failure partway leaves config.toml
+/// untouched, so the inline values are still there and the next startup
+/// retries the whole migration.
+///
+/// [`resolve_credential_references`]: preloop_runner_server::config
+fn migrate_legacy_github_credentials(
+    config: &mut preloop_runner_server::config::ConfigFile,
+    store: &impl preloop_runner_server::credential_store::CredentialStore,
+) -> anyhow::Result<bool> {
+    use preloop_runner_server::credential_store::{github_reference_with_host, SecretString};
+
+    let has_legacy = config
+        .github
+        .legacy_app_pem
+        .as_deref()
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .is_some()
+        || config
+            .github
+            .legacy_pat
+            .as_deref()
+            .map(str::trim)
+            .filter(|s| !s.is_empty())
+            .is_some()
+        || config
+            .github
+            .legacy_webhook_secret
+            .as_deref()
+            .map(str::trim)
+            .filter(|s| !s.is_empty())
+            .is_some()
+        || config.github.apps.iter().any(|app| {
+            !app.legacy_pem.trim().is_empty()
+                || app
+                    .legacy_webhook_secret
+                    .as_deref()
+                    .map(str::trim)
+                    .filter(|s| !s.is_empty())
+                    .is_some()
+        });
+
+    if !has_legacy {
+        return Ok(false);
     }
 
-    let mut bytes = [0_u8; 32];
-    rand::thread_rng().fill_bytes(&mut bytes);
-    let token = bytes
-        .iter()
-        .map(|byte| format!("{byte:02x}"))
-        .collect::<String>();
-    write_private_file(&token_path, token.as_bytes())?;
-    Ok(token)
+    if let Err(error) = store.available() {
+        tracing::warn!(
+            %error,
+            "config contains inline GitHub credentials but no credential store is reachable; \
+             leaving inline credentials active"
+        );
+        return Ok(false);
+    }
+
+    let mut migrated = false;
+    let app_id = config.github.app_id.clone();
+    let host = config.github.server_url.as_deref();
+
+    if let Some(value) = config.github.legacy_app_pem.take() {
+        let value = value.trim();
+        if !value.is_empty() {
+            match app_id.as_deref() {
+                Some(app_id) => {
+                    let reference = github_reference_with_host("app-pem", host, Some(app_id))?;
+                    if store.get(&reference)?.is_none() {
+                        store.set(&reference, &SecretString::new(value))?;
+                    }
+                    config.github.app_pem_ref = Some(reference.as_str().to_owned());
+                    migrated = true;
+                }
+                None => {
+                    config.github.legacy_app_pem = Some(value.to_owned());
+                    eprintln!(
+                        "[preloop] leaving the inline GitHub App key in config.toml: \
+                         github.app_id is not set, so it cannot be namespaced"
+                    );
+                }
+            }
+        }
+    }
+    if let Some(value) = config.github.legacy_pat.take() {
+        let value = value.trim();
+        if !value.is_empty() {
+            let reference = github_reference_with_host("pat", host, None)?;
+            if store.get(&reference)?.is_none() {
+                store.set(&reference, &SecretString::new(value))?;
+            }
+            config.github.pat_ref = Some(reference.as_str().to_owned());
+            migrated = true;
+        }
+    }
+    if let Some(value) = config.github.legacy_webhook_secret.take() {
+        let value = value.trim();
+        if !value.is_empty() {
+            match app_id.as_deref() {
+                Some(app_id) => {
+                    let reference = github_reference_with_host("webhook", host, Some(app_id))?;
+                    if store.get(&reference)?.is_none() {
+                        store.set(&reference, &SecretString::new(value))?;
+                    }
+                    config.github.webhook_secret_ref = Some(reference.as_str().to_owned());
+                    migrated = true;
+                }
+                None => {
+                    config.github.legacy_webhook_secret = Some(value.to_owned());
+                    eprintln!(
+                        "[preloop] leaving the inline webhook secret in config.toml: \
+                         github.app_id is not set, so it cannot be namespaced"
+                    );
+                }
+            }
+        }
+    }
+    for app in &mut config.github.apps {
+        let pem = app.legacy_pem.trim().to_owned();
+        if !pem.is_empty() {
+            let reference = github_reference_with_host("app-pem", host, Some(&app.app_id))?;
+            if store.get(&reference)?.is_none() {
+                store.set(&reference, &SecretString::new(&pem))?;
+            }
+            app.legacy_pem.clear();
+            app.pem_ref = Some(reference.as_str().to_owned());
+            migrated = true;
+        }
+        if let Some(value) = app.legacy_webhook_secret.take() {
+            let value = value.trim();
+            if !value.is_empty() {
+                let reference = github_reference_with_host("webhook", host, Some(&app.app_id))?;
+                if store.get(&reference)?.is_none() {
+                    store.set(&reference, &SecretString::new(value))?;
+                }
+                app.webhook_secret_ref = Some(reference.as_str().to_owned());
+                migrated = true;
+            }
+        }
+    }
+    Ok(migrated)
 }
 
 /// Merge stored and command-line GitHub credentials into the environment the
@@ -1238,13 +1411,23 @@ fn resolve_github_auth(args: &ServeArgs, state_dir: &std::path::Path) -> anyhow:
     // `preloop setup` stores credentials in config.toml's [github] section,
     // which is what the server itself loads at startup. Fill any gaps from
     // it so the startup report matches what the server will actually see.
-    let file_config = preloop_runner_server::config::load_config()?;
-    auth.fill_gaps(github_auth::StoredAuth {
-        app_id: file_config.github.app_id,
+    let mut file_config = preloop_runner_server::config::load_config()?;
+    let store = preloop_runner_server::credential_store::OsCredentialStore;
+    // Read before migrating: migration moves the inline values out of
+    // `config.github`, and the freshly stored ones are not re-resolved here.
+    let from_file = github_auth::StoredAuth {
+        app_id: file_config.github.app_id.clone(),
         installation_id: None,
-        private_key_pem: file_config.github.app_pem,
-        webhook_secret: file_config.github.webhook_secret,
-    });
+        private_key_pem: file_config.github.app_pem().map(str::to_owned),
+        webhook_secret: file_config.github.webhook_secret().map(str::to_owned),
+    };
+    if migrate_legacy_github_credentials(&mut file_config, &store)? {
+        preloop_runner_server::config::write_config(&file_config)?;
+        eprintln!(
+            "[preloop] migrated legacy GitHub credentials to the operating-system credential store"
+        );
+    }
+    auth.fill_gaps(from_file);
 
     if args.save {
         if !supplied {
@@ -1262,13 +1445,18 @@ fn resolve_github_auth(args: &ServeArgs, state_dir: &std::path::Path) -> anyhow:
     Ok(())
 }
 
-async fn cmd_engine(args: ServeArgs) -> anyhow::Result<()> {
+async fn cmd_engine(
+    args: ServeArgs,
+    observability: preloop_observability::Observability,
+) -> anyhow::Result<()> {
     let home = preloop_home();
     let state_dir = home.join("state");
     let socket = home.join("preloop.sock");
 
-    // Ensure PRELOOP_SYSTEM_TOKEN and engine.token stay synchronized.
-    let token = prepare_engine_token(&home, std::env::var("PRELOOP_SYSTEM_TOKEN").ok())?;
+    // Keep AppState's resolver on the same engine home as this CLI.
+    std::env::set_var("PRELOOP_HOME", &home);
+    let store = OsCredentialStore;
+    let token = prepare_engine_token(&home, std::env::var("PRELOOP_SYSTEM_TOKEN").ok(), &store)?;
     std::env::set_var("PRELOOP_SYSTEM_TOKEN", &token);
     let listen: std::net::SocketAddr = args
         .listen
@@ -1329,6 +1517,22 @@ async fn cmd_engine(args: ServeArgs) -> anyhow::Result<()> {
             std::time::SystemTime,
         >::new()));
     let pool_enabled = env_flag("PRELOOP_RUNNER_POOL_ENABLED", DEFAULT_RUNNER_POOL_ENABLED);
+    // One shared handle: the server and the pool both observe the same
+    // preparing/queue state, and the server exports via the process handle
+    // instead of a fresh no-op one. Seed `mode` from the pool switch — the
+    // one snapshot field with no per-field setter — so `preloop status`
+    // never shows a warm pool that is not configured; `desired` is filled
+    // from the resolved config below.
+    let pool_status = std::sync::Arc::new(preloop_observability::status::PoolStatus::new(
+        preloop_observability::status::PoolSnapshot {
+            mode: if pool_enabled {
+                preloop_observability::status::PoolMode::Warm
+            } else {
+                preloop_observability::status::PoolMode::OnDemand
+            },
+            ..Default::default()
+        },
+    ));
     let pool_config = local_runner_pool_config(
         &home,
         runner_url.clone(),
@@ -1339,7 +1543,18 @@ async fn cmd_engine(args: ServeArgs) -> anyhow::Result<()> {
         pool_enabled,
         pool_preparing.clone(),
         pending_registrations.clone(),
+        pool_status.clone(),
+        observability.clone(),
     );
+    // Report the real pool configuration: the configured warm size (or zero
+    // in on-demand mode) instead of the zero-sized warm default.
+    match &pool_config {
+        Ok(config) => pool_status.set_desired(config.size as u32),
+        // A failed config (e.g. missing Linux runner bundle, warned below)
+        // means no pool will ever run: surface that as Disabled instead of
+        // the Warm/OnDemand seed picked from the enable switch alone.
+        Err(_) => pool_status.set_mode(preloop_observability::status::PoolMode::Disabled),
+    }
     let pool_available = match &pool_config {
         Ok(_) => true,
         Err(error) => {
@@ -1367,6 +1582,8 @@ async fn cmd_engine(args: ServeArgs) -> anyhow::Result<()> {
             next_job_runs_on: Some(next_job_runs_on.clone()),
             pool_preparing: Some(pool_preparing.clone()),
             pending_registrations: pool_available.then_some(pending_registrations),
+            pool_status: Some(pool_status.clone()),
+            observability: Some(observability),
             require_job_assignments: env_flag("PRELOOP_REQUIRE_JOB_ASSIGNMENTS", false),
             state_dir,
             store_url: args.store.clone(),
@@ -1382,7 +1599,7 @@ async fn cmd_engine(args: ServeArgs) -> anyhow::Result<()> {
     // instead of a generic socket-wait timeout.
     tokio::select! {
         result = &mut server => return result?,
-        result = wait_for_engine_socket(&socket) => result?,
+        result = wait_for_engine_socket(&socket, listen) => result?,
     }
 
     let shutdown = tokio_util::sync::CancellationToken::new();
@@ -1459,25 +1676,101 @@ async fn engine_shutdown_signal() {
     }
 }
 
-async fn wait_for_engine_socket(socket: &std::path::Path) -> anyhow::Result<()> {
+async fn wait_for_engine_socket(
+    socket: &std::path::Path,
+    listen: std::net::SocketAddr,
+) -> anyhow::Result<()> {
+    // readyz probe: TCP requests target the configured listen address (host
+    // and port); the Unix client rides the control socket instead. 500ms
+    // timeout, 30s window.
     #[cfg(unix)]
     let client = reqwest::Client::builder().unix_socket(socket).build()?;
     #[cfg(not(unix))]
     let client = reqwest::Client::new();
+    let readyz_url = format!("http://{listen}/readyz");
     let start = std::time::Instant::now();
+    let mut last_reason: Option<String> = None;
     while start.elapsed() < Duration::from_secs(30) {
-        if client
-            .get("http://localhost/healthz")
+        match client
+            .get(&readyz_url)
             .timeout(Duration::from_millis(500))
             .send()
             .await
-            .is_ok()
         {
-            return Ok(());
+            Ok(resp) => {
+                if resp.status().is_success() {
+                    return Ok(());
+                }
+                // Non-2xx readyz: capture reason for timeout reporting.
+                let status = resp.status();
+                let body = resp.text().await.unwrap_or_default();
+                let reason = extract_readyz_reason(&body)
+                    .unwrap_or_else(|| format!("{status}: {}", truncate_reason(&body)));
+                last_reason = Some(reason);
+            }
+            Err(err) => {
+                last_reason = Some(err.to_string());
+            }
         }
         tokio::time::sleep(Duration::from_millis(50)).await;
     }
+    if let Some(reason) = last_reason {
+        anyhow::bail!("local control plane did not become ready within 30 seconds: last readyz reason: {reason}")
+    }
     anyhow::bail!("local control plane did not become ready within 30 seconds")
+}
+
+fn extract_readyz_reason(body: &str) -> Option<String> {
+    if body.trim().is_empty() {
+        return None;
+    }
+    if let Ok(v) = serde_json::from_str::<serde_json::Value>(body) {
+        for key in ["reason", "code", "message", "error", "status"] {
+            if let Some(s) = v.get(key).and_then(|x| x.as_str()) {
+                if !s.trim().is_empty() {
+                    return Some(s.to_owned());
+                }
+            }
+        }
+        // Nested { "ready": { "reason": ... } } or similar
+        if let Some(obj) = v.as_object() {
+            for (_, val) in obj {
+                if let Some(s) = val.as_str() {
+                    if !s.trim().is_empty() && s.len() < 200 {
+                        return Some(s.to_owned());
+                    }
+                }
+                if let Some(inner) = val.as_object() {
+                    for k in ["reason", "code"] {
+                        if let Some(s) = inner.get(k).and_then(|x| x.as_str()) {
+                            return Some(s.to_owned());
+                        }
+                    }
+                }
+            }
+        }
+        // Return truncated JSON if no specific field
+        return Some(truncate_reason(body));
+    }
+    Some(truncate_reason(body))
+}
+
+fn truncate_reason(s: &str) -> String {
+    let t = s.trim();
+    if t.len() > 300 {
+        // Byte slicing a `&str` panics when the cut lands inside a multi-byte
+        // character; the body is an arbitrary `/readyz` response (a localized
+        // proxy error page, for example), so cut on a character boundary.
+        let cut = t
+            .char_indices()
+            .map(|(index, _)| index)
+            .take_while(|index| *index <= 300)
+            .last()
+            .unwrap_or(0);
+        format!("{}…", &t[..cut])
+    } else {
+        t.to_owned()
+    }
 }
 
 // Configuration assembly, not a public API: the parameter list mirrors the
@@ -1495,6 +1788,8 @@ fn local_runner_pool_config(
     pending_registrations: std::sync::Arc<
         std::sync::RwLock<std::collections::BTreeMap<String, std::time::SystemTime>>,
     >,
+    pool_status: std::sync::Arc<preloop_observability::status::PoolStatus>,
+    observability: preloop_observability::Observability,
 ) -> anyhow::Result<RunnerPoolConfig> {
     let control_bridge = home.join("control-bridge");
     std::fs::create_dir_all(&control_bridge)?;
@@ -1572,6 +1867,7 @@ fn local_runner_pool_config(
     // Compare on the plain `repository:tag`, so the digest-pinned defaults
     // (ubuntu:24.04@sha256:…) still count as stock Ubuntu images.
     let custom_base = !is_stock_base_image(&base_image);
+    let cpus = runner_cpus();
     Ok(RunnerPoolConfig {
         // Size zero is the deliberate low-memory mode: keep the local
         // supervisor alive, but build a runner only when a job is queued.
@@ -1579,7 +1875,7 @@ fn local_runner_pool_config(
             std::env::var("PRELOOP_RUNNER_POOL_SIZE")
                 .ok()
                 .and_then(|value| value.parse().ok())
-                .unwrap_or_else(|| host_runner_pool_size(RUNNER_CPUS))
+                .unwrap_or_else(|| host_runner_pool_size(cpus))
         } else {
             0
         },
@@ -1637,14 +1933,14 @@ fn local_runner_pool_config(
         dns: std::env::var("PRELOOP_RUNNER_DNS").ok(),
         registration_token_env: "PRELOOP_SYSTEM_TOKEN".into(),
         labels: runner_pool_labels(),
-        cpus: RUNNER_CPUS,
+        cpus,
         memory_mib: runner_memory_mib(),
         storage_gib: runner_storage_gib(),
         overlay_gib: std::env::var("PRELOOP_RUNNER_OVERLAY_GB")
             .ok()
             .and_then(|v| v.parse().ok()),
         debug_dir: Some(home.join("state").join("debug")),
-        runner_key_dir: Some(home.join("runner-keys")),
+        runner_key_dir: None,
         // Warm the golden with the images this project's workflows declare,
         // so `container:`/`services:` jobs do not re-pull on every run.
         preload_images: preloop_orchestrator::environment::scan_workflow_images(
@@ -1654,6 +1950,8 @@ fn local_runner_pool_config(
         next_job_runs_on: (!custom_base).then_some(next_job_runs_on),
         pending_registrations: Some(pending_registrations),
         preparing_signal: Some(preparing_signal),
+        pool_status: Some(pool_status),
+        observability: Some(observability),
     })
 }
 
@@ -1681,8 +1979,8 @@ fn runner_pool_labels() -> Vec<String> {
     labels
 }
 
-/// vCPUs given to each runner VM.
-const RUNNER_CPUS: u16 = 4;
+/// vCPUs given to each runner VM, honouring `PRELOOP_RUNNER_CPUS`.
+const RUNNER_CPUS: u16 = 8;
 /// Low-memory on-demand provisioning is the default; opt into idle warm VMs.
 const DEFAULT_RUNNER_POOL_ENABLED: bool = false;
 /// Published or locally cached packed images avoid cold OCI bootstrap per job.
@@ -1713,7 +2011,18 @@ fn runner_memory_mib() -> u32 {
         .filter(|value| *value >= MIN_MEMORY_MIB)
         .unwrap_or(RUNNER_MEMORY_MIB)
 }
-
+/// vCPUs per runner VM, honouring `PRELOOP_RUNNER_CPUS`.
+///
+/// Invalid, zero, or out-of-range values fall back to the default. Keeping the
+/// value positive prevents invalid VM configurations and pool sizing division
+/// by zero.
+fn runner_cpus() -> u16 {
+    std::env::var("PRELOOP_RUNNER_CPUS")
+        .ok()
+        .and_then(|raw| raw.trim().parse::<u16>().ok())
+        .filter(|value| *value > 0)
+        .unwrap_or(RUNNER_CPUS)
+}
 /// Persistent storage for each runner VM, honouring
 /// `PRELOOP_RUNNER_STORAGE_GB`.
 fn runner_storage_gib() -> u32 {
@@ -1847,6 +2156,302 @@ fn default_local_activity_type(event: &str, payload: &serde_json::Value) -> Opti
     }
 }
 
+/// Events for which GitHub supplies a changed-file list, so a local run can
+/// stand in for one by deriving the same list from git.
+///
+/// Everything else (`workflow_dispatch`, `schedule`, …) has no file list on
+/// GitHub either, so deriving one would invent a contract the real event does
+/// not have.
+fn event_carries_changed_files(event: &str) -> bool {
+    matches!(
+        event,
+        "push" | "pull_request" | "pull_request_target" | "pull_request_review" | "merge_group"
+    )
+}
+
+#[allow(dead_code)]
+fn unquote_git_path(raw: &str) -> String {
+    let s = raw.trim();
+    if s.starts_with('"') && s.ends_with('"') && s.len() >= 2 {
+        let inner = &s[1..s.len() - 1];
+        let mut bytes = Vec::new();
+        let mut chars = inner.chars().peekable();
+        while let Some(c) = chars.next() {
+            if c == '\\' {
+                match chars.peek() {
+                    Some('\\') => {
+                        chars.next();
+                        bytes.push(b'\\');
+                    }
+                    Some('"') => {
+                        chars.next();
+                        bytes.push(b'"');
+                    }
+                    Some('n') => {
+                        chars.next();
+                        bytes.push(b'\n');
+                    }
+                    Some('t') => {
+                        chars.next();
+                        bytes.push(b'\t');
+                    }
+                    Some('r') => {
+                        chars.next();
+                        bytes.push(b'\r');
+                    }
+                    Some('0'..='7') => {
+                        let mut octal_val = 0u8;
+                        let mut count = 0;
+                        while count < 3 && chars.peek().is_some_and(|ch| ('0'..='7').contains(ch)) {
+                            octal_val = (octal_val << 3) + (chars.next().unwrap() as u8 - b'0');
+                            count += 1;
+                        }
+                        bytes.push(octal_val);
+                    }
+                    _ => {
+                        if let Some(next_c) = chars.next() {
+                            let mut b = [0u8; 4];
+                            bytes.extend_from_slice(next_c.encode_utf8(&mut b).as_bytes());
+                        }
+                    }
+                }
+            } else {
+                let mut b = [0u8; 4];
+                bytes.extend_from_slice(c.encode_utf8(&mut b).as_bytes());
+            }
+        }
+        String::from_utf8(bytes).unwrap_or_else(|_| inner.to_owned())
+    } else {
+        s.to_string()
+    }
+}
+
+/// Extract the path from one `git status --porcelain` line.
+///
+/// Layout is two status columns, a space, then the path; renames read
+/// `R  old -> new`, where only the destination exists now. Quoted paths (set
+/// by `core.quotePath`) keep their quotes stripped so they match the
+/// repository-relative names a workflow filter is written against.
+#[allow(dead_code)]
+fn porcelain_path(line: &str) -> Option<String> {
+    let rest = line.get(3..)?.trim();
+    if rest.is_empty() {
+        return None;
+    }
+    let path = rest.rsplit(" -> ").next().unwrap_or(rest);
+    Some(unquote_git_path(path))
+}
+
+/// Whether `base` can actually be diffed against `HEAD`.
+///
+/// Resolving is not enough. A fork remote (`origin` pointing at someone
+/// else's copy) resolves fine but can share no history, and `git diff
+/// base...HEAD` then fails with "no merge base". Checking here keeps that
+/// failure out of the derived change set.
+fn usable_diff_base(base: &str) -> bool {
+    if git_rev_parse(base).is_err() {
+        return false;
+    }
+    std::process::Command::new("git")
+        .args(["merge-base", base, "HEAD"])
+        .output()
+        .is_ok_and(|output| output.status.success())
+}
+
+/// Remotes configured for this repository, in git's order.
+fn git_remotes() -> Vec<String> {
+    std::process::Command::new("git")
+        .arg("remote")
+        .output()
+        .ok()
+        .filter(|output| output.status.success())
+        .map(|output| {
+            String::from_utf8_lossy(&output.stdout)
+                .lines()
+                .map(str::trim)
+                .filter(|line| !line.is_empty())
+                .map(str::to_owned)
+                .collect()
+        })
+        .unwrap_or_default()
+}
+
+/// Resolve the ref a local run should diff against.
+///
+/// `--base` wins. Otherwise prefer the branch's own tracking ref — the most
+/// reliable statement of "where this branch came from" — then each remote's
+/// default, then local `main`/`master`. Every candidate must share history
+/// with `HEAD`, so a fork remote cannot be picked and then fail to diff.
+///
+/// Returns `None` when nothing usable is found, so the caller leaves
+/// `changed_paths_known` false rather than claiming an empty change set — an
+/// empty *known* list would make every `paths:` filter reject the run.
+fn resolve_local_diff_base(explicit: Option<&str>) -> Option<String> {
+    if let Some(base) = explicit {
+        return usable_diff_base(base).then(|| base.to_owned());
+    }
+    let mut candidates: Vec<String> = Vec::new();
+    if let Ok(output) = std::process::Command::new("git")
+        .args(["rev-parse", "--abbrev-ref", "@{upstream}"])
+        .output()
+    {
+        if output.status.success() {
+            let tracking = String::from_utf8_lossy(&output.stdout).trim().to_owned();
+            if !tracking.is_empty() {
+                candidates.push(tracking);
+            }
+        }
+    }
+    for remote in git_remotes() {
+        candidates.push(format!("{remote}/HEAD"));
+        candidates.push(format!("{remote}/main"));
+        candidates.push(format!("{remote}/master"));
+    }
+    candidates.push("main".to_owned());
+    candidates.push("master".to_owned());
+    candidates
+        .into_iter()
+        .find(|candidate| usable_diff_base(candidate))
+}
+
+fn git_uncommitted_paths() -> anyhow::Result<Vec<String>> {
+    let output = std::process::Command::new("git")
+        .args(["status", "-z", "--porcelain=v1"])
+        .output()
+        .context("git status")?;
+    if !output.status.success() {
+        anyhow::bail!(
+            "git status failed: {}",
+            String::from_utf8_lossy(&output.stderr).trim()
+        );
+    }
+    let mut paths = Vec::new();
+    let mut iter = output.stdout.split(|&b| b == 0);
+    while let Some(item) = iter.next() {
+        if item.is_empty() {
+            continue;
+        }
+        let item_str = String::from_utf8_lossy(item);
+        if item_str.len() < 3 {
+            continue;
+        }
+        let status_code = &item_str[..2];
+        let path_part = &item_str[3..];
+        if (status_code.starts_with('R') || status_code.starts_with('C')) && iter.size_hint().0 > 0
+        {
+            if let Some(target) = iter.next() {
+                let target_str = String::from_utf8_lossy(target).to_string();
+                paths.push(target_str);
+                continue;
+            }
+        }
+        paths.push(path_part.to_string());
+    }
+    Ok(paths)
+}
+
+/// Changed files for a local run: the merge-base diff against `base`, plus
+/// anything uncommitted.
+///
+/// Uncommitted files count because the server snapshots the working tree, not
+/// `HEAD` — a `paths:` filter judged only on committed history would ignore
+/// the very edit the user is testing.
+fn local_changed_paths(base: &str) -> anyhow::Result<Vec<String>> {
+    let output = std::process::Command::new("git")
+        .args(["diff", "-z", "--name-only", &format!("{base}...HEAD")])
+        .output()
+        .context("git diff")?;
+    if !output.status.success() {
+        anyhow::bail!(
+            "git diff against `{base}` failed: {}",
+            String::from_utf8_lossy(&output.stderr).trim()
+        );
+    }
+    let mut paths: Vec<String> = output
+        .stdout
+        .split(|&b| b == 0)
+        .filter(|slice| !slice.is_empty())
+        .map(|slice| String::from_utf8_lossy(slice).to_string())
+        .collect();
+    paths.extend(git_uncommitted_paths()?);
+    paths.sort();
+    paths.dedup();
+    Ok(paths)
+}
+
+/// Derive the changed-file list for a local run, or `None` to leave it unknown.
+///
+/// An explicit `--payload` carrying `paths` or `commits` wins: the caller
+/// stated the change set and must not be second-guessed.
+fn default_local_changed_paths(
+    event: &str,
+    base: Option<&str>,
+    payload: &serde_json::Value,
+) -> Option<Vec<String>> {
+    if !event_carries_changed_files(event) {
+        return None;
+    }
+    if payload.get("paths").is_some() || payload.get("commits").is_some() {
+        return None;
+    }
+    let base = resolve_local_diff_base(base)?;
+    local_changed_paths(&base).ok()
+}
+
+fn strip_branch_prefix(raw: &str) -> &str {
+    if let Some(rest) = raw.strip_prefix("refs/heads/") {
+        return rest;
+    }
+    if let Some(rest) = raw.strip_prefix("refs/remotes/") {
+        if let Some((_remote, branch)) = rest.split_once('/') {
+            return branch;
+        }
+        return rest;
+    }
+    for remote in ["origin/", "upstream/"] {
+        if let Some(rest) = raw.strip_prefix(remote) {
+            return rest;
+        }
+    }
+    raw
+}
+
+/// Branch a `pull_request` run should be filtered against.
+///
+/// GitHub applies `on.pull_request.branches` to the PR's *target* branch, not
+/// the head branch. Without this a local PR run filters on the checked-out
+/// branch and a workflow gated to `branches: [main]` never matches. Only
+/// derived when the payload does not already carry a base ref.
+fn default_local_filter_branch(
+    event: &str,
+    base: Option<&str>,
+    payload: &serde_json::Value,
+) -> Option<String> {
+    if !matches!(event, "pull_request" | "pull_request_target") {
+        return None;
+    }
+    if payload
+        .get("pull_request")
+        .and_then(|pr| pr.get("base"))
+        .and_then(|base| base.get("ref"))
+        .is_some()
+    {
+        return None;
+    }
+    // An explicit `--base` is the user's stated PR target and names the branch
+    // filters apply to whether or not the ref exists locally — shallow clones
+    // and un-fetched bases are normal. Only the fallback needs a real ref,
+    // because it has nothing else to go on.
+    let base = match base {
+        Some(base) => base.to_owned(),
+        None => resolve_local_diff_base(None)?,
+    };
+    // Filters are written against branch names (`main`), not remote-qualified
+    // refs (`origin/main`), but branches can contain slashes (`feature/auth`).
+    let name = strip_branch_prefix(&base).to_owned();
+    (!name.is_empty()).then_some(name)
+}
+
 fn collect_local_reusable_workflows(
     workflow_path: &std::path::Path,
 ) -> anyhow::Result<BTreeMap<String, String>> {
@@ -1900,6 +2505,11 @@ async fn cmd_run(args: RunArgs) -> anyhow::Result<()> {
         None => serde_json::json!({}),
     };
     let activity_type = default_local_activity_type(event, &payload);
+    // A local run stands in for a webhook delivery, so supply the parts of that
+    // delivery git can answer for. Anything git cannot know (PR number, actor,
+    // labels, upstream run) stays absent rather than invented.
+    let derived_changed_paths = default_local_changed_paths(event, args.base.as_deref(), &payload);
+    let derived_filter_branch = default_local_filter_branch(event, args.base.as_deref(), &payload);
 
     let mut secrets = preloop_gha_protocol::SecretMap::default();
     for secret in &args.secrets {
@@ -1943,6 +2553,9 @@ async fn cmd_run(args: RunArgs) -> anyhow::Result<()> {
         selected_jobs: args.job.into_iter().collect(),
         base_ref: args.base,
         activity_type,
+        changed_paths: derived_changed_paths.clone().unwrap_or_default(),
+        changed_paths_known: derived_changed_paths.is_some(),
+        filter_branch: derived_filter_branch,
         // On by default where it can be acted on: a paused job blocks until a
         // controller answers, so pausing a piped or detached run would hang
         // something with no way to respond. `--preserve-on-failure` is the
@@ -2802,10 +3415,10 @@ fn plan_json(plan: &preloop_gha_protocol::JobPlan) -> serde_json::Value {
     })
 }
 
-async fn cmd_status(run_id: Option<String>) -> anyhow::Result<()> {
+async fn cmd_status(args: StatusArgs) -> anyhow::Result<()> {
     let client = build_client();
     let url = server_url();
-    if let Some(run_id) = run_id {
+    if let Some(run_id) = args.run_id {
         // Single-run mode: one machine-readable status word
         // (success/failure/cancelled/skipped/in_progress/queued/pending) for
         // scripts like the pre-push hook. Connection failures carry the
@@ -2832,33 +3445,450 @@ async fn cmd_status(run_id: Option<String>) -> anyhow::Result<()> {
         );
         return Ok(());
     }
-    let mut request = client.get(format!("{url}/api/v1/runs?limit=20"));
+    // Native bearer required for /api/v1/status (same as other native calls)
+    let mut status_req = client.get(format!("{url}/api/v1/status"));
     if let Some(token) = api_token() {
-        request = request.bearer_auth(token);
+        status_req = status_req.bearer_auth(token);
     }
-    let response = request.send().await?;
-    if !response.status().is_success() {
-        let status = response.status();
-        let body = response.text().await.unwrap_or_default();
+    let status_resp = status_req
+        .send()
+        .await
+        .with_context(engine_unreachable_context)?;
+    if !status_resp.status().is_success() {
+        let status = status_resp.status();
+        let body = status_resp.text().await.unwrap_or_default();
         anyhow::bail!("server returned {status}: {body}");
     }
-    let runs: Vec<serde_json::Value> = response.json().await?;
+    let status_text = status_resp.text().await?;
+    if args.json {
+        // Byte-for-byte, no prose: so jq works
+        print!("{}", status_text);
+        if !status_text.ends_with('\n') {
+            println!();
+        }
+        return Ok(());
+    }
+    // Parse into the typed DTO for a schema check, but degrade instead of
+    // failing: the CLI self-updates while a supervised engine lags, so a
+    // mismatch must not take `preloop status` down at the moment it is most
+    // needed. `--json` above stays raw for byte-identical `jq` output.
+    if let Err(error) =
+        serde_json::from_str::<preloop_observability::status::OperationalSnapshot>(&status_text)
+    {
+        eprintln!(
+            "[warn] status schema differs from this CLI ({error}); \
+             some sections may render as dashes. Use --json for the raw payload."
+        );
+    }
+    let status: serde_json::Value =
+        serde_json::from_str(&status_text).context("parse status json")?;
+
+    // Fetch recent runs for table (preserve existing behavior)
+    let mut runs_req = client.get(format!("{url}/api/v1/runs?limit={}", args.limit));
+    if let Some(token) = api_token() {
+        runs_req = runs_req.bearer_auth(token);
+    }
+    let runs: Vec<serde_json::Value> = match runs_req.send().await {
+        Ok(r) if r.status().is_success() => r.json().await.unwrap_or_default(),
+        Ok(r) => {
+            let st = r.status();
+            let body = r.text().await.unwrap_or_default();
+            eprintln!("[warn] runs table unavailable: {st}: {body}");
+            Vec::new()
+        }
+        Err(e) => {
+            eprintln!("[warn] runs table unavailable: {e}");
+            Vec::new()
+        }
+    };
+
+    // --- Human rendering: 10 sections in order ---
+    render_status_human(&status, &runs, args.limit);
+    Ok(())
+}
+
+fn render_status_human(status: &serde_json::Value, runs: &[serde_json::Value], limit: usize) {
+    // Helpers to extract safely
+    let get_str = |v: &serde_json::Value, k: &str| -> Option<String> {
+        v.get(k).and_then(|x| x.as_str()).map(|s| s.to_owned())
+    };
+    let get_f64 =
+        |v: &serde_json::Value, k: &str| -> Option<f64> { v.get(k).and_then(|x| x.as_f64()) };
+    let get_u64 =
+        |v: &serde_json::Value, k: &str| -> Option<u64> { v.get(k).and_then(|x| x.as_u64()) };
+    let get_bool =
+        |v: &serde_json::Value, k: &str| -> Option<bool> { v.get(k).and_then(|x| x.as_bool()) };
+
+    // 1. service + snapshot age
+    println!("== service ==");
+    let service = status.get("service").unwrap_or(&serde_json::Value::Null);
+    let version =
+        get_str(service, "version").unwrap_or_else(|| env!("CARGO_PKG_VERSION").to_owned());
+    let instance = get_str(service, "instance_id")
+        .or_else(|| get_str(status, "instance_id"))
+        .unwrap_or_else(|| "-".to_owned());
+    let uptime = get_f64(service, "uptime_seconds")
+        .or_else(|| get_f64(status, "uptime_seconds"))
+        .unwrap_or(0.0);
+    let shutdown = get_bool(service, "shutdown_requested")
+        .or_else(|| get_bool(status, "shutdown_requested"))
+        .unwrap_or(false);
+    let snapshot_age = get_f64(status, "snapshot_age_seconds").unwrap_or(0.0);
+    let observed_at = get_str(status, "observed_at").unwrap_or_else(|| "-".to_owned());
+    let overall = get_str(status, "overall").unwrap_or_else(|| "unknown".to_owned());
+    println!(
+        "  version: {version}  instance: {instance}  uptime: {uptime:.0}s  overall: {overall}"
+    );
+    println!(
+        "  observed_at: {observed_at}  snapshot_age: {snapshot_age:.1}s  shutdown: {shutdown}"
+    );
+    if status.get("schema_version").is_some() {
+        println!("  schema_version: {}", status["schema_version"]);
+    }
+
+    // 2. queue (ready/blocked + oldest)
+    println!("\n== queue ==");
+    let jobs = status.get("jobs").unwrap_or(&serde_json::Value::Null);
+    let ready = get_u64(jobs, "ready").unwrap_or(0);
+    let dep_blocked = get_u64(jobs, "dependency_blocked").unwrap_or(0);
+    let conc_blocked = get_u64(jobs, "concurrency_blocked").unwrap_or(0);
+    let pending_exp = get_u64(jobs, "pending_expansion").unwrap_or(0);
+    let expanding = get_u64(jobs, "expanding").unwrap_or(0);
+    let claimable = get_u64(jobs, "claimable").unwrap_or(0);
+    let unclaimable = get_u64(jobs, "unclaimable").unwrap_or(0);
+    let oldest = get_f64(jobs, "oldest_ready_seconds");
+    println!("  ready: {ready}  claimable: {claimable}  unclaimable: {unclaimable}  dependency_blocked: {dep_blocked}  concurrency_blocked: {conc_blocked}  pending_expansion: {pending_exp}  expanding: {expanding}");
+    match oldest {
+        Some(v) => println!("  oldest_ready: {v:.1}s"),
+        None => println!("  oldest_ready: -"),
+    }
+    // Also show runs queued/in_progress if present
+    if let Some(runs_obj) = status.get("runs") {
+        let q = get_u64(runs_obj, "queued").unwrap_or(0);
+        let ip = get_u64(runs_obj, "in_progress").unwrap_or(0);
+        let completed = get_u64(runs_obj, "completed").unwrap_or(0);
+        println!("  runs queued: {q}  in_progress: {ip}  completed: {completed}");
+    }
+
+    // 3. concurrency + scheduler
+    println!("\n== concurrency & scheduler ==");
+    let conc = status
+        .get("concurrency")
+        .unwrap_or(&serde_json::Value::Null);
+    let groups_active = get_u64(conc, "groups_active").unwrap_or(0);
+    let groups_contended = get_u64(conc, "groups_contended").unwrap_or(0);
+    let pending_holders = get_u64(conc, "pending_holders").unwrap_or(0);
+    let deepest = get_u64(conc, "deepest_group_pending").unwrap_or(0);
+    let qmax = get_u64(conc, "queue_max_pending").unwrap_or(0);
+    let overflow = get_u64(conc, "overflow_cancellations").unwrap_or(0);
+    println!("  groups active: {groups_active}  contended: {groups_contended}  pending_holders: {pending_holders}  deepest_pending: {deepest}  queue_max: {qmax}  overflow_cancellations: {overflow}");
+    let sched = status.get("scheduler").unwrap_or(&serde_json::Value::Null);
+    let enabled = get_bool(sched, "enabled").unwrap_or(false);
+    let schedules = get_u64(sched, "schedules").unwrap_or(0);
+    let last_scan = get_str(sched, "last_scan_at").unwrap_or_else(|| "-".to_owned());
+    let next_fire = get_str(sched, "next_fire_at").unwrap_or_else(|| "-".to_owned());
+    let fired = get_u64(sched, "fired").unwrap_or(0);
+    let skipped = get_u64(sched, "skipped_overlapping").unwrap_or(0);
+    let late = get_u64(sched, "late_fires").unwrap_or(0);
+    let max_delay = get_f64(sched, "max_fire_delay_seconds");
+    println!("  scheduler enabled: {enabled}  schedules: {schedules}  fired: {fired}  skipped_overlapping: {skipped}  late_fires: {late}");
+    println!(
+        "  last_scan: {last_scan}  next_fire: {next_fire}  max_delay: {}",
+        max_delay
+            .map(|v| format!("{v:.1}s"))
+            .unwrap_or_else(|| "-".to_owned())
+    );
+
+    // 4. pool + runners
+    println!("\n== pool & runners ==");
+    let pool = status.get("pool").unwrap_or(&serde_json::Value::Null);
+    let mode = get_str(pool, "mode").unwrap_or_else(|| "-".to_owned());
+    let desired = get_u64(pool, "desired").unwrap_or(0);
+    let preparing = pool
+        .get("preparing")
+        .and_then(|x| x.as_bool())
+        .unwrap_or(false);
+    let building = get_u64(pool, "building").unwrap_or(0);
+    let provisioning = get_u64(pool, "provisioning").unwrap_or(0);
+    let pool_idle = get_u64(pool, "idle").unwrap_or(0);
+    let pool_busy = get_u64(pool, "busy").unwrap_or(0);
+    let paused = get_u64(pool, "paused").unwrap_or(0);
+    let failures = get_u64(pool, "consecutive_provision_failures").unwrap_or(0);
+    println!("  pool mode: {mode}  desired: {desired}  idle: {pool_idle}  busy: {pool_busy}  building: {building}  provisioning: {provisioning}  paused: {paused}  preparing: {preparing}  provision_failures: {failures}");
+    let runners = status.get("runners").unwrap_or(&serde_json::Value::Null);
+    let reg = get_u64(runners, "registered").unwrap_or(0);
+    let sessions = get_u64(runners, "sessions").unwrap_or(0);
+    let idle = get_u64(runners, "idle").unwrap_or(0);
+    let busy = get_u64(runners, "busy").unwrap_or(0);
+    let stale = get_u64(runners, "stale").unwrap_or(0);
+    let max_poll = get_f64(runners, "max_poll_age_seconds");
+    let max_lease = get_f64(runners, "max_lease_age_seconds");
+    println!("  runners registered: {reg}  sessions: {sessions}  idle: {idle}  busy: {busy}  stale: {stale}");
+    println!(
+        "  max_poll_age: {}  max_lease_age: {}",
+        max_poll
+            .map(|v| format!("{v:.1}s"))
+            .unwrap_or_else(|| "-".to_owned()),
+        max_lease
+            .map(|v| format!("{v:.1}s"))
+            .unwrap_or_else(|| "-".to_owned())
+    );
+    // Live runner -> job pairings: which job each busy runner executes.
+    // Counts alone cannot distinguish a busy pool from a stalled one.
+    if let Some(list) = runners.get("assignments").and_then(|v| v.as_array()) {
+        for entry in list {
+            let runner = entry
+                .get("runner_id")
+                .and_then(|v| v.as_i64())
+                .map(|v| v.to_string())
+                .unwrap_or_else(|| "?".to_owned());
+            let run = entry
+                .get("run_id")
+                .and_then(|v| v.as_str())
+                .map(|v| v.get(..8).unwrap_or(v).to_owned())
+                .unwrap_or_else(|| "?".to_owned());
+            let job = entry.get("job_id").and_then(|v| v.as_str()).unwrap_or("?");
+            let age = entry
+                .get("assigned_seconds_ago")
+                .and_then(|v| v.as_f64())
+                .map(|v| format!("{v:.0}s"))
+                .unwrap_or_else(|| "-".to_owned());
+            println!("  runner {runner}: {run} / {job} ({age})");
+        }
+    }
+
+    // 5. VM fleet stub
+    println!("\n== vm fleet ==");
+    let vms = status
+        .get("vms")
+        .unwrap_or(status.get("vm").unwrap_or(&serde_json::Value::Null));
+    if vms.is_null() || vms.as_object().map(|m| m.is_empty()).unwrap_or(false) {
+        println!("  source: unavailable  (host sampler not yet reporting)");
+        println!("  capabilities: cpu=false memory=false sparse_disk=false");
+        println!("  host_usage: -");
+    } else {
+        let source = get_str(vms, "source").unwrap_or_else(|| "unknown".to_owned());
+        let sample_age = get_f64(vms, "sample_age_seconds")
+            .map(|v| format!("{v:.1}s"))
+            .unwrap_or_else(|| "-".to_owned());
+        println!("  source: {source}  sample_age: {sample_age}");
+        if let Some(caps) = vms.get("capabilities") {
+            let cap_str = caps
+                .as_object()
+                .map(|m| {
+                    m.iter()
+                        .map(|(k, v)| format!("{k}={}", v.as_bool().unwrap_or(false)))
+                        .collect::<Vec<_>>()
+                        .join(" ")
+                })
+                .unwrap_or_else(|| "-".to_owned());
+            println!("  capabilities: {cap_str}");
+        }
+        if let Some(cnt) = vms.get("count") {
+            let runner = get_u64(cnt, "runner").unwrap_or(0);
+            let golden = get_u64(cnt, "golden").unwrap_or(0);
+            let unavailable = get_u64(cnt, "unavailable").unwrap_or(0);
+            println!("  count runner: {runner}  golden: {golden}  unavailable: {unavailable}");
+        }
+        if let Some(conf) = vms.get("configured") {
+            let vcpus = get_u64(conf, "vcpus")
+                .map(|v| v.to_string())
+                .unwrap_or_else(|| "-".to_owned());
+            let mem = get_u64(conf, "memory_bytes")
+                .map(|v| format!("{v}"))
+                .unwrap_or_else(|| "-".to_owned());
+            let storage = get_u64(conf, "storage_bytes")
+                .map(|v| format!("{v}"))
+                .unwrap_or_else(|| "-".to_owned());
+            println!("  configured vcpus: {vcpus}  memory: {mem}  storage: {storage}");
+        }
+        if let Some(usage) = vms.get("host_usage") {
+            let cores = get_f64(usage, "cpu_cores")
+                .map(|v| format!("{v:.1}"))
+                .unwrap_or_else(|| "-".to_owned());
+            let mem = get_u64(usage, "memory_bytes")
+                .map(|v| format!("{v}"))
+                .unwrap_or_else(|| "-".to_owned());
+            println!("  host_usage cpu_cores: {cores}  memory: {mem}");
+        }
+        if let Some(top) = vms.get("top_consumers").and_then(|x| x.as_array()) {
+            if !top.is_empty() {
+                println!("  top_consumers ({}):", top.len().min(5));
+                for c in top.iter().take(5) {
+                    let name = c
+                        .get("machine_name")
+                        .and_then(|x| x.as_str())
+                        .unwrap_or("?");
+                    let role = c.get("role").and_then(|x| x.as_str()).unwrap_or("?");
+                    let activity = c.get("activity").and_then(|x| x.as_str()).unwrap_or("?");
+                    println!("    - {name} ({role}/{activity})");
+                }
+            } else {
+                println!("  top_consumers: -");
+            }
+        }
+    }
+
+    // 6. store/storage/GitHub/debug/telemetry
+    println!("\n== store / storage / github / debug / telemetry ==");
+    let store = status.get("store").unwrap_or(&serde_json::Value::Null);
+    let backend = get_str(store, "backend").unwrap_or_else(|| "-".to_owned());
+    let cfail = get_u64(store, "consecutive_failures").unwrap_or(0);
+    println!("  store backend: {backend}  consecutive_failures: {cfail}");
+    let storage = status.get("storage").unwrap_or(&serde_json::Value::Null);
+    if !storage.is_null() {
+        let free = get_u64(storage, "state_fs_free_bytes")
+            .map(|v| format!("{v}"))
+            .unwrap_or_else(|| "-".to_owned());
+        let ratio = get_f64(storage, "state_fs_free_ratio")
+            .map(|v| format!("{v:.2}"))
+            .unwrap_or_else(|| "-".to_owned());
+        println!("  storage free: {free}  ratio: {ratio}");
+        if let Some(comps) = storage.get("components").and_then(|x| x.as_array()) {
+            for c in comps {
+                let store_name = c.get("store").and_then(|x| x.as_str()).unwrap_or("?");
+                let bytes = c.get("bytes").and_then(|x| x.as_u64()).unwrap_or(0);
+                println!("    {store_name}: {bytes} bytes");
+            }
+        }
+    } else {
+        println!("  storage: -");
+    }
+    let github = status.get("github").unwrap_or(&serde_json::Value::Null);
+    if !github.is_null() {
+        let configured = get_bool(github, "configured").unwrap_or(false);
+        let pending = get_u64(github, "pending_check_updates").unwrap_or(0);
+        println!("  github configured: {configured}  pending_check_updates: {pending}");
+        if let Some(rl) = github.get("rate_limit") {
+            let remaining = get_u64(rl, "remaining").unwrap_or(0);
+            let limit_rl = get_u64(rl, "limit").unwrap_or(0);
+            println!("  github rate_limit: {remaining}/{limit_rl} remaining");
+        }
+        if let Some(exp) = github
+            .get("installation_token_expires_in_seconds")
+            .and_then(|x| x.as_u64())
+        {
+            println!("  github token expires_in: {exp}s");
+        }
+    } else {
+        println!("  github: -");
+    }
+    let debug = status.get("debug").unwrap_or(&serde_json::Value::Null);
+    if !debug.is_null() {
+        let active = get_u64(debug, "active_sessions").unwrap_or(0);
+        let oldest = debug
+            .get("oldest_session_seconds")
+            .and_then(|x| x.as_f64())
+            .map(|v| format!("{v:.0}s"))
+            .unwrap_or_else(|| "-".to_owned());
+        println!("  debug active_sessions: {active}  oldest: {oldest}");
+    }
+    let tele = status.get("telemetry").unwrap_or(&serde_json::Value::Null);
+    if !tele.is_null() {
+        let enabled = get_bool(tele, "otlp_enabled").unwrap_or(false);
+        let dropped = get_u64(tele, "dropped_records").unwrap_or(0);
+        println!("  telemetry otlp_enabled: {enabled}  dropped_records: {dropped}");
+    }
+
+    // 7. non-zero limits
+    println!("\n== limits (non-zero) ==");
+    let limits = status.get("limits").and_then(|x| x.as_array());
+    let mut any_limit = false;
+    if let Some(arr) = limits {
+        for l in arr {
+            let dropped = l.get("dropped").and_then(|x| x.as_u64()).unwrap_or(0);
+            let rejected = l.get("rejected").and_then(|x| x.as_u64()).unwrap_or(0);
+            if dropped > 0 || rejected > 0 {
+                any_limit = true;
+                let name = l.get("limit").and_then(|x| x.as_str()).unwrap_or("?");
+                let value = l
+                    .get("value")
+                    .and_then(|x| x.as_u64())
+                    .map(|v| v.to_string())
+                    .unwrap_or_else(|| "-".to_owned());
+                println!("  {name}: value={value} dropped={dropped} rejected={rejected}");
+            }
+        }
+    }
+    if !any_limit {
+        println!("  (no limits with drops/rejects)");
+    }
+
+    // 8. stale tasks
+    println!("\n== tasks (stale/exited) ==");
+    let tasks = status.get("tasks").and_then(|x| x.as_array());
+    let mut any_task = false;
+    if let Some(arr) = tasks {
+        for t in arr {
+            let state = t.get("state").and_then(|x| x.as_str()).unwrap_or("running");
+            if state == "stale" || state == "exited" {
+                any_task = true;
+                let name = t.get("name").and_then(|x| x.as_str()).unwrap_or("?");
+                let critical = t.get("critical").and_then(|x| x.as_bool()).unwrap_or(false);
+                let age = t
+                    .get("heartbeat_age_seconds")
+                    .and_then(|x| x.as_f64())
+                    .map(|v| format!("{v:.1}s"))
+                    .unwrap_or_else(|| "-".to_owned());
+                println!("  {name}: state={state} critical={critical} age={age}");
+            }
+        }
+    }
+    if !any_task {
+        println!("  (all tasks healthy)");
+    }
+
+    // 9. conditions with one-line actions (≤5 exemplars)
+    println!("\n== conditions ==");
+    let conditions = status.get("conditions").and_then(|x| x.as_array());
+    if let Some(arr) = conditions {
+        if arr.is_empty() {
+            println!("  (no conditions)");
+        } else {
+            for c in arr {
+                let code = c.get("code").and_then(|x| x.as_str()).unwrap_or("?");
+                let severity = c.get("severity").and_then(|x| x.as_str()).unwrap_or("info");
+                let msg = c.get("message").and_then(|x| x.as_str()).unwrap_or("");
+                let action = condition_action(code);
+                println!("  [{severity}] {code}: {msg} -> {action}");
+                if let Some(exs) = c.get("exemplars").and_then(|x| x.as_array()) {
+                    for ex in exs.iter().take(5) {
+                        let ex_str = match ex {
+                            serde_json::Value::String(s) => s.clone(),
+                            other => other.to_string(),
+                        };
+                        println!("    - {ex_str}");
+                    }
+                    if exs.len() > 5 {
+                        println!("    ... and {} more", exs.len() - 5);
+                    }
+                } else if let Some(exs) = c.get("exemplar").and_then(|x| x.as_str()) {
+                    println!("    - {exs}");
+                }
+            }
+        }
+    } else {
+        println!("  (no conditions)");
+    }
+
+    // 10. recent runs table
+    println!("\n== recent runs (limit={}) ==", limit);
     if runs.is_empty() {
         println!("No runs found.");
-        return Ok(());
+        return;
     }
     println!(
         "{:<38}  {:<6}  {:<12}  {:<12}  {:<10}  WORKFLOW",
         "RUN ID", "#", "STATUS", "EVENT", "PUSH"
     );
     println!("{}", "-".repeat(104));
-    for run in &runs {
+    for run in runs {
         let run_id = run["run_id"].as_str().unwrap_or("?");
         let run_number = run
             .get("run_number")
             .and_then(serde_json::Value::as_u64)
             .unwrap_or(0);
-        let status = run["status"].as_str().unwrap_or("?");
+        let st = run["status"].as_str().unwrap_or("?");
         let event = run
             .get("event")
             .and_then(serde_json::Value::as_str)
@@ -2882,21 +3912,73 @@ async fn cmd_status(run_id: Option<String>) -> anyhow::Result<()> {
             })
             .unwrap_or("?");
         let push = match run.get("push_state").and_then(|state| state.get("status")) {
-            Some(status) => {
-                let status = status.as_str().unwrap_or("?");
+            Some(s) => {
+                let s = s.as_str().unwrap_or("?");
                 match run["push_state"]["pr_number"].as_u64() {
-                    Some(number) => format!("{status} #{number}"),
-                    None => status.to_owned(),
+                    Some(n) => format!("{s} #{n}"),
+                    None => s.to_owned(),
                 }
             }
             None => "-".to_owned(),
         };
         println!(
             "{:<38}  {:<6}  {:<12}  {:<12}  {:<10}  {}",
-            run_id, run_number, status, event, push, workflow
+            run_id, run_number, st, event, push, workflow
         );
     }
-    Ok(())
+}
+
+fn condition_action(code: &str) -> &'static str {
+    match code {
+        "queue_no_registered_runner" => "register a runner or enable the pool",
+        "claimable_queue_stalled" => "inspect assignments; restart if bindings are stale",
+        "run_in_progress_without_execution" => "inspect the run; requeue or cancel it",
+        "queue_label_mismatch" => "add a runner with that label",
+        "concurrency_queue_overflow" => "raise concurrency queue max or reduce parallelism",
+        "concurrency_group_starved" => "check concurrency group that starves others",
+        "scheduler_scan_stale" => "check scheduler scan heartbeat (restart if stuck)",
+        "scheduler_fire_late" => "check scheduler clock / load",
+        "pool_preparing" => "wait for image preparation to finish",
+        "pool_provisioning_deficit" => "check pool capacity / provision failures",
+        "pool_repeated_provision_failure" => "inspect provision logs and VM host capacity",
+        "runner_poll_stale" => "check runner connectivity and heartbeat",
+        "runner_lease_stale" => "check runner lease renewal",
+        "vm_sampler_stale" | "vm_sample_unavailable" | "vm_unreachable" => {
+            "check VM host sampler and SmolVM health"
+        }
+        "vm_host_memory_pressure" => "free host memory or reduce pool size",
+        "vm_host_cpu_throttled" => "reduce host CPU load or raise CPU quota",
+        "vm_host_oom_kill" => "check host OOM kills and runner memory",
+        "vm_sparse_disk_pressure" => "free disk space on VM data volume",
+        "store_write_failure" | "store_connection_down" => "check store connectivity and disk",
+        "storage_capacity_pressure" => "free disk space or run GC/prune",
+        "limit_drop_active" => "raise that limit or reduce load",
+        "limit_reject_active" => "raise that limit or back off",
+        "github_check_update_failure" => "check GitHub App permissions and network",
+        "github_terminal_check_pending" => "retry check update or check GitHub status",
+        "github_rate_limit_low" => "back off GitHub API or wait for rate-limit reset",
+        "github_installation_token_expiring" => "refresh GitHub installation token",
+        "debug_session_stale" => "close stale debug session",
+        "debug_audit_evicted" => "increase audit retention or flush audits",
+        "telemetry_export_failure" => "check OTLP endpoint and credentials",
+        "state_sampler_stale" | "task_stale" | "task_exited" => "check background task health",
+        _ => "see runbook for this condition",
+    }
+}
+
+/// Build the `?job=&step=` pairs for a filtered log request.
+///
+/// Split out so a test can assert the wire query without a live server: these
+/// pairs silently going missing is exactly the bug this replaced.
+fn logs_query(job: Option<&str>, step: Option<usize>) -> Vec<(&'static str, String)> {
+    let mut query = Vec::new();
+    if let Some(job) = job {
+        query.push(("job", job.to_owned()));
+    }
+    if let Some(step) = step {
+        query.push(("step", step.to_string()));
+    }
+    query
 }
 
 async fn cmd_logs(args: LogsArgs) -> anyhow::Result<()> {
@@ -2908,7 +3990,24 @@ async fn cmd_logs(args: LogsArgs) -> anyhow::Result<()> {
             .await?
             .ok_or_else(|| anyhow::anyhow!("no runs found"))?,
     };
+
+    if args.follow {
+        // The live feed carries whole steps as they stream; it has no notion of
+        // "just step N". Refuse instead of quietly ignoring one of the flags.
+        if args.step.is_some() {
+            anyhow::bail!(
+                "`--step` cannot be combined with `--follow`: the live feed is per job, not \
+                 per step. Follow the job, or drop `--follow` to read one finished step."
+            );
+        }
+        return follow_run_logs(&client, &url, &run_id, args.job.as_deref()).await;
+    }
+
     let mut request = client.get(format!("{url}/api/v1/runs/{run_id}/logs"));
+    let query = logs_query(args.job.as_deref(), args.step);
+    if !query.is_empty() {
+        request = request.query(&query);
+    }
     if let Some(token) = api_token() {
         request = request.bearer_auth(token);
     }
@@ -2921,6 +4020,137 @@ async fn cmd_logs(args: LogsArgs) -> anyhow::Result<()> {
     let body = response.text().await?;
     print!("{body}");
     Ok(())
+}
+
+/// Fetch one job's durable log through the native logs endpoint.
+async fn fetch_run_job_logs(
+    client: &reqwest::Client,
+    url: &str,
+    run_id: &str,
+    job: Option<&str>,
+) -> anyhow::Result<String> {
+    let mut request = client.get(format!("{url}/api/v1/runs/{run_id}/logs"));
+    if let Some(job) = job {
+        request = request.query(&[("job", job)]);
+    }
+    if let Some(token) = api_token() {
+        request = request.bearer_auth(token);
+    }
+    let response = request.send().await?;
+    if !response.status().is_success() {
+        let status = response.status();
+        let body = response.text().await.unwrap_or_default();
+        anyhow::bail!("server returned {status}: {body}");
+    }
+    Ok(response.text().await?)
+}
+
+/// Stream one job's live console feed and exit when that job finishes.
+///
+/// The server closes the selected job's feed when that job completes. The
+/// client drains every queued SSE frame before returning; if a completed job
+/// has no retained in-memory snapshot (for example after a server restart),
+/// the durable job-log endpoint supplies the missing output.
+async fn follow_run_logs(
+    client: &reqwest::Client,
+    url: &str,
+    run_id: &str,
+    job: Option<&str>,
+) -> anyhow::Result<()> {
+    use futures_util::StreamExt as _;
+
+    let mut request = client.get(format!("{url}/api/v1/runs/{run_id}/logs/live"));
+    if let Some(job) = job {
+        request = request.query(&[("job", job)]);
+    }
+    if let Some(token) = api_token() {
+        request = request.bearer_auth(token);
+    }
+    let response = request.send().await?;
+    if !response.status().is_success() {
+        let status = response.status();
+        let body = response.text().await.unwrap_or_default();
+        anyhow::bail!("server returned {status}: {body}");
+    }
+
+    let mut stream = response.bytes_stream();
+    let mut buffer = Vec::new();
+    let mut emitted_data = false;
+    while let Some(chunk) = stream.next().await {
+        let bytes = chunk.map_err(|error| anyhow::anyhow!("live log stream failed: {error}"))?;
+        buffer.extend_from_slice(&bytes);
+        while let Some((frame_end, delimiter_len)) = next_sse_frame(&buffer) {
+            let frame: Vec<u8> = buffer.drain(..frame_end).collect();
+            buffer.drain(..delimiter_len);
+            emitted_data |= print_live_log_frame_bytes(&frame)?;
+        }
+    }
+    // A well-formed SSE server terminates every event with a blank line, but
+    // process a final complete-looking frame rather than silently dropping it.
+    if !buffer.is_empty() {
+        emitted_data |= print_live_log_frame_bytes(&buffer)?;
+    }
+
+    if !emitted_data {
+        // The live buffer is intentionally in-memory. A late follower after a
+        // restart still gets the durable output instead of a successful empty
+        // follow.
+        let body = fetch_run_job_logs(client, url, run_id, job).await?;
+        print!("{body}");
+    }
+    Ok(())
+}
+
+/// Return the first complete SSE frame delimiter and its byte length.
+fn next_sse_frame(buffer: &[u8]) -> Option<(usize, usize)> {
+    for index in 0..buffer.len().saturating_sub(1) {
+        if buffer[index..].starts_with(b"\n\n") {
+            return Some((index, 2));
+        }
+        if index + 4 <= buffer.len() && buffer[index..].starts_with(b"\r\n\r\n") {
+            return Some((index, 4));
+        }
+        if buffer[index..].starts_with(b"\r\r") {
+            return Some((index, 2));
+        }
+    }
+    None
+}
+
+/// Print console lines carried by one complete, UTF-8 SSE frame.
+///
+/// Raw bytes are decoded only after the frame boundary is known, so an HTTP
+/// chunk split in the middle of a multibyte character cannot corrupt JSON.
+/// Keep-alive/comment frames and malformed JSON remain non-fatal.
+fn print_live_log_frame_bytes(frame: &[u8]) -> anyhow::Result<bool> {
+    let frame = std::str::from_utf8(frame).context("live log SSE frame was not UTF-8")?;
+    let mut data_lines = Vec::new();
+    for line in frame.split('\n') {
+        let line = line.strip_suffix('\r').unwrap_or(line);
+        let Some(payload) = line.strip_prefix("data:") else {
+            continue;
+        };
+        data_lines.push(payload.strip_prefix(' ').unwrap_or(payload));
+    }
+    if data_lines.is_empty() {
+        return Ok(false);
+    }
+    let payload = data_lines.join("\n");
+    let Ok(wrapper) =
+        serde_json::from_str::<preloop_gha_protocol::LiveLogFeedLinesWrapper>(&payload)
+    else {
+        return Ok(false);
+    };
+    for console_line in &wrapper.value {
+        println!("{console_line}");
+    }
+    Ok(!wrapper.value.is_empty())
+}
+
+/// Print one SSE frame for callers/tests that already have valid UTF-8 text.
+#[cfg(test)]
+fn print_live_log_frame(frame: &str) {
+    let _ = print_live_log_frame_bytes(frame.as_bytes());
 }
 
 async fn cmd_cancel(args: CancelArgs) -> anyhow::Result<()> {
@@ -3081,38 +4311,254 @@ mod tests {
 
     /// Serializes tests that mutate process-global env vars read by
     /// `local_runner_pool_config` (`PRELOOP_RUNNER_BUNDLE`,
-    /// `PRELOOP_RUNNER_BASE_IMAGE`, `PRELOOP_RUNNER_STORAGE_GB`): parallel
-    /// test threads would otherwise race each other's set_var/remove_var
-    /// pairs.
+    /// `PRELOOP_RUNNER_BASE_IMAGE`, `PRELOOP_RUNNER_CPUS`,
+    /// `PRELOOP_RUNNER_STORAGE_GB`): parallel test threads would otherwise
+    /// race each other's set_var/remove_var pairs.
     static TEST_ENV_MUTEX: std::sync::Mutex<()> = std::sync::Mutex::new(());
 
+    mod github_credential_migration {
+        use super::super::migrate_legacy_github_credentials;
+        use preloop_runner_server::config::{AppConfig, ConfigFile, GitHubConfig};
+        use preloop_runner_server::credential_store::{
+            github_reference, CredentialStore, MemoryCredentialStore,
+        };
+
+        fn legacy_config() -> ConfigFile {
+            ConfigFile {
+                github: GitHubConfig {
+                    app_id: Some("123".into()),
+                    legacy_app_pem: Some("INLINE-PEM".into()),
+                    legacy_pat: Some("ghp_inline".into()),
+                    legacy_webhook_secret: Some("hook-secret".into()),
+                    ..Default::default()
+                },
+                ..Default::default()
+            }
+        }
+
+        #[test]
+        fn inline_credentials_move_into_the_store() {
+            let store = MemoryCredentialStore::default();
+            let mut config = legacy_config();
+            assert!(migrate_legacy_github_credentials(&mut config, &store).unwrap());
+
+            assert_eq!(config.github.legacy_app_pem, None);
+            assert_eq!(config.github.legacy_pat, None);
+            assert_eq!(config.github.legacy_webhook_secret, None);
+            assert_eq!(
+                config.github.app_pem_ref.as_deref(),
+                Some("github-app-pem-123")
+            );
+            let pem_ref = github_reference("app-pem", Some("123")).unwrap();
+            assert_eq!(
+                store.get(&pem_ref).unwrap().as_ref().map(|s| s.expose()),
+                Some("INLINE-PEM")
+            );
+            let pat_ref = github_reference("pat", None).unwrap();
+            assert_eq!(
+                store.get(&pat_ref).unwrap().as_ref().map(|s| s.expose()),
+                Some("ghp_inline")
+            );
+        }
+        /// The regression: migration used to inspect fields that the loader
+        /// had just populated from the credential store, so it reported a
+        /// migration and rewrote config.toml on every single startup.
+        #[test]
+        fn migration_is_idempotent() {
+            let store = MemoryCredentialStore::default();
+            let mut config = legacy_config();
+            assert!(migrate_legacy_github_credentials(&mut config, &store).unwrap());
+            assert!(
+                !migrate_legacy_github_credentials(&mut config, &store).unwrap(),
+                "second run must be a no-op"
+            );
+        }
+
+        /// `preloop setup github --webhook-secret` writes a secret with no
+        /// App id. Failing that config would refuse to start the server.
+        #[test]
+        fn a_missing_app_id_is_not_fatal() {
+            let store = MemoryCredentialStore::default();
+            let mut config = ConfigFile {
+                github: GitHubConfig {
+                    legacy_webhook_secret: Some("hook-secret".into()),
+                    legacy_pat: Some("ghp_inline".into()),
+                    ..Default::default()
+                },
+                ..Default::default()
+            };
+            // The PAT needs no App id, so it still migrates.
+            assert!(migrate_legacy_github_credentials(&mut config, &store).unwrap());
+            assert_eq!(config.github.legacy_pat, None);
+            assert_eq!(
+                config.github.legacy_webhook_secret.as_deref(),
+                Some("hook-secret"),
+                "un-namespaceable secret must be left inline, not dropped"
+            );
+        }
+
+        #[test]
+        fn registry_entries_migrate_too() {
+            let store = MemoryCredentialStore::default();
+            let mut config = ConfigFile {
+                github: GitHubConfig {
+                    apps: vec![AppConfig {
+                        app_id: "456".into(),
+                        legacy_pem: "REGISTRY-PEM".into(),
+                        legacy_webhook_secret: Some("registry-hook".into()),
+                        ..Default::default()
+                    }],
+                    ..Default::default()
+                },
+                ..Default::default()
+            };
+            assert!(migrate_legacy_github_credentials(&mut config, &store).unwrap());
+            assert!(config.github.apps[0].legacy_pem.is_empty());
+            assert_eq!(config.github.apps[0].legacy_webhook_secret, None);
+            let pem_ref = github_reference("app-pem", Some("456")).unwrap();
+            assert_eq!(
+                store.get(&pem_ref).unwrap().as_ref().map(|s| s.expose()),
+                Some("REGISTRY-PEM")
+            );
+            assert!(!migrate_legacy_github_credentials(&mut config, &store).unwrap());
+        }
+
+        #[test]
+        fn rotation_preserves_existing_store_credentials() {
+            let store = MemoryCredentialStore::default();
+            let pat_ref = github_reference("pat", None).unwrap();
+            store
+                .set(
+                    &pat_ref,
+                    &preloop_runner_server::credential_store::SecretString::new("ROTATED-PAT"),
+                )
+                .unwrap();
+
+            let mut config = ConfigFile {
+                github: GitHubConfig {
+                    legacy_pat: Some("stale_legacy_pat".into()),
+                    pat_ref: Some(pat_ref.as_str().to_owned()),
+                    ..Default::default()
+                },
+                ..Default::default()
+            };
+
+            assert!(migrate_legacy_github_credentials(&mut config, &store).unwrap());
+            assert_eq!(config.github.legacy_pat, None);
+            assert_eq!(
+                store.get(&pat_ref).unwrap().as_ref().map(|s| s.expose()),
+                Some("ROTATED-PAT"),
+                "migration must not overwrite rotated store value with stale legacy value"
+            );
+        }
+
+        #[test]
+        fn empty_legacy_values_do_not_fail_migration() {
+            let store = MemoryCredentialStore::default();
+            let mut config = ConfigFile {
+                github: GitHubConfig {
+                    app_id: Some("123".into()),
+                    legacy_app_pem: Some("  ".into()),
+                    legacy_pat: Some("".into()),
+                    legacy_webhook_secret: Some("".into()),
+                    ..Default::default()
+                },
+                ..Default::default()
+            };
+            assert!(!migrate_legacy_github_credentials(&mut config, &store).unwrap());
+        }
+
+        #[test]
+        fn distinct_hosts_with_identical_app_ids_do_not_collide_in_store() {
+            let store = MemoryCredentialStore::default();
+            let mut config_cloud = ConfigFile {
+                github: GitHubConfig {
+                    app_id: Some("999".into()),
+                    server_url: Some("https://github.com".into()),
+                    legacy_app_pem: Some("CLOUD-PEM".into()),
+                    ..Default::default()
+                },
+                ..Default::default()
+            };
+            let mut config_ghes = ConfigFile {
+                github: GitHubConfig {
+                    app_id: Some("999".into()),
+                    server_url: Some("https://ghe.corp.internal".into()),
+                    legacy_app_pem: Some("GHES-PEM".into()),
+                    ..Default::default()
+                },
+                ..Default::default()
+            };
+
+            assert!(migrate_legacy_github_credentials(&mut config_cloud, &store).unwrap());
+            assert!(migrate_legacy_github_credentials(&mut config_ghes, &store).unwrap());
+
+            let cloud_ref = preloop_runner_server::credential_store::github_reference_with_host(
+                "app-pem",
+                Some("https://github.com"),
+                Some("999"),
+            )
+            .unwrap();
+            let ghes_ref = preloop_runner_server::credential_store::github_reference_with_host(
+                "app-pem",
+                Some("https://ghe.corp.internal"),
+                Some("999"),
+            )
+            .unwrap();
+
+            assert_ne!(cloud_ref.as_str(), ghes_ref.as_str());
+            assert_eq!(
+                store.get(&cloud_ref).unwrap().as_ref().map(|s| s.expose()),
+                Some("CLOUD-PEM")
+            );
+            assert_eq!(
+                store.get(&ghes_ref).unwrap().as_ref().map(|s| s.expose()),
+                Some("GHES-PEM")
+            );
+        }
+    }
+
     #[test]
-    fn first_serve_token_creates_private_home_and_file() {
+    fn truncate_reason_cuts_on_char_boundary() {
+        // 200 four-byte characters = 800 bytes; byte-slicing at 300 would
+        // panic. The result must be a valid, shorter string ending with the
+        // ellipsis.
+        let long = "界".repeat(200);
+        let truncated = truncate_reason(&long);
+        assert!(truncated.ends_with('…'));
+        assert!(truncated.len() < long.len());
+        assert!(truncated.is_char_boundary(truncated.len()));
+        // Short input passes through untouched.
+        assert_eq!(truncate_reason("  ok  "), "ok");
+    }
+
+    #[test]
+    fn first_serve_token_creates_private_home_and_store_entry() {
         let root = tempfile::tempdir().unwrap();
         let home = root.path().join("missing").join(".preloop");
         assert!(!home.exists());
+        let store = preloop_runner_server::credential_store::MemoryCredentialStore::default();
 
-        let token = prepare_engine_token(&home, None).unwrap();
+        let token = prepare_engine_token(&home, None, &store).unwrap();
 
         assert_eq!(token.len(), 64);
+        let reference =
+            preloop_runner_server::credential_store::engine_token_reference(&home).unwrap();
         assert_eq!(
-            std::fs::read_to_string(home.join("engine.token")).unwrap(),
-            token
+            store
+                .get(&reference)
+                .unwrap()
+                .as_ref()
+                .map(|value| value.expose()),
+            Some(token.as_str())
         );
+        assert!(!home.join("engine.token").exists());
         #[cfg(unix)]
         {
             use std::os::unix::fs::PermissionsExt as _;
             assert_eq!(
                 std::fs::metadata(&home).unwrap().permissions().mode() & 0o777,
                 0o700
-            );
-            assert_eq!(
-                std::fs::metadata(home.join("engine.token"))
-                    .unwrap()
-                    .permissions()
-                    .mode()
-                    & 0o777,
-                0o600
             );
         }
     }
@@ -3155,6 +4601,28 @@ mod tests {
         assert!(require_digest_pinned_base("/tmp/preloop.smolmachine").is_ok());
         assert!(require_digest_pinned_base("ghcr.io/acme/base:latest").is_err());
         assert!(require_digest_pinned_base("ghcr.io/acme/base@sha256:not-a-digest").is_err());
+    }
+
+    #[test]
+    fn runner_cpus_honors_positive_values_and_rejects_invalid_values() {
+        let _env_guard = TEST_ENV_MUTEX.lock().unwrap();
+        for (value, expected) in [
+            ("1", 1),
+            (" 8 ", 8),
+            ("0", RUNNER_CPUS),
+            ("-1", RUNNER_CPUS),
+            ("not-a-number", RUNNER_CPUS),
+            ("65536", RUNNER_CPUS),
+        ] {
+            unsafe {
+                std::env::set_var("PRELOOP_RUNNER_CPUS", value);
+            }
+            assert_eq!(runner_cpus(), expected, "{value}");
+        }
+        unsafe {
+            std::env::remove_var("PRELOOP_RUNNER_CPUS");
+        }
+        assert_eq!(runner_cpus(), RUNNER_CPUS);
     }
 
     #[test]
@@ -3283,6 +4751,10 @@ mod tests {
                 false,
                 std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
                 std::sync::Arc::new(std::sync::RwLock::new(std::collections::BTreeMap::new())),
+                std::sync::Arc::new(preloop_observability::status::PoolStatus::new(
+                    preloop_observability::status::PoolSnapshot::default(),
+                )),
+                preloop_observability::Observability::noop(),
             )
             .unwrap();
             unsafe {
@@ -3358,6 +4830,10 @@ mod tests {
                 false,
                 std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
                 std::sync::Arc::new(std::sync::RwLock::new(std::collections::BTreeMap::new())),
+                std::sync::Arc::new(preloop_observability::status::PoolStatus::new(
+                    preloop_observability::status::PoolSnapshot::default(),
+                )),
+                preloop_observability::Observability::noop(),
             )
             .unwrap();
             unsafe {
@@ -3407,6 +4883,124 @@ mod tests {
         );
         assert_eq!(
             default_local_activity_type("push", &serde_json::json!({})),
+            None
+        );
+    }
+
+    #[test]
+    fn porcelain_path_handles_status_columns_renames_and_quotes() {
+        assert_eq!(
+            porcelain_path(" M src/lib.rs").as_deref(),
+            Some("src/lib.rs")
+        );
+        assert_eq!(porcelain_path("?? new.rs").as_deref(), Some("new.rs"));
+        assert_eq!(porcelain_path("A  added.rs").as_deref(), Some("added.rs"));
+        // Only the destination of a rename exists in the tree now.
+        assert_eq!(
+            porcelain_path("R  old.rs -> new.rs").as_deref(),
+            Some("new.rs")
+        );
+        // `core.quotePath` wraps non-ASCII names; filters are written unquoted.
+        assert_eq!(
+            porcelain_path("?? \"src/späte.rs\"").as_deref(),
+            Some("src/späte.rs")
+        );
+        assert_eq!(
+            porcelain_path("?? \"src/sp\\303\\244te.rs\"").as_deref(),
+            Some("src/späte.rs")
+        );
+        assert_eq!(porcelain_path(""), None);
+        assert_eq!(porcelain_path("   "), None);
+    }
+
+    #[test]
+    fn only_file_list_events_derive_changed_paths() {
+        for event in [
+            "push",
+            "pull_request",
+            "pull_request_target",
+            "pull_request_review",
+            "merge_group",
+        ] {
+            assert!(event_carries_changed_files(event), "{event}");
+        }
+        // GitHub sends no file list for these, so deriving one would invent a
+        // contract the real event does not have.
+        for event in ["workflow_dispatch", "schedule", "release", "issue_comment"] {
+            assert!(!event_carries_changed_files(event), "{event}");
+        }
+    }
+
+    /// An explicit payload states the change set; derivation must not override
+    /// it, or `--payload` would silently stop working.
+    #[test]
+    fn explicit_payload_paths_suppress_derivation() {
+        assert!(
+            default_local_changed_paths("push", None, &serde_json::json!({"paths": ["a.rs"]}))
+                .is_none()
+        );
+        assert!(default_local_changed_paths(
+            "push",
+            None,
+            &serde_json::json!({"commits": [{"modified": ["a.rs"]}]})
+        )
+        .is_none());
+        // Events without a file list never derive, payload or not.
+        assert!(
+            default_local_changed_paths("workflow_dispatch", None, &serde_json::json!({}))
+                .is_none()
+        );
+    }
+
+    #[test]
+    fn filter_branch_derives_pr_target_not_head() {
+        // GitHub filters a PR on its target branch; `--base` names it.
+        assert_eq!(
+            default_local_filter_branch("pull_request", Some("main"), &serde_json::json!({}))
+                .as_deref(),
+            Some("main")
+        );
+        // Remote-qualified refs are reduced to the branch name filters use.
+        assert_eq!(
+            default_local_filter_branch(
+                "pull_request",
+                Some("origin/release-2"),
+                &serde_json::json!({})
+            )
+            .as_deref(),
+            Some("release-2")
+        );
+        // Slashes within branch names must be preserved
+        assert_eq!(
+            default_local_filter_branch(
+                "pull_request",
+                Some("origin/feature/auth"),
+                &serde_json::json!({})
+            )
+            .as_deref(),
+            Some("feature/auth")
+        );
+        assert_eq!(
+            default_local_filter_branch(
+                "pull_request",
+                Some("release/v1.0"),
+                &serde_json::json!({})
+            )
+            .as_deref(),
+            Some("release/v1.0")
+        );
+        // A payload that already carries the base ref wins.
+        assert_eq!(
+            default_local_filter_branch(
+                "pull_request",
+                Some("main"),
+                &serde_json::json!({"pull_request": {"base": {"ref": "develop"}}})
+            ),
+            None
+        );
+        // Only PR-family events have a target branch.
+        assert_eq!(
+            default_local_filter_branch("push", Some("main"), &serde_json::json!({})),
             None
         );
     }
@@ -3532,6 +5126,66 @@ mod tests {
         };
         assert_eq!(args.job.unwrap(), "build");
         assert_eq!(args.step.unwrap(), 3);
+    }
+
+    /// The flags used to parse and then be dropped on the floor. Assert the
+    /// wire query itself, not just that clap accepted the argument.
+    #[test]
+    fn logs_filters_reach_the_query_string() {
+        assert_eq!(
+            logs_query(Some("build"), Some(3)),
+            vec![("job", "build".to_owned()), ("step", "3".to_owned())]
+        );
+    }
+
+    #[test]
+    fn logs_query_omits_absent_filters() {
+        assert!(logs_query(None, None).is_empty());
+        assert_eq!(
+            logs_query(Some("test"), None),
+            vec![("job", "test".to_owned())]
+        );
+        assert_eq!(logs_query(None, Some(2)), vec![("step", "2".to_owned())]);
+    }
+
+    #[test]
+    fn logs_follow_flag_parses_short_and_long() {
+        for argv in [vec!["logs", "-f"], vec!["logs", "--follow"]] {
+            let cli = parse(&argv).unwrap();
+            let Command::Logs(args) = cli.command else {
+                panic!("expected Logs");
+            };
+            assert!(args.follow, "{argv:?} should enable follow");
+        }
+    }
+
+    #[test]
+    fn logs_defaults_to_no_follow_and_no_filters() {
+        let cli = parse(&["logs"]).unwrap();
+        let Command::Logs(args) = cli.command else {
+            panic!("expected Logs");
+        };
+        assert!(!args.follow);
+        assert!(args.job.is_none());
+        assert!(args.step.is_none());
+    }
+
+    #[test]
+    fn live_log_frame_prints_only_console_lines() {
+        let frame = "event: live-log\ndata: {\"stepId\":\"s1\",\"startLine\":1,\"count\":2,\
+                     \"value\":[\"first\",\"second\"]}";
+        // The production parser reports whether this frame emitted console
+        // lines; the `event:` line itself carries no output.
+        assert!(print_live_log_frame_bytes(frame.as_bytes()).unwrap());
+        assert!(!print_live_log_frame_bytes(b"event: live-log").unwrap());
+    }
+
+    #[test]
+    fn live_log_frame_tolerates_keepalive_and_garbage() {
+        // Keep-alive comments and unparseable payloads must not abort a follow.
+        print_live_log_frame(":");
+        print_live_log_frame("event: live-log\ndata: not-json");
+        print_live_log_frame("");
     }
 
     #[test]
@@ -3761,14 +5415,29 @@ mod tests {
     #[test]
     fn status_parses() {
         let cli = parse(&["status"]).unwrap();
-        assert!(matches!(cli.command, Command::Status { run_id: None }));
-        let cli = parse(&["status", "550e8400-e29b-41d4-a716-446655440000"]).unwrap();
-        assert!(matches!(
-            cli.command,
-            Command::Status {
-                run_id: Some(ref id)
-            } if id == "550e8400-e29b-41d4-a716-446655440000"
-        ));
+        let Command::Status(args) = cli.command else {
+            panic!("expected Status");
+        };
+        assert!(!args.json);
+        assert_eq!(args.limit, 20);
+        let cli = parse(&["status", "--json", "--limit", "5"]).unwrap();
+        let Command::Status(args) = cli.command else {
+            panic!("expected Status");
+        };
+        assert!(args.json);
+        assert_eq!(args.limit, 5);
+        // Default limit is 20 and --json defaults to false
+        let cli = parse(&["status", "--limit", "42"]).unwrap();
+        let Command::Status(args) = cli.command else {
+            panic!("expected Status");
+        };
+        assert_eq!(args.limit, 42);
+        // Historical single-run mode: `preloop status <run_id>` still parses.
+        let cli = parse(&["status", "run-abc"]).unwrap();
+        let Command::Status(args) = cli.command else {
+            panic!("expected Status");
+        };
+        assert_eq!(args.run_id.as_deref(), Some("run-abc"));
     }
 
     #[test]

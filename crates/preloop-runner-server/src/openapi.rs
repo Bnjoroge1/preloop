@@ -151,6 +151,7 @@ pub(crate) struct RunResponse {
         list_runs,
         get_run,
         get_run_logs,
+        live_run_logs,
         cancel_run,
         rerun_run,
         run_events,
@@ -179,7 +180,10 @@ pub(crate) struct RunResponse {
         list_dispatch_runs,
         github_register,
         github_callback,
-        list_runners
+        list_runners,
+        readyz,
+        status,
+        metrics
     ),
     components(
         schemas(
@@ -204,7 +208,8 @@ impl Modify for SecuritySchemes {
                 Http::builder()
                     .scheme(HttpAuthScheme::Bearer)
                     .description(Some(
-                        "System token (`PRELOOP_SYSTEM_TOKEN` or default `preloop-system-token`). \
+                        "System token (`PRELOOP_SYSTEM_TOKEN`, or a per-engine token generated \
+                         and stored in the OS credential store or private engine.token file). \
                          Used by CLI clients, agents, and operators.",
                     ))
                     .build(),
@@ -282,6 +287,38 @@ type JsonValue = serde_json::Value;
 )]
 fn healthz() {}
 
+/// Server readiness check (public, reason codes on 503).
+#[utoipa::path(
+    get, path = "/readyz", tag = "Health",
+    responses(
+        (status = 200, description = "Ready", body = JsonValue),
+        (status = 503, description = "Not ready", body = JsonValue)
+    )
+)]
+fn readyz() {}
+
+/// Operational status snapshot (native bearer required).
+#[utoipa::path(
+    get, path = "/api/v1/status", tag = "Health",
+    responses(
+        (status = 200, description = "Operational snapshot", body = JsonValue),
+        (status = 401, description = "Unauthorized", body = ApiErrorResponse)
+    ),
+    security(("native_bearer" = []))
+)]
+fn status() {}
+
+/// Prometheus metrics (native bearer required).
+#[utoipa::path(
+    get, path = "/metrics", tag = "Health",
+    responses(
+        (status = 200, description = "Prometheus text", content_type = "text/plain", body = String),
+        (status = 401, description = "Unauthorized", body = ApiErrorResponse)
+    ),
+    security(("native_bearer" = []))
+)]
+fn metrics() {}
+
 // ── Runs ────────────────────────────────────────────────────────────────────
 
 /// Submit a workflow run.
@@ -323,17 +360,40 @@ fn list_runs() {}
 )]
 fn get_run() {}
 
-/// Get formatted run logs (HTML).
+/// Get run logs as plain text, optionally narrowed to one job or step.
 #[utoipa::path(
     get, path = "/api/v1/runs/{run_id}/logs", tag = "Runs",
-    params(("run_id" = String, Path, description = "Run UUID")),
+    params(
+        ("run_id" = String, Path, description = "Run UUID"),
+        ("job" = Option<String>, Query, description = "Workflow job key or agent job UUID; omit for every job"),
+        ("step" = Option<usize>, Query, description = "1-based step index within the job, in execution order")
+    ),
     responses(
-        (status = 200, content_type = "text/html", description = "Rendered log page", body = String),
-        (status = 404, description = "Run not found", body = ApiErrorResponse)
+        (status = 200, content_type = "text/plain", description = "Merged log text", body = String),
+        (status = 400, description = "`step` given without `job` in a multi-job run", body = ApiErrorResponse),
+        (status = 404, description = "Run, job, or step not found", body = ApiErrorResponse),
+        (status = 409, description = "Job reported one merged log, which has no step boundaries", body = ApiErrorResponse)
     ),
     security(("native_bearer" = []))
 )]
+
 fn get_run_logs() {}
+
+/// Follow one job's live console output as server-sent events.
+#[utoipa::path(
+    get, path = "/api/v1/runs/{run_id}/logs/live", tag = "Runs",
+    params(
+        ("run_id" = String, Path, description = "Run UUID"),
+        ("job" = Option<String>, Query, description = "Workflow job key or agent job UUID; required when the run has multiple jobs")
+    ),
+    responses(
+        (status = 200, content_type = "text/event-stream", description = "Live log events; the stream closes when the selected job is terminal", body = String),
+        (status = 400, description = "Job is required when the run has multiple jobs", body = ApiErrorResponse),
+        (status = 404, description = "Run or job not found", body = ApiErrorResponse)
+    ),
+    security(("native_bearer" = []))
+)]
+fn live_run_logs() {}
 
 /// Cancel a running workflow.
 #[utoipa::path(

@@ -160,16 +160,25 @@ pub(crate) fn github_api_base() -> String {
         .unwrap_or_else(|| "https://api.github.com".to_owned())
 }
 
+fn record_check_reporting(shared: &Arc<SharedState>, success: bool) {
+    let mut snapshot = shared.state.status_snapshot.write();
+    if success {
+        snapshot.github.last_check_success_at = Some(chrono::Utc::now());
+    } else {
+        snapshot.github.last_check_failure_at = Some(chrono::Utc::now());
+    }
+}
+
 async fn resolve_check_run_token(shared: &Arc<SharedState>, repo: &str) -> Option<String> {
-    if let Some(app_creds) = crate::github_app::select_app_for_repo(shared, repo).await {
+    let app_creds = crate::github_app::select_app_for_repo(shared, repo).await;
+    if let Some(app_creds) = app_creds.as_ref() {
         let mut permissions = std::collections::BTreeMap::new();
         permissions.insert("checks".to_owned(), "write".to_owned());
         // The App mint intermittently 422s while the installation grants are
         // being read; a single retry keeps a transient rejection from
-        // stranding the check run in `queued` (the fallback JWT cannot
-        // PATCH check runs and GitHub keeps showing them pending).
+        // stranding the check run in `queued`.
         for attempt in 0..2 {
-            match crate::github_app::get_or_mint_token(&app_creds, repo, &permissions).await {
+            match crate::github_app::get_or_mint_token(app_creds, repo, &permissions).await {
                 Ok(token) => return Some(token),
                 Err(error) if attempt == 0 => {
                     tracing::warn!(
@@ -179,14 +188,22 @@ async fn resolve_check_run_token(shared: &Arc<SharedState>, repo: &str) -> Optio
                     );
                     tokio::time::sleep(std::time::Duration::from_millis(500)).await;
                 }
-                Err(_) => break,
+                Err(error) => {
+                    tracing::warn!(%repo, %error, "check run token mint failed");
+                    break;
+                }
             }
         }
     }
-    std::env::var("PRELOOP_GITHUB_TOKEN").ok()
+    let fallback = std::env::var("PRELOOP_GITHUB_TOKEN").ok();
+    if fallback.is_none() && app_creds.is_some() {
+        record_check_reporting(shared, false);
+    }
+    fallback
 }
 
 async fn send_github_check_request(
+    shared: &Arc<SharedState>,
     token: &str,
     repo: &str,
     method: reqwest::Method,
@@ -202,11 +219,19 @@ async fn send_github_check_request(
         .header("Accept", "application/vnd.github+json")
         .json(&body)
         .send()
-        .await?;
+        .await;
+    let res = match res {
+        Ok(response) => response,
+        Err(error) => {
+            record_check_reporting(shared, false);
+            return Err(error.into());
+        }
+    };
 
     if !res.status().is_success() {
         let status = res.status();
         let err_text = res.text().await.unwrap_or_default();
+        record_check_reporting(shared, false);
         return Err(anyhow::anyhow!(
             "GitHub Check API failed with status {}: {}",
             status,
@@ -214,6 +239,7 @@ async fn send_github_check_request(
         ));
     }
 
+    record_check_reporting(shared, true);
     let val = res.json().await.unwrap_or(Value::Null);
     Ok(val)
 }
@@ -238,17 +264,37 @@ pub(crate) async fn report_check_run_queued(
     if let Some(token) = &token {
         let details_url = run_details_url(run_id);
 
+        let job_name = {
+            let inner = shared.state.inner.lock().await;
+            inner
+                .runs
+                .get(&run_id)
+                .and_then(|run| run.job_names.get(job_id))
+                .cloned()
+                .unwrap_or_else(|| job_id.0.clone())
+        };
         let mut body = serde_json::json!({
-            "name": job_id.to_string(),
+            "name": job_name,
             "head_sha": sha,
             "status": "queued",
+            "output": {
+                "title": job_name,
+                "summary": format!("Waiting for a preloop runner.\n\njob_id: `{}`", job_id.0)
+            }
         });
         if let Some(url) = details_url {
             body["details_url"] = serde_json::json!(url);
         }
 
-        match send_github_check_request(token, repo, reqwest::Method::POST, "check-runs", body)
-            .await
+        match send_github_check_request(
+            shared,
+            token,
+            repo,
+            reqwest::Method::POST,
+            "check-runs",
+            body,
+        )
+        .await
         {
             Ok(res) => {
                 if let Some(id) = res.get("id").and_then(|id| id.as_u64()) {
@@ -311,7 +357,8 @@ pub(crate) async fn report_existing_check_run_queued(
         }
         let path = format!("check-runs/{check_run_id}");
         if let Err(error) =
-            send_github_check_request(token, repo, reqwest::Method::PATCH, &path, body).await
+            send_github_check_request(shared, token, repo, reqwest::Method::PATCH, &path, body)
+                .await
         {
             warn!(
                 %run_id,
@@ -386,7 +433,7 @@ pub(crate) async fn report_check_run_in_progress(
     run_id: RunId,
     job_id: &JobId,
 ) {
-    let (repo, check_run_id) = {
+    let (repo, check_run_id, job_name) = {
         let inner = shared.state.inner.lock().await;
         let run = match inner.runs.get(&run_id) {
             Some(r) => r,
@@ -397,15 +444,26 @@ pub(crate) async fn report_check_run_in_progress(
             Some(id) => id,
             None => return,
         };
-        (repo, check_run_id)
+        let job_name = run
+            .job_names
+            .get(job_id)
+            .cloned()
+            .unwrap_or_else(|| job_id.0.clone());
+        (repo, check_run_id, job_name)
     };
 
     let token = resolve_check_run_token(shared, &repo).await;
     if let Some(token) = &token {
         let details_url = run_details_url(run_id);
 
+        let started_at = chrono::Utc::now().to_rfc3339();
         let mut body = serde_json::json!({
             "status": "in_progress",
+            "started_at": started_at,
+            "output": {
+                "title": job_name,
+                "summary": "Running in preloop."
+            }
         });
         if let Some(url) = details_url {
             body["details_url"] = serde_json::json!(url);
@@ -413,7 +471,8 @@ pub(crate) async fn report_check_run_in_progress(
 
         let path = format!("check-runs/{}", check_run_id);
         if let Err(e) =
-            send_github_check_request(token, &repo, reqwest::Method::PATCH, &path, body).await
+            send_github_check_request(shared, token, &repo, reqwest::Method::PATCH, &path, body)
+                .await
         {
             warn!(
                 %run_id,
@@ -428,6 +487,63 @@ pub(crate) async fn report_check_run_in_progress(
     }
 }
 
+fn markdown_cell(value: &str) -> String {
+    value.replace('|', "\\|").replace(['\r', '\n'], " ")
+}
+
+fn duration_text(
+    started_at: Option<chrono::DateTime<chrono::Utc>>,
+    finished_at: Option<chrono::DateTime<chrono::Utc>>,
+) -> String {
+    match (started_at, finished_at) {
+        (Some(start), Some(finish)) => {
+            let duration = finish
+                .signed_duration_since(start)
+                .num_milliseconds()
+                .max(0);
+            format!("{:.1}s", duration as f64 / 1000.0)
+        }
+        (Some(_), None) => "running".to_owned(),
+        _ => "-".to_owned(),
+    }
+}
+
+fn check_summary(
+    conclusion: &str,
+    steps: &[crate::models::StepRecord],
+    global_issues: &[String],
+    job_id: &JobId,
+) -> String {
+    let mut summary = format!("Job completed with status: **{conclusion}**");
+    if !steps.is_empty() {
+        summary.push_str("\n\n| Step | Conclusion | Duration |\n|---|---:|---:|");
+        for step in steps {
+            summary.push_str(&format!(
+                "\n| {} | {} | {} |",
+                markdown_cell(&step.name),
+                markdown_cell(&step.conclusion),
+                duration_text(step.started_at, step.finished_at)
+            ));
+        }
+        if let Some(failed) = steps.iter().find(|step| step.conclusion == "failure") {
+            summary.push_str(&format!(
+                "\n\n**Failed step:** `{}`",
+                markdown_cell(&failed.name)
+            ));
+        }
+    }
+    if !global_issues.is_empty() {
+        summary.push_str("\n\n### Failure details\n");
+        summary.push_str(&global_issues.join("\n"));
+    }
+    // Map the display name back to the workflow job id: required status
+    // checks match on this exact display string, so a rename that breaks
+    // the ruleset is diagnosable from the check page itself instead of
+    // presenting as "Expected" forever with no explanation.
+    summary.push_str(&format!("\n\njob_id: `{}`", job_id.0));
+    summary
+}
+
 /// Report check run status to completed on GitHub or simulate it locally.
 pub(crate) async fn report_check_run_completed(
     shared: &Arc<SharedState>,
@@ -435,10 +551,10 @@ pub(crate) async fn report_check_run_completed(
     job_id: &JobId,
     status: ExecutionStatus,
 ) {
-    let (repo, check_run_id, annotations, global_issues) = {
+    let (repo, check_run_id, job_name, steps, started_at, completed_at, annotations, global_issues) = {
         let inner = shared.state.inner.lock().await;
         let run = match inner.runs.get(&run_id) {
-            Some(r) => r,
+            Some(run) => run,
             None => return,
         };
         let repo = run.submission.repository.clone();
@@ -446,10 +562,32 @@ pub(crate) async fn report_check_run_completed(
             Some(id) => id,
             None => return,
         };
+        let projected = crate::runs::project_run(&inner, run.clone());
+        let detail = projected
+            .jobs_list
+            .iter()
+            .find(|detail| detail.job_id == job_id.0);
+        let job_name = detail
+            .map(|detail| detail.name.clone())
+            .or_else(|| run.job_names.get(job_id).cloned())
+            .unwrap_or_else(|| job_id.0.clone());
+        let steps = detail
+            .map(|detail| detail.steps.clone())
+            .unwrap_or_default();
+        let started_at = steps
+            .iter()
+            .filter_map(|step| step.started_at)
+            .min()
+            .or(run.started_at);
+        let completed_at = steps
+            .iter()
+            .filter_map(|step| step.finished_at)
+            .max()
+            .or(run.completed_at)
+            .unwrap_or_else(chrono::Utc::now);
 
         let mut annotations = Vec::new();
         let mut global_issues = Vec::new();
-
         if let Some(events) = inner.timeline_events.get(&run_id) {
             for event in events {
                 if let NdjsonEvent::Annotation {
@@ -487,12 +625,26 @@ pub(crate) async fn report_check_run_completed(
                 }
             }
         }
-
-        if annotations.len() > 50 {
-            annotations.truncate(50);
+        if let Some(detail) = detail {
+            for annotation in &detail.annotations {
+                let message = annotation
+                    .get("message")
+                    .and_then(Value::as_str)
+                    .map(str::to_owned)
+                    .unwrap_or_else(|| annotation.to_string());
+                global_issues.push(format!("- {}", markdown_cell(&message)));
+            }
         }
-
-        (repo, check_run_id, annotations, global_issues)
+        (
+            repo,
+            check_run_id,
+            job_name,
+            steps,
+            started_at,
+            completed_at,
+            annotations,
+            global_issues,
+        )
     };
 
     let conclusion = match status {
@@ -502,48 +654,51 @@ pub(crate) async fn report_check_run_completed(
         ExecutionStatus::Skipped => "skipped",
         _ => "failure",
     };
+    let summary = check_summary(conclusion, &steps, &global_issues, job_id);
 
     let token = resolve_check_run_token(shared, &repo).await;
     if let Some(token) = &token {
-        let details_url = run_details_url(run_id);
-
-        let summary = if global_issues.is_empty() {
-            format!("Job completed with status: {}", conclusion)
+        let path = format!("check-runs/{check_run_id}");
+        let chunks: Vec<&[Value]> = if annotations.is_empty() {
+            vec![&[]]
         } else {
-            format!(
-                "Job completed with status: {}\n\n### Global/Job-Level Issues:\n{}",
-                conclusion,
-                global_issues.join("\n")
-            )
+            annotations.chunks(50).collect()
         };
-
-        let mut body = serde_json::json!({
-            "status": "completed",
-            "conclusion": conclusion,
-        });
-        if let Some(url) = details_url {
-            body["details_url"] = serde_json::json!(url);
-        }
-
-        if !annotations.is_empty() || !global_issues.is_empty() {
-            body["output"] = serde_json::json!({
-                "title": format!("Job: {}", job_id.0),
-                "summary": summary,
-                "annotations": annotations,
+        for (index, chunk) in chunks.iter().enumerate() {
+            let last = index + 1 == chunks.len();
+            let mut body = serde_json::json!({
+                "output": {
+                    "title": job_name,
+                    "summary": summary,
+                    "annotations": chunk,
+                }
             });
-        }
-
-        let path = format!("check-runs/{}", check_run_id);
-        if let Err(e) =
-            send_github_check_request(token, &repo, reqwest::Method::PATCH, &path, body).await
-        {
-            warn!(
-                %run_id,
-                %job_id,
-                check_run_id,
-                error = %e,
-                "Failed to update GitHub check run to completed"
-            );
+            if last {
+                body["status"] = serde_json::json!("completed");
+                body["conclusion"] = serde_json::json!(conclusion);
+                body["completed_at"] = serde_json::json!(completed_at.to_rfc3339());
+                if let Some(started_at) = started_at {
+                    body["started_at"] = serde_json::json!(started_at.to_rfc3339());
+                }
+                if let Some(url) = run_details_url(run_id) {
+                    body["details_url"] = serde_json::json!(url);
+                }
+            }
+            if let Err(error) =
+                send_github_check_request(shared, token, &repo, reqwest::Method::PATCH, &path, body)
+                    .await
+            {
+                warn!(
+                    %run_id,
+                    %job_id,
+                    check_run_id,
+                    annotation_batch = index + 1,
+                    annotation_batches = chunks.len(),
+                    %error,
+                    "Failed to update GitHub check run"
+                );
+                return;
+            }
         }
     } else {
         info!(
@@ -579,79 +734,71 @@ pub(crate) async fn fetch_workflows_at(
         // A dispatch for a branch other than the checked-out tree must read
         // the workflow definitions from that ref, not from the working tree.
         if !git_ref.is_empty() {
-            // A ref beginning with '-' would be parsed by git as an option
-            // (e.g. `git rev-parse --verify -x^{commit}`); treat it as
-            // unresolvable and fall back to the checked-out tree.
             if git_ref.starts_with('-') {
-                warn!(
-                    %git_ref,
-                    workspace = %base_path.display(),
-                    "git_ref starts with '-' and is not a valid ref; falling back to the checked-out tree",
-                );
-            } else {
-                let commitish: &str = &format!("{git_ref}^{{commit}}");
-                let resolved = tokio::process::Command::new("git")
-                    .arg("-C")
-                    .arg(base_path)
-                    .args(["rev-parse", "--verify", commitish])
-                    .output()
-                    .await?;
-                if resolved.status.success() {
-                    let listing = tokio::process::Command::new("git")
-                        .arg("-C")
-                        .arg(base_path)
-                        .args([
-                            "ls-tree",
-                            "-r",
-                            "--name-only",
-                            git_ref,
-                            "--",
-                            ".github/workflows",
-                        ])
-                        .output()
-                        .await?;
-                    if !listing.status.success() {
-                        anyhow::bail!(
-                            "git ls-tree for ref {git_ref:?} in {} failed: {}",
-                            base_path.display(),
-                            String::from_utf8_lossy(&listing.stderr),
-                        );
-                    }
-                    for line in String::from_utf8_lossy(&listing.stdout).lines() {
-                        let path = line.trim();
-                        if path.is_empty() {
-                            continue;
-                        }
-                        let name = path.rsplit('/').next().unwrap_or(path);
-                        if name.ends_with(".yml") || name.ends_with(".yaml") {
-                            let path_ref: &str = &format!("{git_ref}:{path}");
-                            let content = tokio::process::Command::new("git")
-                                .arg("-C")
-                                .arg(base_path)
-                                .args(["show", path_ref])
-                                .output()
-                                .await?;
-                            if !content.status.success() {
-                                anyhow::bail!(
-                                    "git show {path_ref:?} in {} failed: {}",
-                                    base_path.display(),
-                                    String::from_utf8_lossy(&content.stderr),
-                                );
-                            }
-                            workflows.insert(
-                                name.to_owned(),
-                                String::from_utf8_lossy(&content.stdout).into_owned(),
-                            );
-                        }
-                    }
-                    return Ok(workflows);
-                }
-                warn!(
-                    %git_ref,
-                    workspace = %base_path.display(),
-                    "git_ref does not resolve in the local workspace; falling back to the checked-out tree",
+                anyhow::bail!("workflow revision {git_ref:?} is not a valid Git ref");
+            }
+            let commitish = format!("{git_ref}^{{commit}}");
+            let resolved = tokio::process::Command::new("git")
+                .arg("-C")
+                .arg(base_path)
+                .args(["rev-parse", "--verify", &commitish])
+                .output()
+                .await?;
+            if !resolved.status.success() {
+                anyhow::bail!(
+                    "workflow revision {git_ref:?} is unavailable in local workspace {}: {}",
+                    base_path.display(),
+                    String::from_utf8_lossy(&resolved.stderr),
                 );
             }
+            let listing = tokio::process::Command::new("git")
+                .arg("-C")
+                .arg(base_path)
+                .args([
+                    "ls-tree",
+                    "-r",
+                    "--name-only",
+                    git_ref,
+                    "--",
+                    ".github/workflows",
+                ])
+                .output()
+                .await?;
+            if !listing.status.success() {
+                anyhow::bail!(
+                    "git ls-tree for ref {git_ref:?} in {} failed: {}",
+                    base_path.display(),
+                    String::from_utf8_lossy(&listing.stderr),
+                );
+            }
+            for line in String::from_utf8_lossy(&listing.stdout).lines() {
+                let path = line.trim();
+                if path.is_empty() {
+                    continue;
+                }
+                let name = path.rsplit('/').next().unwrap_or(path);
+                if name.ends_with(".yml") || name.ends_with(".yaml") {
+                    let path_ref = format!("{git_ref}:{path}");
+                    let content = tokio::process::Command::new("git")
+                        .arg("-C")
+                        .arg(base_path)
+                        .args(["show", &path_ref])
+                        .output()
+                        .await?;
+                    if !content.status.success() {
+                        anyhow::bail!(
+                            "git show {path_ref:?} in {} failed: {}",
+                            base_path.display(),
+                            String::from_utf8_lossy(&content.stderr),
+                        );
+                    }
+                    workflows.insert(
+                        name.to_owned(),
+                        String::from_utf8_lossy(&content.stdout).into_owned(),
+                    );
+                }
+            }
+            return Ok(workflows);
         }
         let workflows_dir = base_path.join(".github/workflows");
         if workflows_dir.exists() {
@@ -676,12 +823,15 @@ pub(crate) async fn fetch_workflows_at(
             let permissions = BTreeMap::from([("contents".to_owned(), "read".to_owned())]);
             Some(crate::github_app::get_or_mint_token_at(api_base, &app, repo, &permissions).await?)
         } else {
-            std::env::var("PRELOOP_GITHUB_TOKEN").ok()
+            shared.state.static_github_pat()
         };
         if let Some(token) = &token {
             fetch_remote_workflows(token, repo, git_ref, api_base).await
+        } else if !git_ref.is_empty() {
+            anyhow::bail!(
+                "cannot fetch workflow revision {git_ref:?} without a local workspace or GitHub credentials"
+            );
         } else {
-            // Default fallback to current workspace root if nothing is configured
             let workflows_dir = PathBuf::from(".").join(".github/workflows");
             let mut workflows = BTreeMap::new();
             if workflows_dir.exists() {
@@ -1284,41 +1434,106 @@ async fn process_github_webhook(
         } else {
             &effective.git_ref
         };
-        let workflows = fetch_workflows(shared, &repo_full_name, workflow_ref)
-            .await
-            .map_err(|error| {
-                error!(
-                    event = %effective.event,
-                    ?error,
-                    "Failed to fetch workflows — delivery failed, will be redelivered"
-                );
-                StatusCode::BAD_GATEWAY
-            })?;
+
+        // The event ref is mutable: another push can move it while this
+        // delivery is in flight, and GitHub's webhook/API views may briefly
+        // converge at different times. Keep it for github.ref and trigger
+        // semantics, but resolve the workflow definition from the immutable
+        // commit that the event identifies.
         let resolved_sha = match &effective.sha {
             Some(sha) => sha.clone(),
-            None => match resolve_ref_sha(shared, &repo_full_name, &effective.git_ref).await {
+            None if effective.event == "pull_request_target" => {
+                error!(
+                    event = %effective.event,
+                    ref_name = %workflow_ref,
+                    "pull_request_target has no base commit SHA — delivery failed, will be redelivered"
+                );
+                return Err(StatusCode::BAD_GATEWAY);
+            }
+            None => match resolve_ref_sha(shared, &repo_full_name, workflow_ref).await {
                 Ok(Some(sha)) => sha,
                 Ok(None) => {
                     error!(
-                        ref_name = %effective.git_ref,
-                        "webhook ref has no resolvable commit SHA — delivery failed, will be redelivered"
+                        ref_name = %workflow_ref,
+                        "webhook workflow ref has no resolvable commit SHA — delivery failed, will be redelivered"
                     );
                     return Err(StatusCode::BAD_GATEWAY);
                 }
                 Err(error) => {
                     error!(
                         ?error,
-                        "failed to resolve webhook ref SHA — delivery failed, will be redelivered"
+                        ref_name = %workflow_ref,
+                        "failed to resolve webhook workflow ref SHA — delivery failed, will be redelivered"
                     );
                     return Err(StatusCode::BAD_GATEWAY);
                 }
             },
         };
+
+        let workflows = fetch_workflows(shared, &repo_full_name, &resolved_sha)
+            .await
+            .map_err(|error| {
+                error!(
+                    event = %effective.event,
+                    sha = %resolved_sha,
+                    source_ref = %workflow_ref,
+                    ?error,
+                    "Failed to fetch workflows at the event commit — delivery failed, will be redelivered"
+                );
+                StatusCode::BAD_GATEWAY
+            })?;
         if effective.event == "push" && effective.git_ref == ref_default {
             if let Some(scheduler) = &shared.state.scheduler {
-                scheduler
-                    .reconcile_all(&workflows, payload_val.clone(), shared.clone())
-                    .await;
+                // Cron definitions are global state, so reconcile them from
+                // the current default-branch head rather than this delivery's
+                // possibly stale event commit. Triggered runs still use the
+                // event-pinned `workflows` above.
+                let scheduler_source = match resolve_ref_sha(shared, &repo_full_name, &ref_default)
+                    .await
+                {
+                    Ok(Some(scheduler_sha)) => {
+                        let scheduler_workflows = if scheduler_sha == resolved_sha {
+                            Some(workflows.clone())
+                        } else {
+                            match fetch_workflows(shared, &repo_full_name, &scheduler_sha).await {
+                                Ok(workflows) => Some(workflows),
+                                Err(error) => {
+                                    warn!(
+                                        sha = %scheduler_sha,
+                                        ?error,
+                                        "failed to fetch current default-branch workflows — skipping cron reconciliation"
+                                    );
+                                    None
+                                }
+                            }
+                        };
+                        scheduler_workflows.map(|workflows| (scheduler_sha, workflows))
+                    }
+                    Ok(None) => {
+                        warn!(
+                            ref_name = %ref_default,
+                            "current default branch has no resolvable commit SHA — skipping cron reconciliation"
+                        );
+                        None
+                    }
+                    Err(error) => {
+                        warn!(
+                            ?error,
+                            ref_name = %ref_default,
+                            "failed to resolve current default branch SHA — skipping cron reconciliation"
+                        );
+                        None
+                    }
+                };
+                if let Some((scheduler_sha, scheduler_workflows)) = scheduler_source {
+                    let mut scheduler_payload = payload_val.clone();
+                    if let Some(object) = scheduler_payload.as_object_mut() {
+                        object.insert("after".to_owned(), Value::String(scheduler_sha));
+                    }
+                    scheduler
+                        .reconcile_all(&scheduler_workflows, scheduler_payload, shared.clone())
+                        .await;
+                }
             }
         }
 
@@ -1735,6 +1950,34 @@ mod tests {
         format!("sha256={hex}")
     }
 
+    fn git_output(workspace: &std::path::Path, args: &[&str]) -> String {
+        let output = std::process::Command::new("git")
+            .arg("-C")
+            .arg(workspace)
+            .args(args)
+            .output()
+            .unwrap();
+        assert!(
+            output.status.success(),
+            "git {args:?} failed: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        String::from_utf8(output.stdout).unwrap().trim().to_owned()
+    }
+
+    fn commit_workspace(workspace: &std::path::Path) -> String {
+        for args in [
+            &["init", "-q", "-b", "main"][..],
+            &["config", "user.email", "github-tests@example.invalid"][..],
+            &["config", "user.name", "GitHub Tests"][..],
+        ] {
+            git_output(workspace, args);
+        }
+        git_output(workspace, &["add", "-A"]);
+        git_output(workspace, &["commit", "-qm", "test workflow"]);
+        git_output(workspace, &["rev-parse", "HEAD"])
+    }
+
     #[test]
     fn github_owned_workflow_filter_matches_filename_or_path() {
         let configured =
@@ -1751,6 +1994,37 @@ mod tests {
             &configured
         ));
         assert!(!is_github_owned_workflow("ci.yml", &configured));
+    }
+
+    #[test]
+    fn completed_check_summary_names_the_failed_step_and_durations() {
+        let start = chrono::Utc::now();
+        let mut setup = crate::models::StepRecord::workflow(
+            "setup".to_owned(),
+            0,
+            "Set up | tools".to_owned(),
+            None,
+        );
+        setup.conclusion = "success".to_owned();
+        setup.started_at = Some(start);
+        setup.finished_at = Some(start + chrono::Duration::milliseconds(1250));
+        let mut test =
+            crate::models::StepRecord::workflow("test".to_owned(), 1, "Run tests".to_owned(), None);
+        test.conclusion = "failure".to_owned();
+        test.started_at = setup.finished_at;
+        test.finished_at = Some(start + chrono::Duration::milliseconds(3250));
+
+        let summary = check_summary(
+            "failure",
+            &[setup, test],
+            &["- exit code 1".to_owned()],
+            &preloop_gha_protocol::JobId("test".to_owned()),
+        );
+        assert!(summary.contains("| Set up \\| tools | success | 1.2s |"));
+        assert!(summary.contains("| Run tests | failure | 2.0s |"));
+        assert!(summary.contains("**Failed step:** `Run tests`"));
+        assert!(summary.contains("exit code 1"));
+        assert!(summary.contains("job_id: `test`"));
     }
 
     #[tokio::test]
@@ -1781,14 +2055,14 @@ mod tests {
     }
 
     /// The signed push payload GitHub would deliver for `owner/repo`.
-    fn signed_push_payload() -> (Vec<u8>, String) {
+    fn signed_push_payload(after: &str) -> (Vec<u8>, String) {
         let payload = serde_json::json!({
             "ref": "refs/heads/main",
             "before": "0000000000000000000000000000000000000000",
-            "after": "deadbeefdeadbeefdeadbeefdeadbeefdeadbeef",
+            "after": after,
             "repository": {"full_name": "owner/repo", "default_branch": "main"},
             "commits": [{
-                "id": "deadbeefdeadbeefdeadbeefdeadbeefdeadbeef",
+                "id": after,
                 "added": ["src/main.rs"],
                 "modified": [],
                 "removed": []
@@ -1805,6 +2079,7 @@ mod tests {
     struct WebhookFixture {
         state: AppState,
         app: axum::Router,
+        workspace: std::path::PathBuf,
         payload_bytes: Vec<u8>,
         signature_header: String,
     }
@@ -1823,20 +2098,33 @@ mod tests {
         }
 
         async fn with_workspace(temp: &tempfile::TempDir, ws_dir: std::path::PathBuf) -> Self {
+            let event_sha = if ws_dir.join(".github/workflows").is_dir() {
+                commit_workspace(&ws_dir)
+            } else {
+                "deadbeefdeadbeefdeadbeefdeadbeefdeadbeef".to_owned()
+            };
             let mut state = AppState::new(temp.path().join("state").to_path_buf())
                 .await
                 .unwrap();
             state.webhook_secret = Some("super-secret".to_owned());
-            state.local_workspace = Some(ws_dir);
+            state.local_workspace = Some(ws_dir.clone());
             let app =
                 crate::app_with_test_api(state.clone(), CancellationToken::new(), "test-token");
-            let (payload_bytes, signature_header) = signed_push_payload();
+            let (payload_bytes, signature_header) = signed_push_payload(&event_sha);
             Self {
                 state,
                 app,
+                workspace: ws_dir,
                 payload_bytes,
                 signature_header,
             }
+        }
+
+        fn refresh_payload_from_head(&mut self) {
+            let event_sha = git_output(&self.workspace, &["rev-parse", "HEAD"]);
+            let (payload_bytes, signature_header) = signed_push_payload(&event_sha);
+            self.payload_bytes = payload_bytes;
+            self.signature_header = signature_header;
         }
 
         /// Deliver the signed standard payload under `delivery`.
@@ -1879,11 +2167,10 @@ mod tests {
         let ws_dir = temp.path().join("ws");
         std::fs::create_dir_all(&ws_dir).unwrap();
         std::fs::create_dir_all(ws_dir.join(".github")).unwrap();
-        // `.github/workflows` exists but is a regular file: the inventory read
-        // fails deterministically (read_dir on a non-directory errors), so the
-        // delivery cannot be processed.
+        // The initial workspace has no Git object for the immutable payload
+        // SHA, so processing fails before the delivery can be acknowledged.
         std::fs::write(ws_dir.join(".github/workflows"), "not a directory").unwrap();
-        let fixture = WebhookFixture::with_workspace(&temp, ws_dir.clone()).await;
+        let mut fixture = WebhookFixture::with_workspace(&temp, ws_dir.clone()).await;
 
         let status = fixture.post("delivery-fetch-fail", Some("push")).await;
         assert_eq!(
@@ -1915,6 +2202,8 @@ mod tests {
             "on: push\njobs:\n  build:\n    runs-on: ubuntu-latest\n    steps:\n      - run: echo hello\n",
         )
         .unwrap();
+        commit_workspace(&ws_dir);
+        fixture.refresh_payload_from_head();
 
         assert_eq!(
             fixture.post("delivery-fetch-fail", Some("push")).await,
@@ -1936,12 +2225,14 @@ mod tests {
         let temp = tempfile::tempdir().unwrap();
         let fixture = WebhookFixture::new(&temp).await;
 
-        // A push without `after` leaves the effective SHA unresolved, and the
-        // local workspace is not a Git repository, so no SHA can be resolved:
-        // the delivery's work cannot be done.
+        // A push that names a commit absent from the local repository must
+        // fail rather than execute workflow YAML from the current checkout.
+        // The delivery's work cannot be done until that immutable commit is
+        // available.
         let payload = serde_json::json!({
             "ref": "refs/heads/main",
             "before": "0000000000000000000000000000000000000000",
+            "after": "deadbeefdeadbeefdeadbeefdeadbeefdeadbeef",
             "repository": {"full_name": "owner/repo", "default_branch": "main"},
             "commits": [{
                 "id": "deadbeefdeadbeefdeadbeefdeadbeefdeadbeef",

@@ -39,7 +39,6 @@ permissions:
 # If there's a prerelease-style suffix to the version, then the release(s)
 # will be marked as a prerelease.
 on:
-  pull_request:
   push:
     tags:
       - '**[0-9]+.[0-9]+.[0-9]+*'
@@ -70,10 +69,25 @@ jobs:
         shell: bash
         run: "curl --proto '=https' --tlsv1.2 -LsSf https://github.com/axodotdev/cargo-dist/releases/download/v0.32.0/cargo-dist-installer.sh | sh"
       - name: Cache dist
-        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
         with:
           name: cargo-dist-cache
           path: ~/.cargo/bin/dist
+      # Every release must ship a changelog entry. This must run before the
+      # plan step: on tag pushes that step runs `dist host --steps=create`,
+      # which would create the GitHub Release before the guard could fail.
+      - name: Verify changelog entry for this release
+        if: ${{ !github.event.pull_request }}
+        run: |
+          version="${GITHUB_REF_NAME#v}"
+          python3 - "$version" <<'PY'
+          import re, sys
+          version = sys.argv[1]
+          text = open("CHANGELOG.md", encoding="utf-8").read()
+          if not re.search(rf"^## \[{re.escape(version)}\]", text, re.M):
+              sys.exit(f"CHANGELOG.md has no entry for [{version}]; add one before cutting the release")
+          print(f"CHANGELOG.md entry for [{version}] found")
+          PY
       # sure would be cool if github gave us proper conditionals...
       # so here's a doubly-nested ternary-via-truthiness to try to provide the best possible
       # functionality based on whether this is a pull_request, and whether it's from a fork.
@@ -86,7 +100,7 @@ jobs:
           cat plan-dist-manifest.json
           echo "manifest=$(jq -c "." plan-dist-manifest.json)" >> "$GITHUB_OUTPUT"
       - name: "Upload dist-manifest.json"
-        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
         with:
           name: artifacts-plan-dist-manifest
           path: plan-dist-manifest.json
@@ -139,7 +153,7 @@ jobs:
         run: ${{ matrix.install_dist.run }}
       # Get the dist-manifest
       - name: Fetch local artifacts
-        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
         with:
           pattern: artifacts-*
           path: target/distrib/
@@ -166,7 +180,7 @@ jobs:
 
           cp dist-manifest.json "$BUILD_MANIFEST_NAME"
       - name: "Upload artifacts"
-        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
         with:
           name: artifacts-build-local-${{ join(matrix.targets, '_') }}
           path: |
@@ -192,14 +206,14 @@ jobs:
           # unauthenticated LFS API rate limit kills the run.
           lfs: true
       - name: Install cached dist
-        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
         with:
           name: cargo-dist-cache
           path: ~/.cargo/bin/
       - run: chmod +x ~/.cargo/bin/dist
       # Get all the local artifacts for the global tasks to use (for e.g. checksums)
       - name: Fetch local artifacts
-        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
         with:
           pattern: artifacts-*
           path: target/distrib/
@@ -217,7 +231,7 @@ jobs:
 
           cp dist-manifest.json "$BUILD_MANIFEST_NAME"
       - name: "Upload artifacts"
-        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
         with:
           name: artifacts-build-global
           path: |
@@ -246,14 +260,14 @@ jobs:
           # unauthenticated LFS API rate limit kills the run.
           lfs: true
       - name: Install cached dist
-        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
         with:
           name: cargo-dist-cache
           path: ~/.cargo/bin/
       - run: chmod +x ~/.cargo/bin/dist
       # Fetch artifacts from scratch-storage
       - name: Fetch artifacts
-        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
         with:
           pattern: artifacts-*
           path: target/distrib/
@@ -266,14 +280,14 @@ jobs:
           cat dist-manifest.json
           echo "manifest=$(jq -c "." dist-manifest.json)" >> "$GITHUB_OUTPUT"
       - name: "Upload dist-manifest.json"
-        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
         with:
           # Overwrite the previous copy
           name: artifacts-dist-manifest
           path: dist-manifest.json
       # Create a GitHub Release while uploading all files to it
       - name: "Download GitHub Artifacts"
-        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
         with:
           pattern: artifacts-*
           path: artifacts
@@ -282,6 +296,31 @@ jobs:
         run: |
           # Remove the granular manifests
           rm -f artifacts/*-dist-manifest.json
+      # Engines resolve the golden at their own release tag. Seed the new
+      # release with the newest complete pair before publishing; the
+      # release-golden workflow then replaces each asset with a fresh bake.
+      # This keeps a failed or unsupported fresh bake visible without ever
+      # leaving the released engine on a guaranteed 404.
+      - name: Seed golden assets from the newest complete release
+        run: |
+          source_tag=""
+          golden_dir="$RUNNER_TEMP/release-goldens"
+          for tag in $(gh release list --limit 50 --json tagName,isDraft --jq '.[] | select(.isDraft == false) | .tagName'); do
+            rm -rf "$golden_dir"
+            mkdir -p "$golden_dir"
+            if gh release download "$tag" \
+                --pattern preloop-ubuntu-24.04-x86_64 \
+                --pattern preloop-ubuntu-24.04-aarch64 \
+                --dir "$golden_dir" &&
+              test -s "$golden_dir/preloop-ubuntu-24.04-x86_64" &&
+              test -s "$golden_dir/preloop-ubuntu-24.04-aarch64"; then
+              source_tag="$tag"
+              break
+            fi
+          done
+          test -n "$source_tag"
+          cp "$golden_dir"/preloop-ubuntu-24.04-{x86_64,aarch64} artifacts/
+          echo "Seeded golden assets from $source_tag"
       - name: Create GitHub Release
         env:
           # The org disables workflow write tokens, so GITHUB_TOKEN can never
@@ -296,41 +335,8 @@ jobs:
         run: |
           # Write and read notes from a file to avoid quoting breaking things
           echo "$ANNOUNCEMENT_BODY" > $RUNNER_TEMP/notes.txt
-          version="${{ needs.plan.outputs.tag }}"
-          version="${version#v}"
-          python3 - "$version" "$RUNNER_TEMP/notes.txt" <<'PY'
-          import re
-          import sys
-
-          version, notes_path = sys.argv[1:]
-          text = open("CHANGELOG.md", encoding="utf-8").read()
-          match = re.search(
-              rf"^## \[{re.escape(version)}\][^\n]*\n(?P<body>.*?)(?=^## \[|\Z)",
-              text,
-              re.M | re.S,
-          )
-          if match and "preloop:skip-golden" in match.group("body"):
-              with open(notes_path, "a", encoding="utf-8") as notes:
-                  notes.write("\n<!-- preloop:skip-golden -->\n")
-          PY
 
           gh release create "${{ needs.plan.outputs.tag }}" --target "$RELEASE_COMMIT" $PRERELEASE_FLAG --title "$ANNOUNCEMENT_TITLE" --notes-file "$RUNNER_TEMP/notes.txt" artifacts/*
-
-      - name: Generate release notes from merged PRs
-        env:
-          # Same reason as the step above: the org disables workflow write
-          # tokens, so editing the release needs the scoped RELEASES_TOKEN.
-          GH_TOKEN: ${{ secrets.RELEASES_TOKEN }}
-        run: |
-          tag="${{ needs.plan.outputs.tag }}"
-          # GitHub-generated "What's Changed" (merged PRs since the previous
-          # tagged release; previous_tag_name defaults to it). Prepend it to
-          # the dist-generated install/download tables.
-          gh api "repos/${{ github.repository }}/releases/generate-notes" \
-            -F tag_name="$tag" --jq '.body' > "$RUNNER_TEMP/pr-notes.md"
-          gh release view "$tag" --json body --jq .body > "$RUNNER_TEMP/dist-notes.md"
-          cat "$RUNNER_TEMP/pr-notes.md" "$RUNNER_TEMP/dist-notes.md" > "$RUNNER_TEMP/notes.md"
-          gh release edit "$tag" --notes-file "$RUNNER_TEMP/notes.md"
 
   announce:
     needs:

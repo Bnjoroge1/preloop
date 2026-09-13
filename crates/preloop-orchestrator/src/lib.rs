@@ -1,12 +1,14 @@
 //! SmolVM-backed ephemeral runner pool for Preloop CI.
 
-pub mod environment;
-mod keys;
-
 include!(concat!(env!("OUT_DIR"), "/pins.rs"));
 
+pub mod environment;
+mod keys;
+pub mod node_externals;
+
 use crate::environment::{
-    curated_toolchains, is_stock_base_image, EnvironmentSpec, ToolchainLayer,
+    curated_toolchains, is_official_runner_image, is_stock_base_image, EnvironmentSpec,
+    ToolchainLayer,
 };
 use crate::keys::{KeyPool, StagedKey};
 use preloop_gha_protocol::RUNNER_BUSY_SENTINEL;
@@ -77,7 +79,7 @@ fn runner_volumes(
     mount_externals: bool,
 ) -> Vec<VolumeMount> {
     let mut volumes = vec![VolumeMount {
-        host: config.runner_bundle.clone(),
+        host: effective_runner_bundle(config),
         guest: PathBuf::from("/opt/preloop/bin"),
         read_only: true,
     }];
@@ -120,19 +122,24 @@ fn runner_volumes(
     volumes
 }
 
-/// Populate the host-side externals directory once, so every VM can mount
-/// `node20`/`node24` instead of baking or downloading them per machine.
+/// Populate the host-side externals directory, validating the manifest and
+/// binary version (R2) for each runtime instead of merely checking for a file.
 ///
-/// Reuses the same shell routine the golden bake used — it is pure
-/// `curl | tar` plus an atomic temp-dir publish, so it runs identically on
-/// the host. Skips the download when the external is already present, so a
-/// concurrent engine start or an operator-provided directory keeps its
-/// contents. Permissions are still normalized on every call: the download is
-/// what gets skipped, not the repair, or a host that published its externals
-/// before the guest runner went non-root would stay broken forever.
+/// Reuses the same shell routine the golden bake uses — now with temp-file
+/// download, SHA256 verification (pinned + SHASUMS), and manifest emission —
+/// so it runs identically on the host and in the guest. A directory is only
+/// re-downloaded when its `preloop-node.json` is missing, its version is stale,
+/// or `bin/node --version` disagrees. Permissions are still normalized on every
+/// call.
 fn ensure_host_externals(config: &RunnerPoolConfig) -> Result<(), OrchestratorError> {
     let externals = config.externals_dir.join("externals");
-    if !externals.join("node24").join("bin").join("node").is_file() {
+    let needs_host = crate::node_externals::expected_runtimes()
+        .iter()
+        .any(|(runtime, version)| {
+            let plain = version.trim_start_matches('v');
+            !crate::node_externals::is_valid_externals_dir(&externals.join(runtime), runtime, plain)
+        });
+    if needs_host {
         std::fs::create_dir_all(&externals).map_err(|error| {
             OrchestratorError::Config(format!(
                 "failed to create externals directory {}: {error}",
@@ -171,17 +178,28 @@ fn ensure_host_externals(config: &RunnerPoolConfig) -> Result<(), OrchestratorEr
     // host symlink: virtiofs exports a symlink node verbatim and the guest
     // kernel then resolves its target in the GUEST namespace, where
     // `/var/lib/preloop/externals` does not exist — node would be missing.
-    // Best-effort copy: the bundle lives in a root-owned release dir when
-    // the engine runs unprivileged, and the deploy step materializes the
-    // externals in that case.
+    // The copy is attempted in place first; when the release directory is not
+    // writable by this engine (unprivileged engine, root-owned release dir) an
+    // engine-owned mirror bundle is published instead — see
+    // `materialize_mirror_bundle`. Either way the pool refuses to start with
+    // externals the guest cannot resolve, because every JS action step would
+    // otherwise fail with `bundled nodeXX is missing` after the pool reports
+    // itself ready.
     let bundle_externals = config.runner_bundle.join("externals");
-    if !bundle_externals
-        .join("node24")
-        .join("bin")
-        .join("node")
-        .is_file()
-    {
+    if !externals_complete(&bundle_externals) {
+        // Ensure bundle parent exists before copy.
         let copy = std::fs::create_dir_all(&bundle_externals).and_then(|()| {
+            // For stale manifests, remove the stale runtime dirs in the bundle first
+            // so `cp -a` does not leave a mix of stale/new.
+            for (runtime, version) in crate::node_externals::expected_runtimes() {
+                let plain = version.trim_start_matches('v');
+                let dest = bundle_externals.join(runtime);
+                if !crate::node_externals::is_valid_externals_dir(&dest, runtime, plain)
+                    && dest.exists()
+                {
+                    let _ = std::fs::remove_dir_all(&dest);
+                }
+            }
             std::process::Command::new("cp")
                 .arg("-a")
                 .arg(externals.join("."))
@@ -196,19 +214,140 @@ fn ensure_host_externals(config: &RunnerPoolConfig) -> Result<(), OrchestratorEr
             Ok(output) => warn!(
                 status = %output.status,
                 bundle = %bundle_externals.display(),
-                "Could not materialize bundle externals (deploy step should copy them)"
+                "Could not materialize bundle externals in place; publishing an engine-owned mirror bundle"
             ),
             Err(error) => warn!(
                 %error,
                 bundle = %bundle_externals.display(),
-                "Could not materialize bundle externals (deploy step should copy them)"
+                "Could not materialize bundle externals in place; publishing an engine-owned mirror bundle"
             ),
         }
     }
     // `cp -a` preserves the source mode, so the bundle copy needs the same
     // repair as the host directory.
     relax_externals_permissions(&bundle_externals);
+    if externals_complete(&bundle_externals) {
+        return Ok(());
+    }
+    materialize_mirror_bundle(config, &externals)
+}
+
+/// Whether `externals_root` carries every expected runtime at its pinned
+/// version, validated through the manifest and `bin/node --version`.
+fn externals_complete(externals_root: &Path) -> bool {
+    crate::node_externals::expected_runtimes()
+        .iter()
+        .all(|(runtime, version)| {
+            let plain = version.trim_start_matches('v');
+            crate::node_externals::is_valid_externals_dir(
+                &externals_root.join(runtime),
+                runtime,
+                plain,
+            )
+        })
+}
+
+/// Engine-owned mirror of the runner bundle.
+///
+/// Lives beside the other engine state, so it is writable whenever the engine
+/// can run at all — unlike the release directory, which is root-owned when the
+/// engine runs unprivileged.
+fn mirror_bundle_dir(config: &RunnerPoolConfig) -> PathBuf {
+    config.externals_dir.join("runner-bundle")
+}
+
+/// The bundle directory actually mounted into guests at `/opt/preloop/bin`.
+///
+/// Prefers the release directory and falls back to the engine-owned mirror,
+/// which `materialize_mirror_bundle` only leaves in place when it is complete.
+fn effective_runner_bundle(config: &RunnerPoolConfig) -> PathBuf {
+    if externals_complete(&config.runner_bundle.join("externals")) {
+        return config.runner_bundle.clone();
+    }
+    let mirror = mirror_bundle_dir(config);
+    if mirror.join(&config.runner_binary_name).is_file()
+        && externals_complete(&mirror.join("externals"))
+    {
+        return mirror;
+    }
+    config.runner_bundle.clone()
+}
+
+/// Publish an engine-owned bundle carrying the runner binary and the validated
+/// host externals, for the case where the release directory cannot be written.
+///
+/// Fails when the mirror still does not validate: a pool that starts without
+/// resolvable externals reports itself ready and then fails every JS action
+/// step, which is far more expensive to diagnose than a refused startup.
+fn materialize_mirror_bundle(
+    config: &RunnerPoolConfig,
+    host_externals: &Path,
+) -> Result<(), OrchestratorError> {
+    let mirror = mirror_bundle_dir(config);
+    let mirror_externals = mirror.join("externals");
+    let runner_source = config.runner_bundle.join(&config.runner_binary_name);
+    let runner_target = mirror.join(&config.runner_binary_name);
+    let published = std::fs::create_dir_all(&mirror_externals).and_then(|()| {
+        for (runtime, version) in crate::node_externals::expected_runtimes() {
+            let plain = version.trim_start_matches('v');
+            let dest = mirror_externals.join(runtime);
+            if !crate::node_externals::is_valid_externals_dir(&dest, runtime, plain)
+                && dest.exists()
+            {
+                let _ = std::fs::remove_dir_all(&dest);
+            }
+        }
+        // `cp -a` for both halves: the runner binary must keep its exec bit and
+        // the externals must arrive as real directories, since virtiofs exports
+        // a symlink node verbatim and the guest would resolve it in its own
+        // namespace.
+        std::fs::copy(&runner_source, &runner_target)?;
+        std::process::Command::new("cp")
+            .arg("-a")
+            .arg(host_externals.join("."))
+            .arg(&mirror_externals)
+            .output()
+    });
+    if let Err(error) = published {
+        return Err(OrchestratorError::Config(format!(
+            "node externals are missing from the runner bundle {} and the \
+             engine-owned mirror {} could not be published: {error}",
+            config.runner_bundle.display(),
+            mirror.display()
+        )));
+    }
+    set_executable_bit(&runner_target);
+    relax_externals_permissions(&mirror_externals);
+    if !runner_target.is_file() || !externals_complete(&mirror_externals) {
+        return Err(OrchestratorError::Config(format!(
+            "node externals are still incomplete after publishing the \
+             engine-owned mirror bundle {}; every JS action step would fail \
+             with `bundled node is missing`. Check network egress to \
+             nodejs.org and the host externals at {}",
+            mirror.display(),
+            host_externals.display()
+        )));
+    }
+    info!(
+        bundle = %mirror.display(),
+        "Published engine-owned mirror bundle with node externals"
+    );
     Ok(())
+}
+
+/// Restore the exec bit on the mirrored runner binary.
+fn set_executable_bit(path: &Path) {
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        if let Ok(metadata) = std::fs::metadata(path) {
+            let mut permissions = metadata.permissions();
+            permissions.set_mode(permissions.mode() | 0o755);
+            let _ = std::fs::set_permissions(path, permissions);
+        }
+    }
+    #[cfg(not(unix))]
+    let _ = path;
 }
 
 /// Make published Node externals traversable by the unprivileged guest account.
@@ -901,7 +1040,7 @@ const BASE_PACKAGES: &str = "\
      haveged mediainfo p7zip-rar pollinate sshpass telnet tk xvfb zsync ftp \
      sphinxsearch systemd-coredump libnss3-tools software-properties-common \
      build-essential pkg-config libssl-dev make autoconf automake libtool m4 \
-     bison flex texinfo patchelf swig dpkg-dev fakeroot binutils \
+     bison flex texinfo patchelf swig dpkg-dev fakeroot binutils lld \
      libicu-dev libsqlite3-dev libyaml-dev \
      python3 python3-pip python-is-python3 \
      unzip zip xz-utils zstd bzip2 brotli lz4 pigz p7zip-full tar \
@@ -1058,6 +1197,7 @@ fn base_packages_pinned() -> String {
         dpkg-dev={APT_DPKG_DEV} \
         fakeroot={APT_FAKEROOT} \
         binutils={APT_BINUTILS} \
+        lld={APT_LLD} \
         libicu-dev={APT_LIBICU_DEV} \
         libsqlite3-dev={APT_LIBSQLITE3_DEV} \
         libyaml-dev={APT_LIBYAML_DEV} \
@@ -1127,6 +1267,25 @@ pub fn loopback_hosts() -> &'static str {
 }
 
 fn node_externals_at(runner_root: &str) -> Vec<Vec<String>> {
+    // Pinned SHA per runtime+platform, derived from versions.toml via build.rs.
+    // Empty string means no pinned entry — SHASUMS verification still applies.
+    let n20_plain = NODE20_EXTERNALS_VERSION.trim_start_matches('v');
+    let n24_plain = NODE24_EXTERNALS_VERSION.trim_start_matches('v');
+    let pinned_n20_arm64 =
+        crate::node_externals_pinned_sha256(&format!("node20_{n20_plain}_linux-arm64"))
+            .unwrap_or("");
+    let pinned_n20_x64 =
+        crate::node_externals_pinned_sha256(&format!("node20_{n20_plain}_linux-x64")).unwrap_or("");
+    let pinned_n24_arm64 =
+        crate::node_externals_pinned_sha256(&format!("node24_{n24_plain}_linux-arm64"))
+            .unwrap_or("");
+    let pinned_n24_x64 =
+        crate::node_externals_pinned_sha256(&format!("node24_{n24_plain}_linux-x64")).unwrap_or("");
+    // For Windows cases (not used on Linux golden but keep for completeness via host externals on Windows).
+    let pinned_n20_win_x64 =
+        crate::node_externals_pinned_sha256(&format!("node20_{n20_plain}_win-x64")).unwrap_or("");
+    let pinned_n24_win_x64 =
+        crate::node_externals_pinned_sha256(&format!("node24_{n24_plain}_win-x64")).unwrap_or("");
     [vec![
         "sh".to_owned(),
         "-c".to_owned(),
@@ -1137,21 +1296,58 @@ fn node_externals_at(runner_root: &str) -> Vec<Vec<String>> {
                set -- $entry; \
                NAME=$1; VERSION=$2; \
                DEST=$RUNNER_EXTERNALS/$NAME; \
-               if [ -f \"$DEST/bin/node\" ]; then \
-                 chmod 755 \"$DEST\"; \
-                 echo \"$NAME already present, skipping\"; continue; \
+               VERSION_PLAIN=${{VERSION#v}}; \
+               if [ -f \"$DEST/preloop-node.json\" ] && grep -q \"\\\"version\\\":\\\"$VERSION_PLAIN\\\"\" \"$DEST/preloop-node.json\" 2>/dev/null && [ \"$(\"$DEST/bin/node\" --version 2>/dev/null)\" = \"$VERSION\" ]; then \
+                 echo \"$NAME $VERSION already valid, skipping\"; \
+                 chmod 755 \"$DEST\" 2>/dev/null || true; \
+                 continue; \
                fi; \
                echo \"Installing $NAME $VERSION into golden...\"; \
                TEMP=$(mktemp -d \"$RUNNER_EXTERNALS/.$NAME.XXXXXX\") && \
                 chmod 755 \"$TEMP\" && \
                 ARCH=$(uname -m); \
                 if [ \"$ARCH\" = \"aarch64\" ] || [ \"$ARCH\" = \"arm64\" ]; then NODE_ARCH=linux-arm64; else NODE_ARCH=linux-x64; fi; \
-                curl -fsSL \"https://nodejs.org/dist/$VERSION/node-$VERSION-$NODE_ARCH.tar.gz\" | \
-                 tar -xz --strip-components=1 -C \"$TEMP\" && \
+                ARCHIVE=\"node-$VERSION-$NODE_ARCH.tar.gz\"; \
+                URL=\"https://nodejs.org/dist/$VERSION/$ARCHIVE\"; \
+                SHASUMS_URL=\"https://nodejs.org/dist/$VERSION/SHASUMS256.txt\"; \
+                TMP_ARCHIVE=$(mktemp \"$RUNNER_EXTERNALS/.$NAME.archive.XXXXXX.tar.gz\"); \
+                if ! curl -fsSL -o \"$TMP_ARCHIVE\" \"$URL\"; then echo \"FAILED fetching $NAME $VERSION\" >&2; rm -f \"$TMP_ARCHIVE\"; rm -rf \"$TEMP\"; exit 1; fi; \
+                ACTUAL=$(shasum -a 256 \"$TMP_ARCHIVE\" 2>/dev/null | awk '{{print $1}}'); \
+                if [ -z \"$ACTUAL\" ]; then ACTUAL=$(sha256sum \"$TMP_ARCHIVE\" 2>/dev/null | awk '{{print $1}}'); fi; \
+                if [ -z \"$ACTUAL\" ]; then echo \"no sha256 tool available\" >&2; rm -f \"$TMP_ARCHIVE\"; rm -rf \"$TEMP\"; exit 1; fi; \
+                VERIFIED=0; \
+                case \"$NAME:$NODE_ARCH\" in \
+                  node20:linux-arm64) PINNED=\"{pinned_n20_arm64}\";; \
+                  node20:linux-x64) PINNED=\"{pinned_n20_x64}\";; \
+                  node24:linux-arm64) PINNED=\"{pinned_n24_arm64}\";; \
+                  node24:linux-x64) PINNED=\"{pinned_n24_x64}\";; \
+                  node20:win-x64) PINNED=\"{pinned_n20_win_x64}\";; \
+                  node24:win-x64) PINNED=\"{pinned_n24_win_x64}\";; \
+                  *) PINNED=\"\";; \
+                esac; \
+                if [ -n \"$PINNED\" ]; then \
+                  if [ \"$ACTUAL\" != \"$PINNED\" ]; then echo \"ERROR: $NAME $VERSION pinned SHA256 mismatch (got $ACTUAL expected $PINNED)\" >&2; rm -f \"$TMP_ARCHIVE\"; rm -rf \"$TEMP\"; exit 1; fi; \
+                  VERIFIED=1; \
+                fi; \
+                SHASUMS_TMP=$(mktemp \"$RUNNER_EXTERNALS/.SHASUMS.XXXXXX\"); \
+                if curl -fsSL -o \"$SHASUMS_TMP\" \"$SHASUMS_URL\" 2>/dev/null; then \
+                  EXPECTED_SHASUMS=$(grep -F \" $ARCHIVE\" \"$SHASUMS_TMP\" | awk '{{print $1}}'); \
+                  if [ -n \"$EXPECTED_SHASUMS\" ] && [ \"$ACTUAL\" != \"$EXPECTED_SHASUMS\" ]; then echo \"ERROR: $NAME $VERSION SHASUMS256.txt mismatch (got $ACTUAL expected $EXPECTED_SHASUMS)\" >&2; rm -f \"$TMP_ARCHIVE\" \"$SHASUMS_TMP\"; rm -rf \"$TEMP\"; exit 1; fi; \
+                  if [ -n \"$EXPECTED_SHASUMS\" ]; then VERIFIED=1; fi; \
+                  rm -f \"$SHASUMS_TMP\"; \
+                else \
+                  rm -f \"$SHASUMS_TMP\"; \
+                fi; \
+                if [ \"$VERIFIED\" != 1 ]; then \
+                  echo \"ERROR: no trusted checksum found for $ARCHIVE (neither pinned SHA nor SHASUMS entry available)\" >&2; rm -f \"$TMP_ARCHIVE\"; rm -rf \"$TEMP\"; exit 1; \
+                fi; \
+                if ! tar -xzf \"$TMP_ARCHIVE\" --strip-components=1 -C \"$TEMP\"; then echo \"FAILED extracting $NAME\" >&2; rm -f \"$TMP_ARCHIVE\"; rm -rf \"$TEMP\"; exit 1; fi; \
+                rm -f \"$TMP_ARCHIVE\"; \
                if [ ! -f \"$TEMP/bin/node\" ]; then \
                  echo \"ERROR: $NAME tarball missing bin/node\" >&2; \
                  rm -rf \"$TEMP\"; exit 1; \
                fi && \
+               printf '{{\"runtime\":\"%s\",\"version\":\"%s\",\"platform\":\"%s\",\"archive_sha256\":\"%s\",\"source\":\"%s\"}}\\n' \"$NAME\" \"$VERSION_PLAIN\" \"$NODE_ARCH\" \"$ACTUAL\" \"$URL\" > \"$TEMP/preloop-node.json\" && \
                [ -d \"$DEST\" ] && rm -rf \"$DEST\"; \
                mv \"$TEMP\" \"$DEST\" && \
                echo \"$NAME $VERSION baked\" || \
@@ -1161,6 +1357,41 @@ fn node_externals_at(runner_root: &str) -> Vec<Vec<String>> {
     ]]
     .into_iter()
     .collect()
+}
+
+/// Default unprivileged account the guest runner drops into, matching the
+/// hosted `runner` user. [`RunnerPoolConfig::runner_user`] may override it.
+pub const DEFAULT_RUNNER_USER: &str = "runner";
+/// Default UID for [`DEFAULT_RUNNER_USER`], matching the hosted image.
+pub const DEFAULT_RUNNER_UID: u32 = 1001;
+
+/// Create the unprivileged runner account and hand it every path a job writes.
+///
+/// Part of [`base_install_script`] — and therefore of the environment
+/// fingerprint — on purpose. Run as a separate post-bake `exec`, a change here
+/// left the fingerprint untouched, so the pool adopted the previous golden and
+/// silently served jobs an account the new code no longer matched. Keep every
+/// step idempotent: the same script runs against an already-prepared rootfs.
+///
+/// The Rust homes are the subtle ones. `ToolchainLayer::Rust` installs them as
+/// root at fixed system addresses (`/usr/local/rustup`, `/usr/local/cargo`)
+/// that `guest_env_prefix` exports to every user, so without this ownership
+/// the runner cannot write them and `rustup toolchain install` dies with
+/// `could not create home directory`.
+pub fn runner_account_script(user: &str, uid: u32) -> String {
+    format!(
+        "getent passwd {user} >/dev/null 2>&1 || useradd -m -u {uid} -s /bin/bash {user} 2>/dev/null; \
+         printf '%s\\n' '{user} ALL=(ALL) NOPASSWD: ALL' > /etc/sudoers.d/preloop-{user} \
+           && chmod 0440 /etc/sudoers.d/preloop-{user}; \
+         mkdir -p /run/user/{uid} /opt/hostedtoolcache /usr/local/rustup /usr/local/cargo; \
+         chown {uid}:{uid} /run/user/{uid} {root} 2>/dev/null; \
+         chown -R {uid}:{uid} /usr/local/rustup /usr/local/cargo 2>/dev/null; \
+         chmod -R 777 /opt/hostedtoolcache 2>/dev/null; \
+         grep -q AGENT_TOOLSDIRECTORY /etc/environment 2>/dev/null || \
+           printf 'AGENT_TOOLSDIRECTORY=/opt/hostedtoolcache\\nRUNNER_TOOL_CACHE=/opt/hostedtoolcache\\n' >> /etc/environment; \
+         getent group docker >/dev/null 2>&1 && usermod -aG docker {user} 2>/dev/null || true",
+        root = RUNNER_ROOT
+    )
 }
 
 /// The guest bootstrap script, one shell round trip.
@@ -1308,8 +1539,10 @@ pub fn base_install_script() -> String {
          install -d -m 0777 /opt/hostedtoolcache && \
          printf 'AGENT_TOOLSDIRECTORY=/opt/hostedtoolcache\\nRUNNER_TOOL_CACHE=/opt/hostedtoolcache\\n' >> /etc/environment && \
          (useradd -m -u 1000 -s /bin/bash ubuntu 2>/dev/null || true) && \
+         ({runner_account}) && \
          apt-get clean && \
          rm -rf /usr/share/doc/* /usr/share/man/* /usr/share/info/*",
+        runner_account = runner_account_script(DEFAULT_RUNNER_USER, DEFAULT_RUNNER_UID),
         docker_packages = docker_apt_packages(),
         compiler_packages = compiler_apt_packages(),
         base_packages_pinned = base_packages_pinned()
@@ -1562,7 +1795,6 @@ async fn write_bake_manifest<P: VmProvider>(
 }
 
 /// PATH the guest runner process exports to every step.
-///
 /// Hosted images carry the toolchain bin directories on the runner's own PATH,
 /// which is what makes `cargo install`-style actions work: `taiki-e/install-action`
 /// drops `cargo-hack` in `$CARGO_HOME/bin` and the next step runs `cargo hack`.
@@ -1570,22 +1802,18 @@ async fn write_bake_manifest<P: VmProvider>(
 /// has to install rustup itself, so on an image that already has rustup — ours,
 /// and GitHub's — the directory is on PATH or the tool is simply unreachable.
 ///
-/// The cargo bin dir must match the user the runner executes steps as: a root
-/// runner (no switching) installs into `/root/.cargo`, a switched runner into
-/// `/home/<user>/.cargo`. The root-only path must never be exported to an
-/// unprivileged runner — `/root` is 0700, so every tool lookup stats it and
-/// gets EACCES (nodejs/ci: `EACCES: permission denied, stat
-/// '/root/.cargo/bin/git'`), and the Go layer untars into the world-readable
-/// `/usr/local/go`. Absent directories cost nothing.
-pub fn guest_runner_path(config: &RunnerPoolConfig) -> String {
-    let cargo_bin = match config.runner_user.as_deref() {
-        None | Some("root") => "/root/.cargo/bin".to_owned(),
-        Some(user) => format!("/home/{user}/.cargo/bin"),
-    };
-    format!(
-        "{cargo_bin}:/usr/local/go/bin:/usr/local/sbin:/usr/local/bin:\
-         /usr/sbin:/usr/bin:/sbin:/bin"
-    )
+/// The cargo bin dir is the fixed system address `/usr/local/cargo/bin`,
+/// matching the exported `CARGO_HOME` (see `guest_env_prefix`): it is
+/// identical for root and switched runners by construction. A per-user
+/// `$HOME/.cargo/bin` here would reintroduce the EACCES trap the homes fix
+/// removes — `/root` is 0700, so exporting `/root/.cargo/bin` to an
+/// unprivileged runner makes every tool lookup fail statting it
+/// (nodejs/ci: `EACCES: permission denied, stat '/root/.cargo/bin/git'`).
+/// Absent directories cost nothing.
+pub fn guest_runner_path(_config: &RunnerPoolConfig) -> String {
+    "/usr/local/cargo/bin:/usr/local/go/bin:/usr/local/sbin:/usr/local/bin:\
+     /usr/sbin:/usr/bin:/sbin:/bin"
+        .to_owned()
 }
 
 /// `env` prefix for guest runner invocations, empty when nothing needs setting.
@@ -1624,6 +1852,17 @@ fn guest_env_prefix(config: &RunnerPoolConfig, name: &MachineName) -> Vec<String
         env.push(format!("PRELOOP_FAILURE_MARKER={GUEST_FAILURE_MARKER}"));
         env.push(format!("PRELOOP_PAUSE_MARKER={GUEST_PAUSE_MARKER}"));
     }
+    // Rust toolchain homes. rustup resolves toolchains under RUSTUP_HOME and
+    // shims under CARGO_HOME, both defaulting to the *calling* user's $HOME.
+    // The bake installs as root while job steps run as the unprivileged
+    // runner user, so a $HOME-derived location is invisible across that
+    // boundary (/root is 0700). The bake therefore installs to these fixed
+    // system addresses (see ToolchainLayer::Rust install_commands), and they
+    // are exported here so every user resolves the identical toolchain.
+    // Order is irrelevant (env entries are independent); they sit last so
+    // the historical PATH/MACHINE_NAME-first prefix is undisturbed.
+    env.push("RUSTUP_HOME=/usr/local/rustup".to_owned());
+    env.push("CARGO_HOME=/usr/local/cargo".to_owned());
     if !env.is_empty() {
         env.insert(0, "/usr/bin/env".to_owned());
     }
@@ -1740,6 +1979,16 @@ pub struct RunnerPoolConfig {
     /// queued-job starvation clock during the warm; it is cleared before
     /// the pool serves its first job.
     pub preparing_signal: Option<Arc<std::sync::atomic::AtomicBool>>,
+    /// Consolidated pool handle (replaces the four ad-hoc Option<Arc<…>> fields above).
+    /// When `Some`, the pool updates it and the server sampler reads it.
+    /// Retain the legacy fields for now for backwards compatibility; new code
+    /// should read/write `pool_status`.
+    pub pool_status: Option<Arc<preloop_observability::status::PoolStatus>>,
+    /// Observability handle whose VM registry tracks this pool's live
+    /// machines. When `Some`, the pool registers created/forked VMs and
+    /// deregisters them at teardown; `None` (tests, legacy callers) skips
+    /// the wiring.
+    pub observability: Option<preloop_observability::Observability>,
 }
 
 /// Cache of environment-specific golden VMs.
@@ -2168,6 +2417,7 @@ async fn prepare_golden_for_env<P: VmProvider + 'static>(
     remove_golden_record(config, golden);
     if provider.status(golden).await? != MachineState::Missing {
         provider.delete(golden).await?;
+        vm_telemetry_deregister(config, golden);
     }
     let spec = MachineSpec {
         name: golden.clone(),
@@ -2191,7 +2441,9 @@ async fn prepare_golden_for_env<P: VmProvider + 'static>(
     };
     provider.create(&spec).await?;
     provider.start(golden).await?;
+    vm_telemetry_register(config, golden, "golden", Some(&spec));
     if let Err(error) = await_guest_ready(provider.as_ref(), golden).await {
+        vm_telemetry_deregister(config, golden);
         let _ = provider.delete(golden).await;
         return Err(error);
     }
@@ -2205,10 +2457,12 @@ async fn prepare_golden_for_env<P: VmProvider + 'static>(
         // Custom bases skip it along with the rest of the bake: the image is
         // the operator's contract.
         if let Err(error) = prepare_rosetta_multiarch(provider.as_ref(), golden).await {
+            vm_telemetry_deregister(config, golden);
             let _ = provider.delete(golden).await;
             return Err(error);
         }
         if let Err(error) = install_base_dependencies(provider.as_ref(), golden).await {
+            vm_telemetry_deregister(config, golden);
             let _ = provider.delete(golden).await;
             return Err(error);
         }
@@ -2216,6 +2470,7 @@ async fn prepare_golden_for_env<P: VmProvider + 'static>(
     for layer in &env_spec.toolchains {
         for command in layer.install_commands() {
             if let Err(error) = provider.exec(golden, &command).await {
+                vm_telemetry_deregister(config, golden);
                 let _ = provider.delete(golden).await;
                 return Err(error.into());
             }
@@ -2233,10 +2488,12 @@ async fn prepare_golden_for_env<P: VmProvider + 'static>(
         );
     }
     if let Err(error) = provider.stop(golden).await {
+        vm_telemetry_deregister(config, golden);
         let _ = provider.delete(golden).await;
         return Err(error.into());
     }
     if let Err(error) = provider.start_forkable(golden).await {
+        vm_telemetry_deregister(config, golden);
         let _ = provider.delete(golden).await;
         return Err(error.into());
     }
@@ -2271,6 +2528,7 @@ async fn prepare_packed_golden<P: VmProvider + 'static>(
     remove_golden_record(config, golden);
     if provider.status(golden).await? != MachineState::Missing {
         provider.delete(golden).await?;
+        vm_telemetry_deregister(config, golden);
     }
     // smolvm's `machine create --from` consumes the SMOLPACK, not the ELF
     // launcher stub written at the payload stem. A downloaded release asset
@@ -2305,7 +2563,9 @@ async fn prepare_packed_golden<P: VmProvider + 'static>(
         let _ = provider.delete(golden).await;
         return Err(error.into());
     }
+    vm_telemetry_register(config, golden, "golden", Some(&spec));
     if let Err(error) = await_guest_ready(provider.as_ref(), golden).await {
+        vm_telemetry_deregister(config, golden);
         let _ = provider.delete(golden).await;
         return Err(error);
     }
@@ -2319,8 +2579,16 @@ async fn prepare_packed_golden<P: VmProvider + 'static>(
             %error, "image preload failed; jobs will pull at run time"
         );
     }
-    provider.stop(golden).await?;
-    provider.start_forkable(golden).await?;
+    if let Err(error) = provider.stop(golden).await {
+        vm_telemetry_deregister(config, golden);
+        let _ = provider.delete(golden).await;
+        return Err(error.into());
+    }
+    if let Err(error) = provider.start_forkable(golden).await {
+        vm_telemetry_deregister(config, golden);
+        let _ = provider.delete(golden).await;
+        return Err(error.into());
+    }
     write_golden_record(config, golden, &env_spec.fingerprint);
     info!(
         machine = golden.as_str(),
@@ -2342,6 +2610,17 @@ impl<P: VmProvider + 'static> RunnerPool<P> {
         if let Some(signal) = &self.config.preparing_signal {
             signal.store(true, std::sync::atomic::Ordering::Release);
         }
+        if let Some(ps) = &self.config.pool_status {
+            ps.set_preparing(true);
+        }
+        // Any error exit below (host externals, artifact prep, stale-machine
+        // cleanup, golden bake) must clear the flag again; the guard is
+        // disarmed once the warm completes.
+        let mut clear_preparing = ClearPreparingOnDrop {
+            signal: self.config.preparing_signal.clone(),
+            pool_status: self.config.pool_status.clone(),
+            armed: true,
+        };
         ensure_host_externals(&self.config)?;
         if self.config.use_packed_artifact || self.config.control_socket.is_none() {
             self.prepare_artifact(true).await?;
@@ -2386,11 +2665,15 @@ impl<P: VmProvider + 'static> RunnerPool<P> {
         if let Some(signal) = &self.config.preparing_signal {
             signal.store(false, std::sync::atomic::Ordering::Release);
         }
+        if let Some(ps) = &self.config.pool_status {
+            ps.set_preparing(false);
+        }
+        clear_preparing.armed = false;
 
         let mut slots = JoinSet::new();
         // Runners currently registered and waiting for work. Slots consult it
         // to decide whether a replacement is worth booting mid-job.
-        let idle = Arc::new(AtomicUsize::new(0));
+        let idle = Arc::new(std::sync::Mutex::new(0));
         // Filled in the background so no slot ever waits on RSA generation.
         let keys = Arc::new(KeyPool::new());
         keys.spawn_refill();
@@ -2428,6 +2711,14 @@ impl<P: VmProvider + 'static> RunnerPool<P> {
             );
         }
 
+        // Warm slots boot their first runners *after* the warm completes and
+        // the preparing flag clears, so those boots must raise the shared
+        // provisioning guard or a job queued during the ~minutes-long boot
+        // window would starve (the server's sweep fails jobs queued 120s
+        // with no matching runner). One counter for the whole pool: the
+        // first completed slot must not clear the signal while its siblings
+        // are still bootstrapping.
+        let provisioning = Arc::new(std::sync::Mutex::new(0));
         for slot in 0..warm_size {
             let provider = self.provider.clone();
             let config = self.config.clone();
@@ -2437,6 +2728,7 @@ impl<P: VmProvider + 'static> RunnerPool<P> {
                 idle: idle.clone(),
                 keys: keys.clone(),
                 building: building.clone(),
+                provisioning: provisioning.clone(),
             };
             slots.spawn(async move {
                 run_slot(
@@ -2477,6 +2769,7 @@ impl<P: VmProvider + 'static> RunnerPool<P> {
         while slots.join_next().await.is_some() {}
         // Clean up every environment-specific golden fork base.
         for golden in golden_registry.all_names().await {
+            vm_telemetry_deregister(&self.config, &golden);
             let _ = self.provider.delete(&golden).await;
         }
         self.remove_stale_machines().await?;
@@ -2490,7 +2783,7 @@ impl<P: VmProvider + 'static> RunnerPool<P> {
         &self,
         shutdown: CancellationToken,
         golden_registry: Arc<GoldenRegistry>,
-        idle: Arc<AtomicUsize>,
+        idle: Arc<std::sync::Mutex<usize>>,
         keys: Arc<KeyPool>,
         building: Arc<AtomicUsize>,
     ) -> Result<(), OrchestratorError> {
@@ -2520,7 +2813,7 @@ impl<P: VmProvider + 'static> RunnerPool<P> {
         info!(max_concurrent, "on-demand runner pool (size=0)");
 
         let semaphore = Arc::new(tokio::sync::Semaphore::new(max_concurrent));
-        let provisioning = Arc::new(AtomicUsize::new(0));
+        let provisioning = Arc::new(std::sync::Mutex::new(0));
         let mut slots = JoinSet::new();
         let mut next_slot: usize = 0;
 
@@ -2564,6 +2857,7 @@ impl<P: VmProvider + 'static> RunnerPool<P> {
                 idle: idle.clone(),
                 keys: keys.clone(),
                 building: building.clone(),
+                provisioning: provisioning.clone(),
             };
             let slot_provisioning = provisioning.clone();
             // Shared with the slot's pause watcher: a job parked in a debug
@@ -2625,6 +2919,7 @@ impl<P: VmProvider + 'static> RunnerPool<P> {
         // Drain remaining runners on shutdown.
         while slots.join_next().await.is_some() {}
         for golden in golden_registry.all_names().await {
+            vm_telemetry_deregister(&self.config, &golden);
             let _ = self.provider.delete(&golden).await;
         }
         self.remove_stale_machines().await?;
@@ -2689,24 +2984,60 @@ impl<P: VmProvider + 'static> RunnerPool<P> {
         };
         self.provider.create(&spec).await?;
         self.provider.start(&name).await?;
-        // A custom base image is the operator's contract: use it as-is. Only
-        // the stock digest-pinned Ubuntu bases get the curated bake (the
-        // GitHub-hosted parity toolset — node/python/go toolcaches, git,
-        // docker, nvm, yarn — plus the Rust layer; `setup-*` actions download
-        // any other version a job asks for at job time).
-        if is_stock_base_image(&self.config.base_image) {
+        // Plain Ubuntu needs the hosted-runner package baseline. Official
+        // runner snapshots already contain it. Both receive the small,
+        // repository-pinned toolchain layer once while the artifact is built.
+        let stock_base = is_stock_base_image(&self.config.base_image);
+        let official_base = is_official_runner_image(&self.config.base_image);
+        if stock_base {
             if let Err(error) = install_base_dependencies(self.provider.as_ref(), &name).await {
                 let _ = self.provider.delete(&name).await;
                 return Err(error);
             }
-            let toolchains = curated_toolchains();
-            for layer in &toolchains {
+        }
+        if stock_base || official_base {
+            for layer in curated_toolchains() {
                 for command in layer.install_commands() {
-                    if let Err(error) = self.provider.exec(&name, &command).await {
+                    let output = self.provider.exec(&name, &command).await?;
+                    if output.exit_code != 0 {
                         let _ = self.provider.delete(&name).await;
-                        return Err(error.into());
+                        return Err(OrchestratorError::Config(format!(
+                            "toolchain install failed for {layer} (exit {}): {}",
+                            output.exit_code,
+                            String::from_utf8_lossy(&output.stderr)
+                                .lines()
+                                .last()
+                                .unwrap_or("unknown error")
+                        )));
                     }
                 }
+            }
+            // Toolchain installation runs as root and recreates writable
+            // rustup state beneath these homes. Re-apply runner ownership
+            // after every layer; doing it only in the base script leaves
+            // `/usr/local/rustup/tmp` root-owned and job-time rustup updates
+            // fail with EACCES.
+            let output = self
+                .provider
+                .exec(
+                    &name,
+                    &[
+                        "sh".to_owned(),
+                        "-c".to_owned(),
+                        runner_account_script(DEFAULT_RUNNER_USER, DEFAULT_RUNNER_UID),
+                    ],
+                )
+                .await?;
+            if output.exit_code != 0 {
+                let _ = self.provider.delete(&name).await;
+                return Err(OrchestratorError::Config(format!(
+                    "final runner-account ownership failed (exit {}): {}",
+                    output.exit_code,
+                    String::from_utf8_lossy(&output.stderr)
+                        .lines()
+                        .last()
+                        .unwrap_or("unknown error")
+                )));
             }
         }
         // Bake the externals *pointer*, not the externals: the packed rootfs
@@ -2736,6 +3067,42 @@ impl<P: VmProvider + 'static> RunnerPool<P> {
                     .last()
                     .unwrap_or("unknown")
             )));
+        }
+        // `base_install_script` already prepared the default account, and that
+        // fragment is fingerprinted. Re-run it here only for a configured
+        // non-default user, whose identity the fingerprint cannot know: the
+        // script is idempotent, so the default case is a cheap no-op skip.
+        let runner_user = self
+            .config
+            .runner_user
+            .as_deref()
+            .unwrap_or(DEFAULT_RUNNER_USER);
+        let runner_uid = self.config.runner_uid.unwrap_or(DEFAULT_RUNNER_UID);
+        if runner_user != DEFAULT_RUNNER_USER || runner_uid != DEFAULT_RUNNER_UID {
+            let output = self
+                .provider
+                .exec(
+                    &name,
+                    &[
+                        "sh".to_owned(),
+                        "-c".to_owned(),
+                        runner_account_script(runner_user, runner_uid),
+                    ],
+                )
+                .await?;
+            if output.exit_code != 0 {
+                // A golden whose runner account is wrong cannot run a job:
+                // every step fails on permissions, which reads as flaky CI.
+                let _ = self.provider.delete(&name).await;
+                return Err(OrchestratorError::Config(format!(
+                    "baking runner account {runner_user} failed (exit {}): {}",
+                    output.exit_code,
+                    String::from_utf8_lossy(&output.stderr)
+                        .lines()
+                        .last()
+                        .unwrap_or("unknown")
+                )));
+            }
         }
         let env_spec = EnvironmentSpec::for_base(self.config.base_image.clone());
         if let Err(error) = write_bake_manifest(self.provider.as_ref(), &name, &env_spec).await {
@@ -2783,6 +3150,7 @@ impl<P: VmProvider + 'static> RunnerPool<P> {
                 .starts_with(&format!("{}-", self.config.name_prefix))
             {
                 notify_runner_gone(&self.config, &name).await;
+                vm_telemetry_deregister(&self.config, &name);
                 if let Err(error) = self.provider.delete(&name).await {
                     warn!(machine = name.as_str(), %error, "failed to delete stale Preloop runner");
                 }
@@ -2865,11 +3233,15 @@ struct RunnerEnvironment {
 #[derive(Clone)]
 struct PoolHandles {
     /// Runners across the whole pool that are registered and unclaimed.
-    idle: Arc<AtomicUsize>,
+    idle: Arc<std::sync::Mutex<usize>>,
     /// Keypairs generated ahead of time for runner registration.
     keys: Arc<KeyPool>,
     /// Replacements currently being built across the whole pool.
     building: Arc<AtomicUsize>,
+    /// Provisions in flight across the whole pool. Raised so the server's
+    /// starvation sweep keeps the queued-job grace clock paused while any
+    /// warm-mode slot is still booting its runner.
+    provisioning: Arc<std::sync::Mutex<usize>>,
 }
 
 /// What a slot needs in order to build its next runner.
@@ -2883,11 +3255,13 @@ struct SlotPlan<'a> {
     /// Environment selected for the replacement.
     environment: RunnerEnvironment,
     /// Runners across the whole pool that are registered and unclaimed.
-    idle: &'a AtomicUsize,
+    idle: &'a std::sync::Mutex<usize>,
     /// Keypairs generated ahead of time for runner registration.
     keys: &'a Arc<KeyPool>,
     /// Replacements currently being built across the whole pool.
     building: &'a AtomicUsize,
+    /// Provisions in flight across the whole pool (see `PoolHandles`).
+    provisioning: &'a Arc<std::sync::Mutex<usize>>,
     /// Whether this slot keeps a warm successor after the current job.
     prebuild_successor: bool,
 }
@@ -2896,11 +3270,18 @@ struct SlotPlan<'a> {
 ///
 /// Held for the duration of the build so concurrent slots see it, and released
 /// on drop so an error path cannot strand the count.
-struct Reservation<'a>(&'a AtomicUsize);
+struct Reservation<'a> {
+    building: &'a AtomicUsize,
+    pool_status: Option<Arc<preloop_observability::status::PoolStatus>>,
+}
 
 impl<'a> Reservation<'a> {
     /// Claim a build slot, or `None` when `wanted` are already in flight.
-    fn take(building: &'a AtomicUsize, wanted: usize) -> Option<Self> {
+    fn take(
+        building: &'a AtomicUsize,
+        wanted: usize,
+        pool_status: Option<Arc<preloop_observability::status::PoolStatus>>,
+    ) -> Option<Self> {
         let mut current = building.load(Ordering::Acquire);
         loop {
             if current >= wanted {
@@ -2912,7 +3293,19 @@ impl<'a> Reservation<'a> {
                 Ordering::AcqRel,
                 Ordering::Acquire,
             ) {
-                Ok(_) => return Some(Self(building)),
+                Ok(_) => {
+                    // Publish the counter's current value, not the pre-CAS
+                    // `current + 1`: a concurrent reservation may have
+                    // incremented again in between, and publishing the stale
+                    // computed value would under-report in-flight builds.
+                    if let Some(ps) = &pool_status {
+                        ps.set_building(building.load(Ordering::Acquire) as u32);
+                    }
+                    return Some(Self {
+                        building,
+                        pool_status,
+                    });
+                }
                 Err(observed) => current = observed,
             }
         }
@@ -2921,7 +3314,14 @@ impl<'a> Reservation<'a> {
 
 impl Drop for Reservation<'_> {
     fn drop(&mut self) {
-        self.0.fetch_sub(1, Ordering::AcqRel);
+        self.building.fetch_sub(1, Ordering::AcqRel);
+        // Re-read after the decrement: a concurrent take or drop may have
+        // changed the counter again, and publishing the value captured at
+        // this reservation's own decrement could overwrite a newer status
+        // update with an older one.
+        if let Some(ps) = &self.pool_status {
+            ps.set_building(self.building.load(Ordering::Acquire) as u32);
+        }
     }
 }
 
@@ -2930,27 +3330,77 @@ impl Drop for Reservation<'_> {
 /// create several runners concurrently; the first completed runner must not
 /// clear the signal while another job's runner is still bootstrapping.
 struct PreparingGuard {
-    active: Arc<AtomicUsize>,
+    active: Arc<std::sync::Mutex<usize>>,
     signal: Option<Arc<std::sync::atomic::AtomicBool>>,
+    pool_status: Option<Arc<preloop_observability::status::PoolStatus>>,
 }
 
 impl PreparingGuard {
-    fn enter(active: Arc<AtomicUsize>, signal: Option<Arc<std::sync::atomic::AtomicBool>>) -> Self {
-        if active.fetch_add(1, Ordering::AcqRel) == 0 {
+    fn enter(
+        active: Arc<std::sync::Mutex<usize>>,
+        signal: Option<Arc<std::sync::atomic::AtomicBool>>,
+        pool_status: Option<Arc<preloop_observability::status::PoolStatus>>,
+    ) -> Self {
+        // The counter mutation and the status publication share one lock, so
+        // a concurrent enter/drop can never publish an older count over a
+        // newer one: `snapshot().provisioning` always matches the live
+        // counter and cannot report a runner that no longer exists.
+        let mut count = active.lock().unwrap();
+        if *count == 0 {
             if let Some(signal) = &signal {
                 signal.store(true, Ordering::Release);
             }
         }
-        Self { active, signal }
+        *count += 1;
+        if let Some(ps) = &pool_status {
+            ps.set_provisioning(*count as u32);
+        }
+        drop(count);
+        Self {
+            active,
+            signal,
+            pool_status,
+        }
     }
 }
 
 impl Drop for PreparingGuard {
     fn drop(&mut self) {
-        if self.active.fetch_sub(1, Ordering::AcqRel) == 1 {
+        let mut count = self.active.lock().unwrap();
+        *count = count.saturating_sub(1);
+        if *count == 0 {
             if let Some(signal) = &self.signal {
                 signal.store(false, Ordering::Release);
             }
+        }
+        if let Some(ps) = &self.pool_status {
+            ps.set_provisioning(*count as u32);
+        }
+    }
+}
+
+/// Clears the pool's preparing flag on drop unless startup completed.
+///
+/// Any startup step failing — host externals, artifact prep, stale-machine
+/// cleanup, golden bake — returns early, and without this the flag would
+/// stay `true` forever, marking every queued job unclaimable in the
+/// operational snapshot. Disarmed once the warm completes.
+struct ClearPreparingOnDrop {
+    signal: Option<Arc<std::sync::atomic::AtomicBool>>,
+    pool_status: Option<Arc<preloop_observability::status::PoolStatus>>,
+    armed: bool,
+}
+
+impl Drop for ClearPreparingOnDrop {
+    fn drop(&mut self) {
+        if !self.armed {
+            return;
+        }
+        if let Some(ps) = &self.pool_status {
+            ps.set_preparing(false);
+        }
+        if let Some(signal) = &self.signal {
+            signal.store(false, std::sync::atomic::Ordering::Release);
         }
     }
 }
@@ -3069,7 +3519,7 @@ async fn run_on_demand_slot<P: VmProvider + 'static>(
     shutdown: CancellationToken,
     golden_registry: Arc<GoldenRegistry>,
     handles: PoolHandles,
-    provisioning: Arc<AtomicUsize>,
+    provisioning: Arc<std::sync::Mutex<usize>>,
     semaphore: Arc<tokio::sync::Semaphore>,
     permit: Arc<std::sync::Mutex<Option<tokio::sync::OwnedSemaphorePermit>>>,
 ) -> Result<(), OrchestratorError> {
@@ -3078,7 +3528,11 @@ async fn run_on_demand_slot<P: VmProvider + 'static>(
         config.use_packed_artifact = false;
         config.use_fork = false;
     }
-    let preparing = PreparingGuard::enter(provisioning, config.preparing_signal.clone());
+    let preparing = PreparingGuard::enter(
+        provisioning,
+        config.preparing_signal.clone(),
+        config.pool_status.clone(),
+    );
     // Resolve the golden for the queued job's environment.
     let (golden, environment) = if config.use_fork {
         let env_base = match &config.next_job_runs_on {
@@ -3185,6 +3639,7 @@ async fn run_on_demand_slot<P: VmProvider + 'static>(
             idle: &handles.idle,
             keys: &handles.keys,
             building: &handles.building,
+            provisioning: &handles.provisioning,
             prebuild_successor: false,
         },
     )
@@ -3199,6 +3654,7 @@ async fn run_on_demand_slot<P: VmProvider + 'static>(
     match result {
         Ok(Some(successor)) => {
             notify_runner_gone(&config, &successor.name).await;
+            vm_telemetry_deregister(&config, &successor.name);
             let _ = provider.delete(&successor.name).await;
             Ok(())
         }
@@ -3224,11 +3680,25 @@ async fn run_slot<P: VmProvider + 'static>(
         idle,
         keys,
         building,
+        provisioning,
     } = handles;
     let mut generation: u64 = 0;
     let mut spare: Option<ReadyRunner> = None;
 
     while !shutdown.is_cancelled() {
+        // Warm mode cleared the pool's preparing flag once the golden bake
+        // finished, but this slot still has to resolve (and possibly bake)
+        // the golden for the queued job's environment and then
+        // fork+boot+register its first runner -- minutes with no runner
+        // registered. Hold the shared provisioning guard across that whole
+        // window, golden preparation included, so the server's starvation
+        // sweep keeps the queued-job grace clock paused; drop it once a
+        // registered runner is in hand.
+        let preparing = PreparingGuard::enter(
+            provisioning.clone(),
+            config.preparing_signal.clone(),
+            config.pool_status.clone(),
+        );
         let (golden, environment) = if config.use_fork {
             // Read the `runs-on` labels of the next queued job so the pool
             // can select the correct base-image golden before forking.
@@ -3313,6 +3783,7 @@ async fn run_slot<P: VmProvider + 'static>(
                     slot,
                     "discarding spare runner built for a different environment"
                 );
+                vm_telemetry_deregister(&config, &ready.name);
                 let _ = provider.delete(&ready.name).await;
             }
         }
@@ -3345,6 +3816,10 @@ async fn run_slot<P: VmProvider + 'static>(
             }
         };
 
+        // Runner is registered (or an already-registered spare); the sweep
+        // can see a matching runner directly now, so resume its grace clock.
+        drop(preparing);
+
         generation += 1;
         let successor = run_one_runner(
             provider.clone(),
@@ -3359,6 +3834,7 @@ async fn run_slot<P: VmProvider + 'static>(
                 idle: &idle,
                 keys: &keys,
                 building: &building,
+                provisioning: &provisioning,
                 prebuild_successor: true,
             },
         )
@@ -3378,6 +3854,7 @@ async fn run_slot<P: VmProvider + 'static>(
 
     if let Some(spare) = spare {
         notify_runner_gone(&config, &spare.name).await;
+        vm_telemetry_deregister(&config, &spare.name);
         let _ = provider.delete(&spare.name).await;
     }
     Ok(())
@@ -3398,12 +3875,30 @@ async fn provision_slot<P: VmProvider + 'static>(
 ) -> Result<ReadyRunner, OrchestratorError> {
     let name = MachineName::new(format!("{}-{slot}-{generation}", config.name_prefix))?;
     match provision_runner(provider, config, &name, golden, keys, &environment).await {
-        Ok(run) => Ok(ReadyRunner {
-            name,
-            run,
-            environment,
-        }),
+        Ok(run) => {
+            // A provision that made it (fork or direct create, configure,
+            // registration) resets the consecutive-failure streak. The
+            // counter feeds `pool_repeated_provision_failure` and the
+            // `consecutive_provision_failures` status field.
+            if let Some(ps) = &config.pool_status {
+                ps.clear_provision_failures();
+            }
+            Ok(ReadyRunner {
+                name,
+                run,
+                environment,
+            })
+        }
         Err(error) => {
+            // A configure failure can happen after the guest has already
+            // registered the runner. Purge by machine name before deleting
+            // the VM so that registration cannot outlive its provisioned
+            // host and retain a live listen credential.
+            notify_runner_gone(config, &name).await;
+            if let Some(ps) = &config.pool_status {
+                ps.record_provision_failure();
+            }
+            vm_telemetry_deregister(config, &name);
             if let Err(cleanup) = provider.delete(&name).await {
                 warn!(
                     machine = name.as_str(),
@@ -3495,6 +3990,7 @@ async fn run_one_runner<P: VmProvider + 'static>(
         idle,
         keys,
         building,
+        provisioning,
         prebuild_successor,
     } = plan;
 
@@ -3508,7 +4004,17 @@ async fn run_one_runner<P: VmProvider + 'static>(
     let claimed = Arc::new(std::sync::atomic::AtomicBool::new(false));
     let run_provider = provider.clone();
     let run_name = name.clone();
-    idle.fetch_add(1, Ordering::AcqRel);
+    // The counter mutation and the status publication share one lock, so a
+    // concurrent claim can never publish an older count over a newer one:
+    // `snapshot().idle` cannot report an idle runner that was already
+    // claimed.
+    {
+        let mut idle = idle.lock().unwrap();
+        *idle += 1;
+        if let Some(ps) = &config.pool_status {
+            ps.set_idle(*idle as u32);
+        }
+    }
     let run_task = tokio::spawn(async move {
         let result = run_until_exit(&run_provider, &run_name, &run, busy_tx).await;
         let _ = done_tx.send(result);
@@ -3521,11 +4027,24 @@ async fn run_one_runner<P: VmProvider + 'static>(
     let successor_claimed = claimed.clone();
     let build_successor = async {
         if busy_rx.await.is_err() {
-            idle.fetch_sub(1, Ordering::AcqRel);
+            {
+                let mut idle = idle.lock().unwrap();
+                *idle = idle.saturating_sub(1);
+                if let Some(ps) = &config.pool_status {
+                    ps.set_idle(*idle as u32);
+                }
+            }
             return None;
         }
         successor_claimed.store(true, Ordering::Release);
-        let idle_after = idle.fetch_sub(1, Ordering::AcqRel).saturating_sub(1);
+        let idle_after = {
+            let mut idle = idle.lock().unwrap();
+            *idle = idle.saturating_sub(1);
+            if let Some(ps) = &config.pool_status {
+                ps.set_idle(*idle as u32);
+            }
+            *idle
+        };
         if !prebuild_successor {
             return None;
         }
@@ -3544,7 +4063,16 @@ async fn run_one_runner<P: VmProvider + 'static>(
         let wanted = queued
             .saturating_sub(idle_after)
             .max(usize::from(idle_after == 0));
-        let _reservation = Reservation::take(building, wanted)?;
+        let _reservation = Reservation::take(building, wanted, config.pool_status.clone())?;
+        // The successor boot runs alongside the job; while it is in flight a
+        // matching runner may not be registered yet (all slots busy). Hold
+        // the shared provisioning guard so the server's starvation sweep
+        // keeps the queued-job grace clock paused for the boot duration.
+        let preparing = PreparingGuard::enter(
+            provisioning.clone(),
+            config.preparing_signal.clone(),
+            config.pool_status.clone(),
+        );
         match provision_slot(
             &provider,
             config,
@@ -3556,8 +4084,12 @@ async fn run_one_runner<P: VmProvider + 'static>(
         )
         .await
         {
-            Ok(successor) => Some(successor),
+            Ok(successor) => {
+                drop(preparing);
+                Some(successor)
+            }
             Err(error) => {
+                drop(preparing);
                 warn!(slot, %error, "pre-provisioning the replacement runner failed");
                 None
             }
@@ -3576,7 +4108,13 @@ async fn run_one_runner<P: VmProvider + 'static>(
         _ = wait_for_environment_change(config, &environment.base, claimed) => {
             run_task.abort();
             let _ = run_task.await;
-            idle.fetch_sub(1, Ordering::AcqRel);
+            {
+                let mut idle = idle.lock().unwrap();
+                *idle = idle.saturating_sub(1);
+                if let Some(ps) = &config.pool_status {
+                    ps.set_idle(*idle as u32);
+                }
+            }
             info!(machine = name.as_str(), environment = %environment.base, "replacing idle runner for queued environment");
             (provider.stop(name).await.map_err(OrchestratorError::from), None)
         },
@@ -3620,6 +4158,7 @@ async fn run_one_runner<P: VmProvider + 'static>(
     if let Some(debug_dir) = preserved {
         hold_for_debugging(name, &debug_dir, &shutdown).await;
         notify_runner_gone(config, name).await;
+        vm_telemetry_deregister(config, name);
         if let Err(error) = provider.delete(name).await {
             warn!(machine = name.as_str(), %error, "failed to delete preserved machine");
         }
@@ -3628,6 +4167,7 @@ async fn run_one_runner<P: VmProvider + 'static>(
 
     // Report the runner's own failure in preference to a teardown failure.
     notify_runner_gone(config, name).await;
+    vm_telemetry_deregister(config, name);
     let delete_result = provider.delete(name).await.map_err(OrchestratorError::from);
     finish(&provider, config, result.and(delete_result), successor).await
 }
@@ -3648,6 +4188,7 @@ async fn finish<P: VmProvider + 'static>(
         Err(error) => {
             if let Some(successor) = successor {
                 notify_runner_gone(config, &successor.name).await;
+                vm_telemetry_deregister(config, &successor.name);
                 if let Err(cleanup) = provider.delete(&successor.name).await {
                     warn!(
                         machine = successor.name.as_str(),
@@ -3779,12 +4320,71 @@ fn fork_base_unusable(error: &VmError) -> bool {
 /// and replacing it with the packed artifact would run the job on the wrong
 /// operating system.
 fn managed_golden(config: &RunnerPoolConfig, golden: &MachineName) -> bool {
-    let prefix = format!("{}-golden", config.name_prefix);
+    let prefix = plain_packed_golden_name(config);
     golden.as_str() == prefix
         || golden.as_str().strip_prefix(&prefix).is_some_and(|rest| {
             rest.strip_prefix('-')
                 .is_some_and(|fp| fp.len() == 12 && fp.bytes().all(|b| b.is_ascii_hexdigit()))
         })
+}
+
+/// The plain packed golden: the single golden baked at pool startup from the
+/// packed artifact for the default environment.
+fn plain_packed_golden_name(config: &RunnerPoolConfig) -> String {
+    format!("{}-golden", config.name_prefix)
+}
+
+/// Best-effort VM telemetry: register a just-created or forked machine.
+///
+/// Fills what the pool knows about the machine; unknown fields stay unset.
+/// No-op without a wired observability handle.
+fn vm_telemetry_register(
+    config: &RunnerPoolConfig,
+    name: &MachineName,
+    role: &str,
+    spec: Option<&MachineSpec>,
+) {
+    let Some(observability) = &config.observability else {
+        return;
+    };
+    let (cpus, memory_mib, storage_gb, overlay_gb) = match spec {
+        Some(spec) => (
+            spec.cpus,
+            spec.memory_mib,
+            spec.storage_gib,
+            spec.overlay_gib,
+        ),
+        // A fork inherits the golden's resources, which match the pool's
+        // configured values.
+        None => (
+            config.cpus,
+            config.memory_mib,
+            config.storage_gib,
+            config.overlay_gib,
+        ),
+    };
+    observability
+        .vm_registry()
+        .register(preloop_observability::vm_telemetry::VmRuntimeInfo {
+            name: name.as_str().to_owned(),
+            role: role.to_owned(),
+            activity: "running".to_owned(),
+            pid: None,
+            start_time: None,
+            cpus,
+            memory_mib,
+            storage_gb,
+            overlay_gb,
+            data_dir: None,
+            created_at: None,
+        });
+}
+
+/// Best-effort VM telemetry: drop a machine from the registry at teardown.
+fn vm_telemetry_deregister(config: &RunnerPoolConfig, name: &MachineName) {
+    if let Some(observability) = &config.observability {
+        observability.vm_registry().deregister(name.as_str());
+    }
 }
 
 /// Create, boot, and register one ephemeral runner; return its `run` argv.
@@ -3966,6 +4566,8 @@ async fn provision_runner<P: VmProvider + 'static>(
     };
 
     if let Some(golden) = forked_golden {
+        // The fork succeeded, so the clone exists as a live machine.
+        vm_telemetry_register(config, name, "runner", None);
         // Fork from the already-booted golden VM instant CoW clone.
         // The PACKED golden carries its bake inside the artifact's flattened
         // rootfs, which forks inherit through the storage chain — so the apt
@@ -3985,8 +4587,8 @@ async fn provision_runner<P: VmProvider + 'static>(
         // writes into clones — so those forks must install the baseline
         // themselves. Treating an env golden as packed skipped that install
         // and provisioned runners without the curated baseline.
-        let golden_is_packed = config.use_packed_artifact
-            && golden.as_str() == format!("{}-golden", config.name_prefix);
+        let golden_is_packed =
+            config.use_packed_artifact && golden.as_str() == plain_packed_golden_name(config);
         if golden_is_packed {
             // The pack carries the apt baseline, but not necessarily apt's
             // indices — restore them before any workflow apt-installs. A
@@ -4054,7 +4656,7 @@ async fn provision_runner<P: VmProvider + 'static>(
         // runner path), the packed artifact is the pool's normal image and
         // stays as-is.
         let golden_is_plain_packed = match golden {
-            Some(golden) => golden.as_str() == format!("{}-golden", config.name_prefix),
+            Some(golden) => golden.as_str() == plain_packed_golden_name(config),
             None => true,
         };
         let uses_packed_artifact = direct_create_from_packed && golden_is_plain_packed;
@@ -4087,6 +4689,7 @@ async fn provision_runner<P: VmProvider + 'static>(
         };
         provider.create(&spec).await?;
         provider.start(name).await?;
+        vm_telemetry_register(config, name, "runner", Some(&spec));
         // The packed artifact is the golden's frozen image; the live golden
         // receives the apt baseline and toolchain bake *after* boot, so a
         // machine created from the artifact is bare and must install the
@@ -4153,6 +4756,7 @@ async fn provision_runner<P: VmProvider + 'static>(
     // guest cannot fabricate a pairing because only this exact configure
     // invocation ever sees the token value.
     let mut provision_token_file: Option<PathBuf> = None;
+    let mut provision_token_value: Option<String> = None;
     if let Some(pending) = &config.pending_registrations {
         let token = uuid::Uuid::new_v4().to_string();
         let dir = config
@@ -4165,7 +4769,19 @@ async fn provision_runner<P: VmProvider + 'static>(
         }) {
             Ok(path) => {
                 if let Ok(mut guard) = pending.write() {
-                    guard.insert(token, std::time::SystemTime::now());
+                    let issued_at = std::time::SystemTime::now();
+                    guard.insert(token.clone(), issued_at);
+                    // Mirror the mint into the consolidated status handle so
+                    // `PoolStatus::snapshot().pending_registrations` counts
+                    // tokens issued after startup too. The server-side
+                    // consume removes it from both stores.
+                    if let Some(ps) = &config.pool_status {
+                        ps.insert_pending(token.clone(), issued_at);
+                        // Same 600s window as the legacy pending-map prune
+                        // below, so stale tokens don't inflate
+                        // `pending_registrations` forever.
+                        ps.retain_pending_newer_than(std::time::Duration::from_secs(600));
+                    }
                     let now = std::time::SystemTime::now();
                     guard.retain(|_, at| {
                         now.duration_since(*at)
@@ -4173,6 +4789,7 @@ async fn provision_runner<P: VmProvider + 'static>(
                             .unwrap_or(false)
                     });
                 }
+                provision_token_value = Some(token);
                 secrets.push((
                     "PRELOOP_PROVISION_TOKEN".to_owned(),
                     SecretSource::HostFile(path.clone()),
@@ -4195,13 +4812,26 @@ async fn provision_runner<P: VmProvider + 'static>(
             }
         }
     }
-    provider
+    let configure_result = provider
         .exec_with_secret_env(name, &as_runner_user(config, &configure), &secrets)
-        .await?;
+        .await;
     drop(staged);
-    if let Some(path) = provision_token_file {
+    if configure_result.is_err() {
+        if let Some(token) = provision_token_value.as_deref() {
+            if let Some(pending) = &config.pending_registrations {
+                if let Ok(mut guard) = pending.write() {
+                    guard.remove(token);
+                }
+            }
+            if let Some(ps) = &config.pool_status {
+                ps.remove_pending(token);
+            }
+        }
+    }
+    if let Some(path) = provision_token_file.take() {
         let _ = std::fs::remove_file(path);
     }
+    configure_result?;
 
     // Bring the container engine up before the runner accepts work, so a job
     // declaring `container:` or `services:` does not race the daemon. Failure
@@ -4330,9 +4960,7 @@ async fn verify_toolchain_installed<P: VmProvider>(
     name: &MachineName,
     layer: &ToolchainLayer,
 ) -> Result<(), OrchestratorError> {
-    let binary = layer.verify_binary();
-    let mut command = vec!["sh".to_owned(), "-c".to_owned()];
-    command.push(format!("command -v {binary}"));
+    let command = vec!["sh".to_owned(), "-c".to_owned(), layer.verify_command()];
     if let Err(error) = provider.exec(name, &command).await {
         return Err(OrchestratorError::Vm(error));
     }
@@ -4510,6 +5138,9 @@ mod lifecycle_tests {
         fail_run: bool,
         fail_delete: bool,
         announce_busy: bool,
+        /// When set, `exec_with_secret_env` (the configure step) blocks until
+        /// notified, so a test can observe the pool mid-provision.
+        configure_gate: Option<Arc<tokio::sync::Notify>>,
         /// Binary that `command -v` cannot find until its toolchain installs.
         absent_binary: Mutex<Option<&'static str>>,
         /// Guest pause marker state: when set, the exec probe for the debug
@@ -4543,10 +5174,16 @@ mod lifecycle_tests {
                 fail_run,
                 fail_delete,
                 announce_busy: false,
+                configure_gate: None,
                 absent_binary: Mutex::new(None),
                 pause_marker: std::sync::atomic::AtomicBool::new(false),
                 probe_transport_error: std::sync::atomic::AtomicBool::new(false),
             }
+        }
+
+        fn with_configure_gate(mut self, gate: Arc<tokio::sync::Notify>) -> Self {
+            self.configure_gate = Some(gate);
+            self
         }
 
         fn announcing_busy(mut self) -> Self {
@@ -4716,6 +5353,78 @@ mod lifecycle_tests {
         let _ = watch.await;
     }
 
+    /// The pinned digests for the Linux node tarballs the provisioning script
+    /// installs, read from the same generated table the script verifies
+    /// against.
+    ///
+    /// These used to be written out by hand, once per architecture. Bumping
+    /// node refreshed the arm64 copies and left the x64 ones on the previous
+    /// release, so the checksum step failed on x86_64 only — invisible to
+    /// anyone developing on arm64, and it sat red in CI. Deriving them means a
+    /// version bump cannot desynchronise the fixture from the pin again.
+    fn pinned_linux_node_sha256() -> (&'static str, &'static str) {
+        let arch = if cfg!(target_arch = "x86_64") {
+            "x64"
+        } else {
+            "arm64"
+        };
+        let pin = |runtime: &str, version: &str| {
+            let key = format!("{runtime}_{version}_linux-{arch}");
+            node_externals_pinned_sha256(&key)
+                .unwrap_or_else(|| panic!("no pinned sha256 for {key}"))
+        };
+        (
+            pin("node20", NODE20_EXTERNALS_VERSION),
+            pin("node24", NODE24_EXTERNALS_VERSION),
+        )
+    }
+
+    /// `curl` stub: serves the pinned SHASUMS for this architecture, and a
+    /// one-word body for any archive download.
+    fn curl_stub_script() -> String {
+        let (node20, node24) = pinned_linux_node_sha256();
+        let arch = if cfg!(target_arch = "x86_64") {
+            "x64"
+        } else {
+            "arm64"
+        };
+        let v20 = NODE20_EXTERNALS_VERSION;
+        let v24 = NODE24_EXTERNALS_VERSION;
+        let shasums = format!(
+            "{node20}  node-v{v20}-linux-{arch}.tar.gz\\n{node24}  node-v{v24}-linux-{arch}.tar.gz\\n"
+        );
+        format!(
+            r#"#!/bin/sh
+out=""
+url=""
+while [ "$#" -gt 0 ]; do
+  case "$1" in
+    -o) out="$2"; shift 2;;
+    -*) shift;;
+    *) url="$1"; shift;;
+  esac
+done
+case "$url" in *SHASUMS256.txt*) printf "{shasums}" > "$out"; exit 0;; esac
+printf archive > "$out"
+"#
+        )
+    }
+
+    /// `shasum`/`sha256sum` stub: reports the pinned digest for whichever
+    /// runtime the caller is verifying. No `uname` branch — the Rust side
+    /// already resolved the architecture when it looked the pin up.
+    fn digest_stub_script() -> String {
+        let (node20, node24) = pinned_linux_node_sha256();
+        format!(
+            r#"#!/bin/sh
+case "$*" in
+  *node24*|*.node24.*) printf "{node24}  dummy\n";;
+  *) printf "{node20}  dummy\n";;
+esac
+"#
+        )
+    }
+
     fn test_output() -> ExecOutput {
         ExecOutput {
             exit_code: 0,
@@ -4733,25 +5442,36 @@ mod lifecycle_tests {
         std::fs::create_dir_all(&bin).unwrap();
 
         let curl = bin.join("curl");
-        std::fs::write(&curl, "#!/bin/sh\nprintf archive\n").unwrap();
+        std::fs::write(&curl, curl_stub_script()).unwrap();
         std::fs::set_permissions(&curl, std::fs::Permissions::from_mode(0o755)).unwrap();
+
+        let shasum = bin.join("shasum");
+        std::fs::write(&shasum, digest_stub_script()).unwrap();
+        std::fs::set_permissions(&shasum, std::fs::Permissions::from_mode(0o755)).unwrap();
+
+        let sha256sum = bin.join("sha256sum");
+        std::fs::write(&sha256sum, digest_stub_script()).unwrap();
+        std::fs::set_permissions(&sha256sum, std::fs::Permissions::from_mode(0o755)).unwrap();
 
         let tar = bin.join("tar");
         std::fs::write(
             &tar,
             r#"#!/bin/sh
-input=$(cat)
-[ "$input" = archive ] || exit 41
+archive=""
+dest=""
 while [ "$#" -gt 0 ]; do
-  if [ "$1" = -C ]; then
-    shift
-    destination=$1
-  fi
-  shift
+  case "$1" in
+    -xzf) archive="$2"; shift 2;;
+    -C) dest="$2"; shift 2;;
+    *) shift;;
+  esac
 done
-mkdir -p "$destination/bin"
-printf '#!/bin/sh\nexit 0\n' > "$destination/bin/node"
-chmod +x "$destination/bin/node"
+if [ ! -f "$archive" ]; then exit 41; fi
+content=$(cat "$archive")
+[ "$content" = archive ] || exit 42
+mkdir -p "$dest/bin"
+printf '#!/bin/sh\nexit 0\n' > "$dest/bin/node"
+chmod +x "$dest/bin/node"
 "#,
         )
         .unwrap();
@@ -4774,6 +5494,24 @@ chmod +x "$destination/bin/node"
         assert!(status.success());
         assert!(root.join("externals/node20/bin/node").is_file());
         assert!(root.join("externals/node24/bin/node").is_file());
+        // Manifests must be written with correct version and SHA.
+        let (node20_sha, node24_sha) = pinned_linux_node_sha256();
+        for name in ["node20", "node24"] {
+            let manifest =
+                std::fs::read_to_string(root.join(format!("externals/{name}/preloop-node.json")))
+                    .unwrap();
+            assert!(manifest.contains("\"runtime\":\""), "{manifest}");
+            assert!(manifest.contains("\"archive_sha256\":\""), "{manifest}");
+            let expected_sha = if name == "node20" {
+                node20_sha
+            } else {
+                node24_sha
+            };
+            assert!(
+                manifest.contains(expected_sha),
+                "{name} manifest must record the pinned digest {expected_sha}: {manifest}"
+            );
+        }
     }
 
     /// The guest runner drops to uid 1001, so a 0700 `node24/` hides a
@@ -4788,25 +5526,35 @@ chmod +x "$destination/bin/node"
         std::fs::create_dir_all(&bin).unwrap();
 
         let curl = bin.join("curl");
-        std::fs::write(&curl, "#!/bin/sh\nprintf archive\n").unwrap();
+        std::fs::write(&curl, curl_stub_script()).unwrap();
         std::fs::set_permissions(&curl, std::fs::Permissions::from_mode(0o755)).unwrap();
+        let shasum = bin.join("shasum");
+        std::fs::write(&shasum, digest_stub_script()).unwrap();
+        std::fs::set_permissions(&shasum, std::fs::Permissions::from_mode(0o755)).unwrap();
+
+        let sha256sum = bin.join("sha256sum");
+        std::fs::write(&sha256sum, digest_stub_script()).unwrap();
+        std::fs::set_permissions(&sha256sum, std::fs::Permissions::from_mode(0o755)).unwrap();
 
         let tar = bin.join("tar");
         std::fs::write(
             &tar,
             r#"#!/bin/sh
-input=$(cat)
-[ "$input" = archive ] || exit 41
+archive=""
+dest=""
 while [ "$#" -gt 0 ]; do
-  if [ "$1" = -C ]; then
-    shift
-    destination=$1
-  fi
-  shift
+  case "$1" in
+    -xzf) archive="$2"; shift 2;;
+    -C) dest="$2"; shift 2;;
+    *) shift;;
+  esac
 done
-mkdir -p "$destination/bin"
-printf '#!/bin/sh\nexit 0\n' > "$destination/bin/node"
-chmod +x "$destination/bin/node"
+if [ ! -f "$archive" ]; then exit 41; fi
+content=$(cat "$archive")
+[ "$content" = archive ] || exit 42
+mkdir -p "$dest/bin"
+printf '#!/bin/sh\nexit 0\n' > "$dest/bin/node"
+chmod +x "$dest/bin/node"
 "#,
         )
         .unwrap();
@@ -4902,9 +5650,21 @@ chmod +x "$destination/bin/node"
             .expect("the runner is launched with an explicit PATH");
         let entries: Vec<&str> = path.split(':').collect();
         assert!(
-            entries.contains(&"/root/.cargo/bin"),
+            entries.contains(&"/usr/local/cargo/bin"),
             "cargo-installed binaries must be reachable: {path}"
         );
+        // Toolchain homes are fixed system addresses, identical for root
+        // and switched runners: a $HOME-derived location would be invisible
+        // across the bake-user/step-user boundary (/root is 0700).
+        for expected in [
+            "RUSTUP_HOME=/usr/local/rustup",
+            "CARGO_HOME=/usr/local/cargo",
+        ] {
+            assert!(
+                env.iter().any(|entry| entry == expected),
+                "guest env must pin {expected}: {env:?}"
+            );
+        }
         assert!(
             entries.contains(&"/usr/local/go/bin"),
             "the go layer untars into /usr/local/go: {path}"
@@ -5108,11 +5868,11 @@ chmod +x "$destination/bin/node"
 
     #[test]
     fn concurrent_on_demand_provisioning_keeps_preparing_signal_raised() {
-        let active = Arc::new(AtomicUsize::new(0));
+        let active = Arc::new(std::sync::Mutex::new(0));
         let signal = Arc::new(std::sync::atomic::AtomicBool::new(false));
 
-        let first = PreparingGuard::enter(active.clone(), Some(signal.clone()));
-        let second = PreparingGuard::enter(active.clone(), Some(signal.clone()));
+        let first = PreparingGuard::enter(active.clone(), Some(signal.clone()), None);
+        let second = PreparingGuard::enter(active.clone(), Some(signal.clone()), None);
         assert!(signal.load(Ordering::Acquire));
 
         drop(first);
@@ -5123,6 +5883,142 @@ chmod +x "$destination/bin/node"
 
         drop(second);
         assert!(!signal.load(Ordering::Acquire));
+    }
+
+    #[tokio::test]
+    async fn warm_slot_raises_preparing_signal_while_provisioning() {
+        // A warm slot clears the pool's preparing flag at the end of the
+        // golden bake, then boots its first runner minutes later. The boot
+        // must re-raise the shared signal, or the server's starvation sweep
+        // fails a job queued during that window ("starving queued job failed
+        // after 120s") even though a runner is on the way.
+        let gate = Arc::new(tokio::sync::Notify::new());
+        let provider = Arc::new(
+            TestProvider::new(false, false, false, false, false).with_configure_gate(gate.clone()),
+        );
+        let mut config = test_config(false);
+        config.size = 1;
+        let signal = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        config.preparing_signal = Some(signal.clone());
+
+        let handles = PoolHandles {
+            idle: Arc::new(std::sync::Mutex::new(0)),
+            keys: Arc::new(KeyPool::new()),
+            building: Arc::new(AtomicUsize::new(0)),
+            provisioning: Arc::new(std::sync::Mutex::new(0)),
+        };
+        let shutdown = CancellationToken::new();
+        let slot = tokio::spawn(run_slot(
+            provider.clone(),
+            config.clone(),
+            0,
+            shutdown.clone(),
+            Arc::new(GoldenRegistry::new(config.name_prefix.clone())),
+            handles,
+        ));
+
+        // Wait until the slot's first provision reaches configure (i.e. the
+        // runner is mid-boot, before registration).
+        let deadline = tokio::time::Instant::now() + tokio::time::Duration::from_secs(5);
+        loop {
+            if provider
+                .events()
+                .await
+                .iter()
+                .any(|event| event.starts_with("configure:"))
+            {
+                break;
+            }
+            assert!(
+                tokio::time::Instant::now() < deadline,
+                "slot never reached the configure step"
+            );
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+
+        assert!(
+            signal.load(Ordering::Acquire),
+            "warm-mode provisioning must raise the preparing signal"
+        );
+
+        // Release the gate, then stop the slot.
+        gate.notify_waiters();
+        shutdown.cancel();
+        slot.abort();
+        let _ = slot.await;
+    }
+
+    /// Materialize a valid externals tree for every expected runtime.
+    fn write_valid_externals(externals_root: &std::path::Path) {
+        for (runtime, version) in crate::node_externals::expected_runtimes() {
+            let plain = version.trim_start_matches('v');
+            let runtime_dir = externals_root.join(runtime);
+            std::fs::create_dir_all(runtime_dir.join("bin")).unwrap();
+            let manifest = crate::node_externals::NodeManifest::new(
+                runtime,
+                plain,
+                "linux-arm64",
+                "abc",
+                "https://example.com",
+            );
+            crate::node_externals::write_manifest(&runtime_dir, &manifest).unwrap();
+            let node = runtime_dir.join("bin/node");
+            std::fs::write(&node, format!("#!/bin/sh\necho v{plain}\n")).unwrap();
+            std::fs::set_permissions(&node, std::fs::Permissions::from_mode(0o755)).unwrap();
+        }
+    }
+
+    /// A release directory the engine cannot write must not strand the pool
+    /// without node: the engine publishes its own bundle and mounts that.
+    #[test]
+    fn mirror_bundle_is_published_when_the_release_bundle_lacks_externals() {
+        let home = tempfile::tempdir().unwrap();
+        let release = tempfile::tempdir().unwrap();
+        std::fs::write(release.path().join("runner"), b"#!/bin/sh\nexit 0\n").unwrap();
+        let host_externals = home.path().join("externals");
+        write_valid_externals(&host_externals);
+
+        let mut config = test_config(false);
+        config.runner_bundle = release.path().to_path_buf();
+        config.externals_dir = home.path().to_path_buf();
+
+        // The release bundle carries no externals, so the guest would resolve
+        // its baked symlink onto nothing.
+        assert_eq!(effective_runner_bundle(&config), release.path());
+
+        materialize_mirror_bundle(&config, &host_externals)
+            .expect("the engine-owned mirror is publishable");
+
+        let mirror = mirror_bundle_dir(&config);
+        assert!(externals_complete(&mirror.join("externals")));
+        assert!(mirror.join("runner").is_file());
+        // Every guest now mounts the mirror instead of the incomplete release.
+        assert_eq!(effective_runner_bundle(&config), mirror);
+    }
+
+    /// Starting a pool whose bundle cannot resolve node reports ready and then
+    /// fails every JS action step, so publishing must fail loudly instead.
+    #[test]
+    fn mirror_bundle_publication_fails_when_host_externals_are_incomplete() {
+        let home = tempfile::tempdir().unwrap();
+        let release = tempfile::tempdir().unwrap();
+        std::fs::write(release.path().join("runner"), b"#!/bin/sh\nexit 0\n").unwrap();
+        // Host cache is empty: nothing valid to mirror.
+        let host_externals = home.path().join("externals");
+        std::fs::create_dir_all(&host_externals).unwrap();
+
+        let mut config = test_config(false);
+        config.runner_bundle = release.path().to_path_buf();
+        config.externals_dir = home.path().to_path_buf();
+
+        let error = materialize_mirror_bundle(&config, &host_externals)
+            .expect_err("an unusable bundle must refuse to start the pool");
+        assert!(
+            format!("{error}").contains("incomplete"),
+            "unexpected error: {error}"
+        );
+        // The release bundle stays selected; no half-published mirror is mounted.
+        assert_eq!(effective_runner_bundle(&config), release.path());
     }
 
     fn test_config(control_socket: bool) -> RunnerPoolConfig {
@@ -5158,6 +6054,8 @@ chmod +x "$destination/bin/node"
             next_job_runs_on: None,
             pending_registrations: None,
             preparing_signal: None,
+            pool_status: None,
+            observability: None,
         }
     }
 
@@ -5348,7 +6246,7 @@ chmod +x "$destination/bin/node"
             let mut absent = self.absent_binary.lock().await;
             if let Some(binary) = *absent {
                 let probe = format!("command -v {binary}");
-                if argv.contains(&probe) {
+                if argv.iter().any(|arg| arg.contains(&probe)) {
                     return Err(test_error("binary-not-found"));
                 }
                 // An install command that names the binary lands it on PATH.
@@ -5376,6 +6274,9 @@ chmod +x "$destination/bin/node"
                 .lock()
                 .await
                 .push(format!("configure:{}", name.as_str()));
+            if let Some(gate) = &self.configure_gate {
+                gate.notified().await;
+            }
             if self.fail_configure {
                 return Err(test_error("configure-failure"));
             }
@@ -5486,6 +6387,58 @@ chmod +x "$destination/bin/node"
         let config = test_config(false);
         let golden = MachineName::new("lifecycle-test-golden").unwrap();
         provisioning_failure(provider, &config, Some(&golden), "configure-failure").await;
+    }
+
+    #[tokio::test]
+    async fn provision_failures_count_and_clear_on_pool_status() {
+        let mut config = test_config(false);
+        let pool_status = Arc::new(preloop_observability::status::PoolStatus::new(
+            preloop_observability::status::PoolSnapshot::default(),
+        ));
+        config.pool_status = Some(pool_status.clone());
+        let keys = Arc::new(KeyPool::new());
+
+        // A failing provision must increment the consecutive-failure counter,
+        // which feeds `pool_repeated_provision_failure` and the status field.
+        let failing = Arc::new(TestProvider::new(true, false, false, false, false));
+        let err = provision_slot(
+            &failing,
+            &config,
+            0,
+            1,
+            None,
+            &keys,
+            RunnerEnvironment {
+                fingerprint: None,
+                base: config.base_image.clone(),
+                toolchains: Vec::new(),
+                curated: true,
+            },
+        )
+        .await
+        .expect_err("start-failure must propagate");
+        assert!(err.to_string().contains("start-failure"));
+        assert_eq!(pool_status.snapshot().consecutive_provision_failures, 1);
+
+        // A succeeding provision must reset the streak to zero.
+        let ok = Arc::new(TestProvider::new(false, false, false, false, false));
+        provision_slot(
+            &ok,
+            &config,
+            0,
+            2,
+            None,
+            &keys,
+            RunnerEnvironment {
+                fingerprint: None,
+                base: config.base_image.clone(),
+                toolchains: Vec::new(),
+                curated: true,
+            },
+        )
+        .await
+        .expect("provisioning succeeds");
+        assert_eq!(pool_status.snapshot().consecutive_provision_failures, 0);
     }
 
     fn packed_fork_config() -> RunnerPoolConfig {
@@ -6078,7 +7031,7 @@ chmod +x "$destination/bin/node"
         )
         .await
         .expect("provisioning succeeds");
-        let idle = AtomicUsize::new(0);
+        let idle = std::sync::Mutex::new(0);
         let error = run_one_runner(
             provider,
             &config,
@@ -6097,6 +7050,7 @@ chmod +x "$destination/bin/node"
                 idle: &idle,
                 keys: &Arc::new(KeyPool::new()),
                 building: &AtomicUsize::new(0),
+                provisioning: &Arc::new(std::sync::Mutex::new(0)),
                 prebuild_successor: true,
             },
         )
@@ -6113,9 +7067,10 @@ chmod +x "$destination/bin/node"
         let mut config = test_config(false);
         config.size = 0;
         let handles = PoolHandles {
-            idle: Arc::new(AtomicUsize::new(0)),
+            idle: Arc::new(std::sync::Mutex::new(0)),
             keys: Arc::new(KeyPool::new()),
             building: Arc::new(AtomicUsize::new(0)),
+            provisioning: Arc::new(std::sync::Mutex::new(0)),
         };
 
         run_on_demand_slot(
@@ -6125,7 +7080,7 @@ chmod +x "$destination/bin/node"
             CancellationToken::new(),
             Arc::new(GoldenRegistry::new(config.name_prefix.clone())),
             handles,
-            Arc::new(AtomicUsize::new(0)),
+            Arc::new(std::sync::Mutex::new(0)),
             Arc::new(tokio::sync::Semaphore::new(1)),
             Arc::new(std::sync::Mutex::new(None)),
         )

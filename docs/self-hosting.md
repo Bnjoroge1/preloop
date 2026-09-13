@@ -38,8 +38,9 @@ access at all** — see option A.
 - **Memory**: `PRELOOP_RUNNER_POOL_SIZE × PRELOOP_RUNNER_MEMORY_MIB`, plus a few
   GB for the control plane. Ceilings are ballooned, so idle runners hold far
   less than their ceiling — but concurrent heavy builds really do use it.
-- **CPU**: each runner VM gets 4 vCPUs. `pool_size × 4` well above your core
-  count means jobs contend and wall-clock-sensitive tests turn flaky.
+- **CPU**: each runner VM gets `PRELOOP_RUNNER_CPUS` vCPUs (default 4).
+  `pool_size × PRELOOP_RUNNER_CPUS` well above your core count means jobs
+  contend and wall-clock-sensitive tests turn flaky.
 - **Disk**: golden images (roughly 0.7–6 GB each, and superseded ones
   accumulate) plus the cache directory, which grows with every distinct key.
 - **GitHub App**: app id, private key PEM, installation id, and a webhook secret
@@ -50,15 +51,20 @@ access at all** — see option A.
 
 ## 3. Install
 
+For a Linux system service, install the CLI and SmolVM runtime in system
+locations. A user-local binary under `/home` cannot be traversed by the
+dedicated service account, and a user-local runtime is not visible to it:
+
 ```sh
-curl -fsSL https://raw.githubusercontent.com/preloopdev/preloop/main/install.sh | sh
-preloop setup github --via app --public-url https://ci.example.com
+sudo -H env PREFIX=/usr/local sh -c \
+  'curl -fsSL https://raw.githubusercontent.com/preloopdev/preloop/main/install.sh | sh'
+sudo /usr/local/bin/preloop setup github --via app --public-url https://ci.example.com
 ```
 
 Then install it as a supervised service — systemd on Linux, launchd on macOS:
 
 ```sh
-sudo preloop server install \
+sudo /usr/local/bin/preloop server install \
   --public-url https://ci.example.com \
   --github-app-id 123456 \
   --github-app-key /etc/preloop/app.pem \
@@ -101,15 +107,18 @@ All configuration is environment variables; CLI flags override them.
 | `PRELOOP_HOME` | `$HOME/.preloop` | State directory (database, blobs, cache, credentials) |
 | `PRELOOP_STORE_URL` | SQLite in the state dir | `sqlite://<path>`, a bare path, or `postgres://…?sslmode=require\|verify-full` |
 | `PRELOOP_UNIX_SOCKET` | — | Control socket path; mounted into runner VMs, serves the runner surface only |
-| `PRELOOP_SYSTEM_TOKEN` | generated | Admin credential for `/api/v1/*`. Treat it as root for the control plane |
+| `PRELOOP_SYSTEM_TOKEN` | generated and stored in the OS credential store; private `$PRELOOP_HOME/engine.token` fallback | Admin credential for `/api/v1/*`. Treat it as root for the control plane; strict external runner registration also uses this credential |
 | `PRELOOP_TOKEN_TTL_SECS` | `2999` | Issued runner token lifetime |
+| `PRELOOP_REGISTRATION_POLICY` | `strict` | Registration policy. `strict` requires the system credential (or a fresh pool provision token on legacy registration); `permissive` accepts any non-empty upstream token on TCP for conformance replay only, while the mounted socket remains strict — never use it on an exposed listener |
 | `PRELOOP_CONFIG` | `$PRELOOP_HOME/config.toml` | Config file path |
 | `PRELOOP_SECRETS_STORE` | config file | Secrets backend selector |
 | `PRELOOP_RUNNER_URL` | loopback listen address | Origin handed to runners. Set automatically; override only for remote runners |
 | `PRELOOP_CONTROL_UPSTREAM` | — | LAN address remote runners use when loopback is not reachable |
 
-Client-side (`preloop` CLI): `PRELOOP_URL` (default `http://127.0.0.1:9090`) and
-`PRELOOP_TOKEN`.
+Managed engines read their generated token from the OS credential store (or
+`$PRELOOP_HOME/engine.token` when that store is unavailable or unreadable). For
+a separate client or service, set `PRELOOP_SYSTEM_TOKEN` explicitly; never print
+or commit the fallback file.
 
 ### GitHub
 
@@ -130,6 +139,7 @@ Client-side (`preloop` CLI): `PRELOOP_URL` (default `http://127.0.0.1:9090`) and
 |---|---|---|
 | `PRELOOP_RUNNER_POOL_ENABLED` | off | Master switch for the microVM pool |
 | `PRELOOP_RUNNER_POOL_SIZE` | derived from host CPU/RAM | Warm machines; `0` forks on demand |
+| `PRELOOP_RUNNER_CPUS` | `4` | vCPUs allocated to each runner VM |
 | `PRELOOP_RUNNER_MEMORY_MIB` | `4096` | Memory ceiling per VM. Raise it for LTO release builds — rustc is `SIGKILL`ed at 4 GiB on large workspaces |
 | `PRELOOP_RUNNER_STORAGE_GB` | `20` | Writable guest disk. Raise to `80` or more for full hosted-image snapshots and large golden packs |
 | `PRELOOP_RUNNER_OVERLAY_GB` | — | Per-VM writable overlay size |
@@ -156,12 +166,11 @@ Keep repository-specific software in workflow setup actions, install steps,
 or a job `container:`.
 
 ---
-
 ## 5. Exposure options
 
 Set `PRELOOP_PUBLIC_URL` to whatever address others actually reach.
 
-### A. No inbound access
+### A. No public inbound access
 
 The most locked-down option, and the only one with zero public attack surface.
 Bind to loopback or a private/VPN address:
@@ -181,11 +190,24 @@ preloop run --push --create-pr   # run CI first, then push and open a draft PR
 Both are outbound-only: check runs are still reported to GitHub. On a VPN such
 as Tailscale, bind the VPN address instead and restrict access with its ACLs —
 then `details_url` links resolve for exactly the people allowed to read logs.
+For a tailnet-only HTTPS URL while keeping Preloop on loopback, use Tailscale
+Serve:
+
+```sh
+tailscale serve --bg --https=443 http://127.0.0.1:9090
+PRELOOP_PUBLIC_URL=https://<host>.<tailnet>.ts.net
+```
+
+This URL is reachable only by tailnet members permitted by the Tailscale ACL.
+It is not a GitHub webhook endpoint; use a separate public, path-filtering
+ingress if GitHub must deliver webhooks.
 
 ### B. Tailscale Funnel
 
-Public HTTPS without opening a port or running a proxy. Traffic transits
-Tailscale's edge.
+Tailscale Funnel provides public HTTPS without opening a port or running a
+proxy. Do **not** point it directly at Preloop: Funnel would publish the
+unauthenticated runner-registration surface described in §6. Put a
+path-filtering proxy in front and publish only the webhook path.
 
 ```sh
 tailscale funnel --bg 9090
@@ -262,31 +284,44 @@ path exposes job logs.
 
 ## 6. Security: what must not be public
 
-**`PRELOOP_LISTEN` defaults to `127.0.0.1:9090`**, so a bare `preloop serve` is
-only reachable from the host. To expose the control plane (tunnels reach it via
-`127.0.0.1` anyway), bind a private address or `0.0.0.0` — and put a proxy in
-front. Publishing `0.0.0.0` on a host with a public IP exposes the API to the
-internet with no authentication on the queue path.
+`PRELOOP_LISTEN` defaults to `127.0.0.1:9090`, so a bare `preloop serve` is
+only reachable from the host. A generated native API token protects
+`/api/v1/*` even when you bind a private non-loopback address, but it does not
+protect the runner registration surface. Bind a private address or `0.0.0.0`
+behind a proxy or tunnel, and do not publish the registration endpoint to the
+internet. `PRELOOP_REGISTRATION_POLICY=permissive` is rejected on non-loopback
+listeners.
 
 **Never publish the whole API surface.** Restrict your proxy or tunnel to
 `/api/v1/github/webhooks`, as every example above does.
 
 The reason is `POST /api/v3/actions/runner-registration`. The official GitHub
-runner authenticates there with a registration token **GitHub** issued and can
-therefore validate. A self-hosted control plane cannot validate a third-party
-credential, so it accepts any non-empty one over TCP. Anyone who can reach that
-endpoint can:
+runner authenticates there with a registration token **GitHub** issued, but a
+self-hosted control plane cannot validate a third-party credential. In the
+safe default (`PRELOOP_REGISTRATION_POLICY=strict`, or when unset), Preloop
+therefore requires its own system credential on TCP and on the mounted socket.
+The host-side pool can instead redeem a single-use provision token staged in
+the control plane for that machine on a legacy registration alias. The token
+expires after ten minutes and is consumed atomically.
+
+The explicit `PRELOOP_REGISTRATION_POLICY=permissive` mode accepts any
+non-empty registration credential on TCP solely for conformance replay of
+GitHub-issued tokens that Preloop cannot verify. The mounted socket still
+requires the system credential. **Never enable permissive mode on an exposed
+or production listener.**
+
+Without the strict gate, anyone who could reach the endpoint could:
 
 1. obtain a runner-management credential,
 2. register a runner with labels matching your jobs,
 3. receive a job message — which carries a freshly minted GitHub App
-   installation token and any secrets scoped to that job, and
-4. report fabricated job conclusions.
+  token and job secrets.
 
-Requests arriving on the mounted control socket are held to a stricter rule (the
-system credential is required), because untrusted workflow code can reach that
-socket. The TCP surface has no equivalent gate, so **network reachability is the
-control**.
+In strict mode, the TCP and mounted-socket surfaces enforce the same
+registration credential boundary: the system credential is required. Workflow
+code is not given the system credential, so it cannot use the socket to mint a
+new runner identity. `PRELOOP_REGISTRATION_POLICY=permissive` is a
+conformance-only TCP exception and is allowed only on loopback.
 
 Also worth knowing:
 
@@ -314,6 +349,7 @@ Also worth knowing:
 | `state/blobs/`, `state/replay/` | Step logs and job artifacts |
 | `state/cache/` | Actions cache entries |
 | `vms/` | Golden images and per-machine state |
+| `engine.token` | Private fallback for the generated native API token when no OS credential service is available |
 
 Back up at least the database and `github-app.json`. Losing the database strands
 any check run GitHub is still waiting on; losing the key means re-keying the App.
@@ -330,7 +366,7 @@ jobs are lost, not resumed — restart during a quiet period and re-run after.
 
 - Memory: `pool_size × PRELOOP_RUNNER_MEMORY_MIB` should fit with headroom.
   4 × 6 GiB on a 22 GiB host is already oversubscribed and relies on ballooning.
-- CPU: `pool_size × 4` vCPUs against your core count. Past roughly 2× the box
+- CPU: `pool_size × PRELOOP_RUNNER_CPUS` vCPUs against your core count. Past roughly 2× the box
   thrashes and timing-sensitive tests flake.
 - Disk: prune superseded golden directories and cap the cache directory.
 

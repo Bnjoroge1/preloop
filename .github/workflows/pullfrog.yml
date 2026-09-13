@@ -18,16 +18,19 @@ permissions:
   issues: write
   id-token: write
 
+# Single-flight across the whole repo. Each run clones ~470 MB and the
+# self-hosted host has 23 GB of RAM shared with an 8 GB runner VM and the
+# control plane, so a comment burst launching several at once is what
+# exhausts the box. Queue instead of cancelling: a superseded review is
+# still cheaper than losing one that was asked for.
 concurrency:
-  group: pullfrog-${{ github.event.pull_request.number || github.event.issue.number || github.run_id }}
-  cancel-in-progress: true
+  group: pullfrog
+  cancel-in-progress: false
 
 jobs:
   pullfrog:
-    # PR events provide the single automatic review. Issue comments are
-    # opt-in only so bot/code-review comments do not launch duplicate agents.
-    if: github.event_name != 'issue_comment' || contains(github.event.comment.body, '@pullfrog')
-    runs-on: self-hosted
+    if: github.actor != 'renovate[bot]' && github.actor != 'dependabot[bot]' && github.actor != 'pullfrog[bot]'
+    runs-on: [self-hosted, preloop-cpane]
     timeout-minutes: 60
     steps:
       - uses: actions/checkout@08c6903cd8c0fde910a37f88322edcfb5dd907a8 # v5.0.0
@@ -35,13 +38,59 @@ jobs:
           persist-credentials: false
           fetch-depth: 0
 
+      - name: Check for reviewable platform changes
+        id: diff_filter
+        env:
+          BASE_REF: ${{ github.base_ref || 'main' }}
+          EVENT_NAME: ${{ github.event_name }}
+        run: |
+          if [ "$EVENT_NAME" = "pull_request" ]; then
+            if git fetch origin "$BASE_REF" --depth=1 >/dev/null 2>&1 && \
+               CHANGED=$(git diff --name-only "origin/$BASE_REF"...HEAD 2>/dev/null) && \
+               [ -n "$CHANGED" ]; then
+              CODE_CHANGED=$(echo "$CHANGED" | grep -vE '^(\.runner-watch/.*\.jsonl$|\.runner-watch/.*\.json$|docs/|.*\.md$)' || true)
+              if [ -z "$CODE_CHANGED" ]; then
+                echo "Only docs, markdown, and static golden captures changed. Skipping Pullfrog review to avoid unnecessary model charges."
+                echo "skip=true" >> "$GITHUB_OUTPUT"
+              else
+                echo "Platform code or executable files changed:"
+                echo "$CODE_CHANGED"
+                echo "skip=false" >> "$GITHUB_OUTPUT"
+              fi
+            else
+              echo "Could not reliably determine git diff; running review."
+              echo "skip=false" >> "$GITHUB_OUTPUT"
+            fi
+          else
+            echo "skip=false" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Ensure npm and npx are available
+        run: |
+          for node_dir in /opt/actions-runner/externals*/node*; do
+            if [ -d "$node_dir/bin" ] && [ -f "$node_dir/lib/node_modules/npm/bin/npm-cli.js" ]; then
+              printf '#!/usr/bin/env sh\nexec node "%s" "$@"\n' "$node_dir/lib/node_modules/npm/bin/npx-cli.js" > "$node_dir/bin/npx" || true
+              printf '#!/usr/bin/env sh\nexec node "%s" "$@"\n' "$node_dir/lib/node_modules/npm/bin/npm-cli.js" > "$node_dir/bin/npm" || true
+              chmod +x "$node_dir/bin/npx" "$node_dir/bin/npm" || true
+              echo "$node_dir/bin" >> "$GITHUB_PATH"
+            fi
+          done || true
+
       - name: Run Pullfrog (via GHES-compatible fork)
-        uses: Bnjoroge1/pullfrog@09dde428a88245ab3c448ff3dcadb8325e4e1d05 # ghes-url-support
+        if: steps.diff_filter.outputs.skip != 'true'
+        continue-on-error: true
+        uses: preloopdev/pullfrog@ee5bcaf5557b069f78177ec0a33381c9e5477cf4 # main
         with:
           prompt: ${{ inputs.prompt || toJSON(github.event) }}
           model: openai/gpt-5.6-terra
         env:
-          # Direct Codex/Claude subscriptions — no CLIProxy, no API keys
+          # LOAD-BEARING, do not delete: the action clones into
+          # `pullfrog-XXXXXX` under the system temp dir and never cleans up.
+          # `/tmp` on the self-hosted host is a tmpfs at 50% of RAM, so each
+          # leaked clone costs ~470 MB of memory permanently. Without this the
+          # leak filled /tmp and the kernel OOM-killed the runner VM and the
+          # control plane (#194, #195; regressed once by a comment cleanup).
+          # runner.temp is disk-backed and cleared between jobs.
+          TMPDIR: ${{ runner.temp }}
           CODEX_AUTH_JSON: ${{ secrets.CODEX_AUTH_JSON }}
           CLAUDE_CODE_OAUTH_TOKEN: ${{ secrets.CLAUDE_CODE_OAUTH_TOKEN }}
-          # Optional: add ANTHROPIC_API_KEY/OPENAI_API_KEY as fallback, but subscription is preferred
