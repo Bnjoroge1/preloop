@@ -3260,6 +3260,7 @@ mod assignment_tests {
                 timeline_id: uuid::Uuid::nil(),
                 result,
                 locked_until: String::new(),
+                claimed_at: None,
                 owner_runner_id: owner,
                 started_at: std::time::SystemTime::now()
                     .checked_sub(std::time::Duration::from_secs(started_ago_secs)),

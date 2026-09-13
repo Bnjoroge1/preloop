@@ -1892,6 +1892,7 @@ mod tests {
             Vec::new(),
             Default::default(),
             Default::default(),
+            Default::default(),
         );
         assert_eq!(
             snapshot.overall,
@@ -1921,6 +1922,7 @@ mod tests {
             true,
             temp.path(),
             Vec::new(),
+            Default::default(),
             Default::default(),
             Default::default(),
         );
@@ -1955,6 +1957,7 @@ mod tests {
             temp.path(),
             Vec::new(),
             github,
+            Default::default(),
             Default::default(),
         );
         assert_eq!(

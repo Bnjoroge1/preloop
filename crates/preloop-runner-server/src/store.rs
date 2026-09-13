@@ -4107,6 +4107,7 @@ mod tests {
             result: None,
             locked_until: "locked".to_owned(),
             claimed_at: Some(claimed_at),
+            owner_runner_id: None,
             started_at: Some(started_at),
             last_renewed_at: Some(renewed_at),
             timeout_triggered: false,
