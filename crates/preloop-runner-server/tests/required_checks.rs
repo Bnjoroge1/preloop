@@ -79,3 +79,58 @@ fn every_required_check_is_produced_by_a_workflow() {
          (rename the job or update ruleset `main` id 20594250 to match): {missing:?}"
     );
 }
+
+#[test]
+fn live_main_ruleset_matches_required_checks() {
+    let Some(token) = std::env::var_os("GITHUB_TOKEN") else {
+        eprintln!("GITHUB_TOKEN is not set; skipping live ruleset validation");
+        return;
+    };
+    let api_url =
+        std::env::var("GITHUB_API_URL").unwrap_or_else(|_| "https://api.github.com".to_owned());
+    let url = format!("{api_url}/repos/preloopdev/preloop/rulesets/20594250");
+    let body: serde_json::Value = reqwest::blocking::Client::new()
+        .get(url)
+        .bearer_auth(token.to_string_lossy())
+        .header(reqwest::header::ACCEPT, "application/vnd.github+json")
+        .header(reqwest::header::USER_AGENT, "preloop-required-checks-test")
+        .send()
+        .expect("requesting main ruleset")
+        .error_for_status()
+        .expect("main ruleset API response")
+        .json()
+        .expect("decoding main ruleset");
+    let contexts: BTreeSet<String> = body
+        .get("rules")
+        .and_then(serde_json::Value::as_array)
+        .and_then(|rules| {
+            rules.iter().find_map(|rule| {
+                if rule.get("type").and_then(serde_json::Value::as_str)
+                    != Some("required_status_checks")
+                {
+                    return None;
+                }
+                rule.get("parameters")?
+                    .get("required_status_checks")?
+                    .as_array()
+            })
+        })
+        .expect("main ruleset required_status_checks rule")
+        .iter()
+        .map(|check| {
+            check
+                .get("context")
+                .and_then(serde_json::Value::as_str)
+                .expect("required status check context")
+                .to_owned()
+        })
+        .collect();
+    let expected: BTreeSet<String> = REQUIRED_CHECKS
+        .iter()
+        .map(|check| (*check).to_owned())
+        .collect();
+    assert_eq!(
+        contexts, expected,
+        "live ruleset `main` id 20594250 differs from REQUIRED_CHECKS"
+    );
+}
