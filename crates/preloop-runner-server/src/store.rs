@@ -2203,6 +2203,7 @@ impl SqliteStore {
             projection.run.run_number.saturating_add(1),
         )?;
         self.store_run_tx(&tx, &projection.run)?;
+        tx.execute("DELETE FROM jobs WHERE run_id = ?1", [run_id.to_string()])?;
         for (kind, job, position) in &projection.jobs {
             self.insert_job(&tx, job, kind, *position)?;
         }

@@ -269,62 +269,50 @@ pub(crate) async fn report_check_run_queued(
     }
 
     let check_run_id = if let Some(token) = &token {
-        // Recover a POST whose response was lost before creating another
-        // check. This lookup is also what makes a stale persisted mapping
-        // converge after GitHub deleted the original check.
-        if let Some(existing) =
-            find_existing_check_run(shared, token, repo, sha, &job_id.to_string()).await?
-        {
-            report_existing_check_run_queued(shared, repo, job_id, run_id, existing).await?;
-            existing
-        } else {
-            let details_url = run_details_url(run_id);
-            let mut body = serde_json::json!({
-                "name": job_id.to_string(),
-                "head_sha": sha,
-                "status": "queued",
-            });
-            if let Some(url) = details_url {
-                body["details_url"] = serde_json::json!(url);
-            }
+        let details_url = run_details_url(run_id);
+        let mut body = serde_json::json!({
+            "name": job_id.to_string(),
+            "head_sha": sha,
+            "status": "queued",
+        });
+        if let Some(url) = details_url {
+            body["details_url"] = serde_json::json!(url);
+        }
 
-            match send_github_check_request(
-                &shared.state.github_breaker,
-                token,
-                repo,
-                reqwest::Method::POST,
-                "check-runs",
-                body,
-            )
-            .await
-            {
-                Ok(response) => match response.get("id").and_then(Value::as_u64) {
-                    Some(id) => {
-                        info!(
-                            %run_id,
-                            %job_id,
-                            check_run_id = id,
-                            "GitHub check run created successfully"
-                        );
-                        id
-                    }
-                    None => find_existing_check_run(shared, token, repo, sha, &job_id.to_string())
-                        .await?
-                        .ok_or_else(|| anyhow::anyhow!("GitHub check-run POST returned no id"))?,
-                },
-                Err(error) => {
-                    // A transport error is ambiguous: GitHub may have
-                    // committed the POST before the connection failed.
-                    match find_existing_check_run(shared, token, repo, sha, &job_id.to_string())
-                        .await
-                    {
-                        Ok(Some(id)) => id,
-                        Ok(None) => return Err(error),
-                        Err(reconcile_error) => {
-                            return Err(anyhow::anyhow!(
-                                "{error}; check-run reconciliation failed: {reconcile_error}"
-                            ));
-                        }
+        match send_github_check_request(
+            &shared.state.github_breaker,
+            token,
+            repo,
+            reqwest::Method::POST,
+            "check-runs",
+            body,
+        )
+        .await
+        {
+            Ok(response) => match response.get("id").and_then(Value::as_u64) {
+                Some(id) => {
+                    info!(
+                        %run_id,
+                        %job_id,
+                        check_run_id = id,
+                        "GitHub check run created successfully"
+                    );
+                    id
+                }
+                None => find_existing_check_run(shared, token, repo, sha, &job_id.to_string())
+                    .await?
+                    .ok_or_else(|| anyhow::anyhow!("GitHub check-run POST returned no id"))?,
+            },
+            Err(error) => {
+                // A transport error is ambiguous: GitHub may have
+                // committed the POST before the connection failed.
+                match find_existing_check_run(shared, token, repo, sha, &job_id.to_string()).await {
+                    Ok(Some(id)) => id,
+                    Ok(None) => return Err(error),
+                    Err(reconcile_error) => {
+                        return Err(anyhow::anyhow!(
+                            "{error}; check-run reconciliation failed: {reconcile_error}"
+                        ));
                     }
                 }
             }

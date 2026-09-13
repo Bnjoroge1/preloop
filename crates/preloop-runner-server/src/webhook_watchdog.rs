@@ -680,21 +680,24 @@ mod tests {
         (format!("http://{addr}"), attempts)
     }
 
-    async fn shared_with_app(api_base: &str) -> Arc<SharedState> {
+    async fn shared_with_app(api_base: &str) -> (tempfile::TempDir, Arc<SharedState>) {
         let temp = tempfile::tempdir().unwrap();
-        // The tempdir must outlive the state; leak it for the test's life.
-        let path = temp.keep();
-        let mut state = crate::AppState::new(path).await.unwrap();
+        let mut state = crate::AppState::new(temp.path().to_path_buf())
+            .await
+            .unwrap();
         state.github_app = Some(GitHubAppCredentials::for_tests(
             "424",
             TEST_KEY.clone(),
             crate::github_app::MintFailurePolicy::LocalJwt,
         ));
         let _ = api_base;
-        Arc::new(SharedState {
-            state,
-            shutdown: tokio_util::sync::CancellationToken::new(),
-        })
+        (
+            temp,
+            Arc::new(SharedState {
+                state,
+                shutdown: tokio_util::sync::CancellationToken::new(),
+            }),
+        )
     }
 
     fn delivery(id: i64, guid: &str, status_code: u16, age_secs: i64) -> serde_json::Value {
@@ -718,7 +721,7 @@ mod tests {
         )
         .await;
         let _api = crate::state::TestEnvVar::set("PRELOOP_GITHUB_API_URL", &api_base);
-        let shared = shared_with_app(&api_base).await;
+        let (_temp, shared) = shared_with_app(&api_base).await;
 
         let outcome = watchdog_poll_once(&shared).await.unwrap();
 
@@ -746,7 +749,7 @@ mod tests {
         )
         .await;
         let _api = crate::state::TestEnvVar::set("PRELOOP_GITHUB_API_URL", &api_base);
-        let shared = shared_with_app(&api_base).await;
+        let (_temp, shared) = shared_with_app(&api_base).await;
 
         let outcome = watchdog_poll_once(&shared).await.unwrap();
 
@@ -777,7 +780,7 @@ mod tests {
         )
         .await;
         let _api = crate::state::TestEnvVar::set("PRELOOP_GITHUB_API_URL", &api_base);
-        let shared = shared_with_app(&api_base).await;
+        let (_temp, shared) = shared_with_app(&api_base).await;
         shared
             .state
             .store
@@ -811,7 +814,7 @@ mod tests {
         )
         .await;
         let _api = crate::state::TestEnvVar::set("PRELOOP_GITHUB_API_URL", &api_base);
-        let shared = shared_with_app(&api_base).await;
+        let (_temp, shared) = shared_with_app(&api_base).await;
 
         let outcome = watchdog_poll_once(&shared).await.unwrap();
 
@@ -840,7 +843,7 @@ mod tests {
         )
         .await;
         let _api = crate::state::TestEnvVar::set("PRELOOP_GITHUB_API_URL", &api_base);
-        let shared = shared_with_app(&api_base).await;
+        let (_temp, shared) = shared_with_app(&api_base).await;
 
         let result = watchdog_poll_once(&shared).await;
 
