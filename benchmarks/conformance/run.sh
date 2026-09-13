@@ -29,7 +29,16 @@ cleanup() {
 }
 trap cleanup EXIT
 
-python3 benchmarks/conformance/check_corpus.py
+python3 benchmarks/conformance/check_corpus.py --exclude-prefix 2
+# v2.337.0 was recorded as four explicit cells.  Keep the current replay pin
+# at v2.336.0, but gate the recovered official cell's summaries, ownership,
+# and plan-GUID isolation here.
+python3 benchmarks/conformance/check_corpus.py \
+  --version 2.337.0 \
+  --golden-root ".runner-watch/golden/v2.337.0" \
+  --cell gh-official \
+  --scenario-prefix 2 \
+  --validate-ownership
 
 # The CI recipe already runs the workspace tests. Standalone conformance builds
 # only the server it executes; runner-watch is told not to repeat the suite.

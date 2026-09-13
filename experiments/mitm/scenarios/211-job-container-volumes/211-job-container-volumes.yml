@@ -1,0 +1,25 @@
+name: 211-job-container-volumes
+on: workflow_dispatch
+jobs:
+  default-container-env:
+    runs-on: self-hosted
+    container:
+    steps:
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+      - run: "node --version && npm --version"

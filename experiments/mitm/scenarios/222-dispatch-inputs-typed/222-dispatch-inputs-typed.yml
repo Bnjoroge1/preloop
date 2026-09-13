@@ -1,0 +1,35 @@
+name: 222-dispatch-inputs-typed
+on: workflow_dispatch
+jobs:
+  dispatch:
+    runs-on: self-hosted
+    steps:
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+      - run: |
+          echo "log-level=${{ inputs.log-level }} dry-run=${{ inputs.dry-run }} note=${{ inputs.note }}"
+          echo "shard=${{ matrix.shard }} event=${{ github.event_name }}"

@@ -1,0 +1,24 @@
+name: 209-continue-on-error-cascade
+on: workflow_dispatch
+jobs:
+  cstep:
+    runs-on: self-hosted
+    steps:
+
+
+
+
+
+
+
+
+      - continue-on-error: true
+        run: |
+          echo "failing inside"
+          exit 5
+      - run: "echo \"still ran because coe, outcome=${{ steps.Boom.outcome }}\""
+      - run: "exit 9"
+      - run: "echo \"unreachable\""
+
+      - run: "echo \"failure branch\""
+        if: "failure()"

@@ -1,0 +1,27 @@
+name: 202-dynamic-matrix-dataflow
+on: workflow_dispatch
+jobs:
+  report:
+    runs-on: self-hosted
+    steps:
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+      - run: "echo \"result=${{ needs.build.result }}\""

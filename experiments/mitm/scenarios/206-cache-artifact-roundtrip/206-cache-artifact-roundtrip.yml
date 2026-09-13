@@ -1,0 +1,27 @@
+name: 206-cache-artifact-roundtrip
+on: workflow_dispatch
+jobs:
+  build:
+    runs-on: self-hosted
+    steps:
+      - name: "create files"
+        run: |
+          mkdir -p dist assets
+          echo "binary-v1-${{ github.run_id }}" > dist/app.bin
+          head -c 100000 /dev/urandom > assets/blob.bin
+          echo "manifest" > dist/manifest.txt
+      - name: "prime cache"
+        uses: "actions/cache@v4"
+        with:
+          path: "assets"
+          key: "edge-cache-${{ github.run_id }}"
+          restore-keys: "edge-cache-${{ github.run_id }}\n"
+
+
+      - with:
+          name: "build-output"
+          path: "dist\n!dist/manifest.txt\n"
+
+
+          retention-days: "1"
+        uses: "actions/upload-artifact@v4"

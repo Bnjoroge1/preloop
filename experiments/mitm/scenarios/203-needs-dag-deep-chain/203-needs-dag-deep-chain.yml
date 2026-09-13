@@ -1,0 +1,10 @@
+name: 203-needs-dag-deep-chain
+on: workflow_dispatch
+jobs:
+  lint:
+    runs-on: self-hosted
+    outputs:
+      status: "${{ steps.lint.outputs.status }}"
+    steps:
+
+      - run: "echo \"status=clean\" >> \"$GITHUB_OUTPUT\""
