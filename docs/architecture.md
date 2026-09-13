@@ -151,7 +151,6 @@ Known limitations:
 | `github_breaker.rs`     | Circuit breaker + rate-limit classification for GitHub calls           |
 | `webhook_watchdog.rs`   | Delivery-history poll, phantom-ack join, redelivery                    |
 | `webhook_health.rs`     | Periodic App subscription / delivery-URL drift checks                  |
-| `webhook_reconciler.rs` | Source-state diff → synthesized deliveries (opt-in)                    |
 | `webhook_status.rs`     | Live repair-layer status behind one lock                               |
 | `webhook_api.rs`        | `/api/v1/webhooks` listing, replay, health                             |
 | `runtime_scheduling.rs` | Job dispatch/pairing, claim eligibility, binding ceiling & reaper       |

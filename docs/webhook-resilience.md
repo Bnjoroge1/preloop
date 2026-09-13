@@ -3,7 +3,7 @@
 GitHub sends each webhook **once**. A non-2xx response, a 10-second timeout,
 or a host that is not there produces a red row in the App's delivery history
 and nothing else — there is no automatic retry, ever. preloop's answer is a
-durable boundary plus four repair layers, each covering a failure the previous
+the durable boundary plus three repair layers, each covering a failure the previous
 one structurally cannot.
 
 The durable boundary: the raw delivery is committed to `webhook_deliveries`
@@ -19,9 +19,9 @@ problem, and everything below is how it gets fixed.
 | 2 | Transient error after the ack | Row stays `received` | Leased worker, backoff 1→5→15→30s, 6 attempts |
 | 3 | Edge failure (Funnel stale, host rebooting, TLS) | GitHub recorded `failure`, no local row | **Delivery watchdog** |
 | 4 | Phantom ack (restore from snapshot, corruption) | GitHub recorded success, no local row | **Delivery watchdog** (GUID join) |
-| 5 | Delayed / throttled delivery | Arrives minutes late | Watchdog **grace window**; reconciler grace window |
+| 5 | Delayed / throttled delivery | Arrives minutes late | Delivery watchdog **grace window** |
 | 6 | GitHub API outage or rate limit mid-processing | Every queued delivery fails on the same dependency | **Circuit breaker** + parking |
-| 7 | No delivery ever generated | Nothing in the history to redeliver | **Source-state reconciler** |
+| 7 | No delivery ever generated | Nothing in the history to redeliver | No automatic repair; see `internal/opportunities.md` |
 | 8 | Silent misconfiguration (events narrowed, URL repointed) | Silence, indistinguishable from "no pushes" | **App health monitor** |
 | 9 | Payload older than GitHub's 3-day window | Redelivery impossible | **Local replay** (`preloop webhooks replay`) |
 
@@ -81,28 +81,8 @@ misconfigured App on day one and nothing after. This re-reads `GET /app` and
 GitHub exposes no API to change an App's event subscription, and no `active`
 flag on `/app/hook/config`: this layer pages a human, it cannot self-heal.
 
-## Layer 4 — source-state reconciler
 
-`src/webhook_reconciler.rs`. **Opt-in**, because every synthesis is a CI run
-GitHub never asked for. Set `PRELOOP_WEBHOOK_RECONCILE_REPOS`; empty means
-disabled and zero HTTP calls.
-
-Compares the default-branch head and open-PR heads against existing runs, and
-for a gap enqueues a webhook-shaped payload into the *same* durable queue —
-same adapters, same trigger evaluation, same check reporting. No second code
-path.
-
-Guards against the one race delivery-id dedup cannot catch (a late real
-webhook arriving after synthesis, under a different GUID):
-
-- a grace window far longer than any plausible delivery delay, and
-- a durable reservation keyed `repository | event | ref | head sha`, which
-  survives restarts even though in-memory run state does not.
-
-It cannot rebuild multi-commit push history or action-specific PR semantics; a
-PR is synthesized as `synchronize`, the only claim current state supports.
-
-## Layer 5 — operator surface
+## Layer 4 — operator surface
 
 Native API (bearer-authenticated):
 
@@ -110,7 +90,7 @@ Native API (bearer-authenticated):
 |----------|---------|
 | `GET /api/v1/webhooks/deliveries?state=&limit=` | Queue listing plus counters. Never returns payloads. |
 | `POST /api/v1/webhooks/deliveries/{id}/replay` | Requeue from the retained local payload. `404` unknown, `409` still active. |
-| `GET /api/v1/webhooks/health` | Queue, watchdog, reconciler, breaker and App config in one document. |
+| `GET /api/v1/webhooks/health` | Queue, watchdog, breaker and App config in one document. |
 
 CLI:
 
@@ -136,7 +116,6 @@ The operational snapshot (`GET /api/v1/status`, `/readyz`) carries:
 | `webhook_watchdog_stale` | No successful history poll in 30 minutes — lost deliveries would go unnoticed |
 | `webhook_repairs_pending` | Redeliveries requested that have not arrived |
 | `webhook_config_drift` | App events, permissions or delivery URL wrong |
-| `webhook_reconciler_failing` | Source-state reconciliation erroring |
 
 ## Configuration
 
@@ -150,19 +129,14 @@ The operational snapshot (`GET /api/v1/status`, `/readyz`) carries:
 | `PRELOOP_GITHUB_BREAKER` | on | `off` keeps observing but never trips |
 | `PRELOOP_GITHUB_BREAKER_THRESHOLD` | 3 | Consecutive failures before opening |
 | `PRELOOP_WEBHOOK_HEALTH_INTERVAL_SECS` | 900 | App config re-read cadence (floor 60) |
-| `PRELOOP_WEBHOOK_RECONCILE_REPOS` | *(empty)* | Comma-separated `owner/repo`; empty disables the reconciler |
-| `PRELOOP_WEBHOOK_RECONCILE_INTERVAL_SECS` | 900 | Reconciler cadence (floor 60) |
-| `PRELOOP_WEBHOOK_RECONCILE_GRACE_SECS` | 900 | How old a head must be before synthesis |
 | `PRELOOP_PUBLIC_URL` | — | Also the expected delivery URL for drift detection |
 
 ## Durable state
 
-Migration 9 (`webhook-delivery-repair-state`), both backends:
+Migrations 9–11 (the repair-state history), both backends:
 
-- `webhook_watchdog` — per-App history cursor and last-success timestamps.
+- `webhook_watchdog` — per-App history cursor, pagination continuation, and last-success timestamps.
 - `webhook_redeliveries` — repair records keyed by delivery GUID.
-- `webhook_synthetic_events` — reconciler idempotency keys. Never pruned:
-  they are tiny, and forgetting one re-fires CI for a head that already ran.
 
 ## Deliberately out of scope
 

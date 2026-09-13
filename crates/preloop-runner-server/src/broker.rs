@@ -467,6 +467,14 @@ pub(crate) async fn broker_session_root(
     let session_id = uuid::Uuid::new_v4().to_string();
     {
         let mut inner = shared.state.inner.lock().await;
+        // Authentication and insertion must share a final registration check:
+        // the liveness sweep may have purged this runner after token
+        // validation but before this lock was acquired.
+        if !inner.runners.contains_key(&runner_id) {
+            return Err(ApiError::unauthorized(
+                "runner registration is no longer active",
+            ));
+        }
         inner
             .session_keys
             .insert(session_id.clone(), SessionEncryption::generate());

@@ -237,9 +237,6 @@ pub(crate) async fn report_check_run_queued(
     job_id: &JobId,
     run_id: RunId,
 ) -> anyhow::Result<Option<u64>> {
-    // Webhook delivery is at-least-once. A replay can find a run whose
-    // queued check was already persisted before the worker crashed; PATCH
-    // that check instead of POSTing a second one.
     let existing_check_run_id = {
         let inner = shared.state.inner.lock().await;
         inner
@@ -247,79 +244,117 @@ pub(crate) async fn report_check_run_queued(
             .get(&run_id)
             .and_then(|run| run.job_check_run_ids.get(job_id).copied())
     };
-    if let Some(check_run_id) = existing_check_run_id {
-        report_existing_check_run_queued(shared, repo, job_id, run_id, check_run_id).await?;
-        return Ok(Some(check_run_id));
-    }
-
     let token = resolve_check_run_token(shared, repo).await;
-    let mut check_run_id = None;
 
-    if let Some(token) = &token {
-        let details_url = run_details_url(run_id);
-
-        let mut body = serde_json::json!({
-            "name": job_id.to_string(),
-            "head_sha": sha,
-            "status": "queued",
-        });
-        if let Some(url) = details_url {
-            body["details_url"] = serde_json::json!(url);
-        }
-
-        match send_github_check_request(
-            &shared.state.github_breaker,
-            token,
-            repo,
-            reqwest::Method::POST,
-            "check-runs",
-            body,
-        )
-        .await
-        {
-            Ok(res) => {
-                if let Some(id) = res.get("id").and_then(|id| id.as_u64()) {
-                    check_run_id = Some(id);
-                    info!(
-                        %run_id,
-                        %job_id,
-                        check_run_id = id,
-                        "GitHub check run created successfully"
-                    );
+    if let Some(check_run_id) = existing_check_run_id {
+        match report_existing_check_run_queued(shared, repo, job_id, run_id, check_run_id).await {
+            Ok(()) => return Ok(Some(check_run_id)),
+            Err(error) if !is_check_run_not_found(&error) => return Err(error),
+            Err(error) => {
+                warn!(
+                    %run_id,
+                    %job_id,
+                    check_run_id,
+                    %error,
+                    "persisted GitHub check run is stale; reconciling it"
+                );
+                let mut inner = shared.state.inner.lock().await;
+                if let Some(run) = inner.runs.get_mut(&run_id) {
+                    if run.job_check_run_ids.get(job_id) == Some(&check_run_id) {
+                        run.job_check_run_ids.remove(job_id);
+                    }
                 }
             }
-            Err(e) => {
-                warn!(%run_id, %job_id, error = %e, "Failed to create GitHub check run");
-                return Err(e);
+        }
+    }
+
+    let check_run_id = if let Some(token) = &token {
+        // Recover a POST whose response was lost before creating another
+        // check. This lookup is also what makes a stale persisted mapping
+        // converge after GitHub deleted the original check.
+        if let Some(existing) =
+            find_existing_check_run(shared, token, repo, sha, &job_id.to_string()).await?
+        {
+            report_existing_check_run_queued(shared, repo, job_id, run_id, existing).await?;
+            existing
+        } else {
+            let details_url = run_details_url(run_id);
+            let mut body = serde_json::json!({
+                "name": job_id.to_string(),
+                "head_sha": sha,
+                "status": "queued",
+            });
+            if let Some(url) = details_url {
+                body["details_url"] = serde_json::json!(url);
+            }
+
+            match send_github_check_request(
+                &shared.state.github_breaker,
+                token,
+                repo,
+                reqwest::Method::POST,
+                "check-runs",
+                body,
+            )
+            .await
+            {
+                Ok(response) => match response.get("id").and_then(Value::as_u64) {
+                    Some(id) => {
+                        info!(
+                            %run_id,
+                            %job_id,
+                            check_run_id = id,
+                            "GitHub check run created successfully"
+                        );
+                        id
+                    }
+                    None => find_existing_check_run(shared, token, repo, sha, &job_id.to_string())
+                        .await?
+                        .ok_or_else(|| anyhow::anyhow!("GitHub check-run POST returned no id"))?,
+                },
+                Err(error) => {
+                    // A transport error is ambiguous: GitHub may have
+                    // committed the POST before the connection failed.
+                    match find_existing_check_run(shared, token, repo, sha, &job_id.to_string())
+                        .await
+                    {
+                        Ok(Some(id)) => id,
+                        Ok(None) => return Err(error),
+                        Err(reconcile_error) => {
+                            return Err(anyhow::anyhow!(
+                                "{error}; check-run reconciliation failed: {reconcile_error}"
+                            ));
+                        }
+                    }
+                }
             }
         }
     } else {
         info!(%run_id, %job_id, "GitHub token not configured, using mock check run");
-        check_run_id = Some(rand::random::<u32>() as u64);
-    }
+        rand::random::<u32>() as u64
+    };
 
-    if let Some(check_id) = check_run_id {
-        let mapping_changed = {
-            let mut inner = shared.state.inner.lock().await;
-            inner.runs.get_mut(&run_id).map(|run| {
-                run.job_check_run_ids
-                    .insert(job_id.clone(), check_id)
-                    .is_none_or(|previous| previous != check_id)
-            })
-        };
-        if mapping_changed == Some(true) {
-            // Persist the record now. The mapping is only meaningful while
-            // the run lives, and the next status event may be hours away (a
-            // long queue); a restart in that window used to restore the run
-            // with an empty mapping, silently orphaning the GitHub check in
-            // "queued" forever even though the job ran and completed.
-            shared
-                .state
-                .emit(preloop_gha_protocol::NdjsonEvent::CheckRunCreated { run_id })
-                .await;
-        }
+    let mapping_changed = {
+        let mut inner = shared.state.inner.lock().await;
+        inner.runs.get_mut(&run_id).map(|run| {
+            run.job_check_run_ids
+                .insert(job_id.clone(), check_run_id)
+                .is_none_or(|previous| previous != check_run_id)
+        })
+    };
+    if mapping_changed == Some(true) {
+        // The mapping is meaningful while the run lives, and the next status
+        // event may be hours away. Persist it before returning to the caller.
+        shared
+            .state
+            .emit(preloop_gha_protocol::NdjsonEvent::CheckRunCreated { run_id })
+            .await;
     }
-    Ok(check_run_id)
+    Ok(Some(check_run_id))
+}
+
+fn is_check_run_not_found(error: &anyhow::Error) -> bool {
+    error.to_string().contains("status 404")
 }
 
 /// Move an existing GitHub check run back to the queue after a rerequest.
@@ -368,14 +403,52 @@ pub(crate) async fn report_existing_check_run_queued(
     }
     Ok(())
 }
+async fn find_existing_check_run(
+    shared: &Arc<SharedState>,
+    token: &str,
+    repo: &str,
+    sha: &str,
+    name: &str,
+) -> anyhow::Result<Option<u64>> {
+    let payload = match send_github_check_request(
+        &shared.state.github_breaker,
+        token,
+        repo,
+        reqwest::Method::GET,
+        &format!("commits/{sha}/check-runs"),
+        Value::Null,
+    )
+    .await
+    {
+        Ok(payload) => payload,
+        Err(error) if is_check_run_not_found(&error) => return Ok(None),
+        Err(error) => return Err(error),
+    };
+    Ok(payload
+        .get("check_runs")
+        .and_then(Value::as_array)
+        .and_then(|check_runs| {
+            check_runs.iter().find_map(|check_run| {
+                (check_run.get("name").and_then(Value::as_str) == Some(name)
+                    && check_run.get("head_sha").and_then(Value::as_str) == Some(sha))
+                .then(|| check_run.get("id").and_then(Value::as_u64))
+                .flatten()
+            })
+        }))
+}
+
 /// Report a permanent failure check run to GitHub (e.g. invalid workflow YAML, expression failure).
+///
+/// The check name and head SHA are the idempotency key. A retry after a crash
+/// first finds the existing check and patches it, avoiding duplicate failed
+/// checks in GitHub's UI.
 pub(crate) async fn report_check_run_permanent_failure(
     shared: &Arc<SharedState>,
     repo: &str,
     sha: &str,
     name: &str,
     summary: &str,
-) {
+) -> anyhow::Result<()> {
     let token = resolve_check_run_token(shared, repo).await;
     if let Some(token) = &token {
         let body = serde_json::json!({
@@ -389,21 +462,24 @@ pub(crate) async fn report_check_run_permanent_failure(
                 "summary": summary,
             }
         });
-        if let Err(e) = send_github_check_request(
+        let existing = find_existing_check_run(shared, token, repo, sha, name).await?;
+        let (method, path) = match existing {
+            Some(check_run_id) => (reqwest::Method::PATCH, format!("check-runs/{check_run_id}")),
+            None => (reqwest::Method::POST, "check-runs".to_owned()),
+        };
+        send_github_check_request(
             &shared.state.github_breaker,
             token,
             repo,
-            reqwest::Method::POST,
-            "check-runs",
+            method,
+            &path,
             body,
         )
-        .await
-        {
-            warn!(%repo, %name, error = %e, "Failed to create failed GitHub check run");
-        }
+        .await?;
     } else {
         info!(%repo, %name, "GitHub token not configured, mock failure check run recorded");
     }
+    Ok(())
 }
 
 /// Publish queued/completed checks for a native rerun.
@@ -427,19 +503,26 @@ pub(crate) async fn report_check_runs_for_run(
     for job_id in jobs {
         if let Some((reused_job_id, check_run_id)) = &reused_check_run {
             if reused_job_id == &job_id {
-                let _ = report_existing_check_run_queued(
+                if let Err(error) = report_existing_check_run_queued(
                     shared,
                     &repository,
                     &job_id,
                     run_id,
                     *check_run_id,
                 )
-                .await;
-            } else {
-                let _ = report_check_run_queued(shared, &repository, &sha, &job_id, run_id).await;
+                .await
+                {
+                    warn!(%run_id, %job_id, ?error, "failed to requeue GitHub check run");
+                }
+            } else if let Err(error) =
+                report_check_run_queued(shared, &repository, &sha, &job_id, run_id).await
+            {
+                warn!(%run_id, %job_id, ?error, "failed to report queued GitHub check run");
             }
-        } else {
-            let _ = report_check_run_queued(shared, &repository, &sha, &job_id, run_id).await;
+        } else if let Err(error) =
+            report_check_run_queued(shared, &repository, &sha, &job_id, run_id).await
+        {
+            warn!(%run_id, %job_id, ?error, "failed to report queued GitHub check run");
         }
 
         let status = {
@@ -488,7 +571,7 @@ pub(crate) async fn report_check_run_in_progress(
 
         let path = format!("check-runs/{}", check_run_id);
         if let Err(e) = send_github_check_request(
-            &shared.state.github_breaker,
+            &shared.state.github_lifecycle_breaker,
             token,
             &repo,
             reqwest::Method::PATCH,
@@ -617,7 +700,7 @@ pub(crate) async fn report_check_run_completed(
 
         let path = format!("check-runs/{}", check_run_id);
         if let Err(e) = send_github_check_request(
-            &shared.state.github_breaker,
+            &shared.state.github_lifecycle_breaker,
             token,
             &repo,
             reqwest::Method::PATCH,
@@ -1531,6 +1614,9 @@ pub(crate) async fn drain_webhook_queue(shared: &Arc<SharedState>) -> anyhow::Re
 
     let mut total_processed = 0;
     loop {
+        if shared.shutdown.is_cancelled() {
+            break;
+        }
         // A known GitHub outage means every claim here would charge an
         // attempt and then fail on the same dependency. Not claiming is the
         // difference between riding out an incident and dead-lettering every
@@ -1571,7 +1657,6 @@ async fn drain_webhook_queue_with_heartbeat(
         tokio::select! {
             result = &mut drain => return result,
             _ = ticker.tick() => heartbeat.beat(),
-            _ = shared.shutdown.cancelled() => return Ok(0),
         }
     }
 }
@@ -1777,15 +1862,49 @@ pub(crate) async fn process_one_delivery(
                     return;
                 }
                 if let Some(sha) = &failure.sha {
-                    tokio::select! {
+                    let report_result = tokio::select! {
                         _ = lease_lost.cancelled() => return,
-                        _ = report_check_run_permanent_failure(
+                        result = report_check_run_permanent_failure(
                             shared,
                             &repo,
                             sha,
                             &failure.check_name,
                             &failure.error,
-                        ) => {}
+                        ) => result,
+                    };
+                    if let Err(report_error) = report_result {
+                        let retry_error = format!(
+                            "failed to report permanent check run: {report_error}; \
+                             original workflow error: {error}"
+                        );
+                        let backoff = webhook_retry_backoff(
+                            &shared.state.webhook_retry_backoff,
+                            delivery.attempts,
+                        );
+                        warn!(
+                            delivery_id = %delivery.delivery_id,
+                            %report_error,
+                            "check-run failure reporting failed; retrying webhook delivery"
+                        );
+                        if let Err(store_error) = shared
+                            .state
+                            .store
+                            .fail_webhook_delivery(
+                                &delivery.delivery_id,
+                                lease_token,
+                                &retry_error,
+                                false,
+                                Some(backoff),
+                            )
+                            .await
+                        {
+                            warn!(
+                                delivery_id = %delivery.delivery_id,
+                                ?store_error,
+                                "failed to schedule webhook retry after check-run reporting failure"
+                            );
+                        }
+                        return;
                     }
                 }
             }

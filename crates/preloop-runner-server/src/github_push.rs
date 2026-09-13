@@ -408,14 +408,17 @@ pub(crate) async fn push_run_to_github(
                 .is_some_and(|run| run.job_check_run_ids.contains_key(job_id))
         };
         if !has_check_run {
-            let _ = crate::github::report_check_run_queued(
+            if let Err(error) = crate::github::report_check_run_queued(
                 shared,
                 &repository,
                 &effective_sha,
                 job_id,
                 run_id,
             )
-            .await;
+            .await
+            {
+                tracing::warn!(%run_id, %job_id, ?error, "failed to report queued GitHub check run");
+            }
             if jobs.get(job_id).is_some_and(|status| status.is_terminal()) {
                 crate::github::report_check_run_completed(shared, run_id, job_id, jobs[job_id])
                     .await;

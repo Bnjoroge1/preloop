@@ -1,12 +1,12 @@
 //! Live status shared by the webhook repair layers.
 //!
-//! The watchdog, the source-state reconciler and the App health monitor each
-//! run on their own cadence, and each produces a fact an operator needs
-//! *before* something breaks: when the delivery history was last read, when
-//! the App's event subscription was last verified, how many repairs are
-//! outstanding. A blind watchdog is indistinguishable from a quiet one
-//! unless its last successful poll is published somewhere, so this type is
-//! the single place all three write and the status snapshot reads.
+//! The delivery watchdog and App health monitor each run on their own cadence,
+//! and each produces a fact an operator needs *before* something breaks: when
+//! the delivery history was last read, when the App's event subscription was
+//! last verified, and how many repairs are outstanding. A blind watchdog is
+//! indistinguishable from a quiet one unless its last successful poll is
+//! published somewhere, so this type is the single place both layers write and
+//! the status snapshot reads.
 
 use std::time::{SystemTime, UNIX_EPOCH};
 
@@ -60,14 +60,14 @@ impl AppWebhookConfigStatus {
 /// Delivery-watchdog progress.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub(crate) struct WatchdogStatus {
+    /// The first attempted poll since startup. Unlike `last_poll_at_us`, this
+    /// does not move during a persistent outage, so a never-successful
+    /// watchdog eventually becomes visibly stale.
+    pub(crate) first_poll_at_us: Option<i64>,
     pub(crate) last_poll_at_us: Option<i64>,
-    /// Last poll that completed without error. Staleness here is the alert.
     pub(crate) last_success_at_us: Option<i64>,
-    /// Deliveries examined in the last successful poll.
     pub(crate) last_examined: u64,
-    /// Redeliveries requested since boot.
     pub(crate) redeliveries_requested: u64,
-    /// Repairs that have not yet shown up locally.
     pub(crate) open_repairs: u64,
     pub(crate) last_error: Option<String>,
     /// False when no GitHub App is configured: the watchdog cannot run
@@ -76,26 +76,21 @@ pub(crate) struct WatchdogStatus {
     pub(crate) enabled: bool,
 }
 
-/// Source-state reconciler progress.
-#[derive(Debug, Clone, Default, PartialEq, Eq)]
-pub(crate) struct ReconcilerStatus {
-    pub(crate) enabled: bool,
-    pub(crate) last_run_at_us: Option<i64>,
-    pub(crate) last_success_at_us: Option<i64>,
-    /// Events synthesized since boot — every one of these is a run GitHub
-    /// never asked for, so the number is worth watching.
-    pub(crate) synthesized: u64,
-    pub(crate) repositories_scanned: u64,
-    pub(crate) last_error: Option<String>,
+/// A single publication of the App configuration verdict and its timestamp.
+///
+/// Keeping both fields under one lock prevents an API read from combining the
+/// statuses from one health check with the timestamp from another.
+#[derive(Debug, Clone, Default)]
+struct AppConfigSnapshot {
+    statuses: Vec<AppWebhookConfigStatus>,
+    checked_at_us: Option<i64>,
 }
 
 /// Everything the repair layers publish, behind one lock.
 #[derive(Debug, Default)]
 pub(crate) struct WebhookResilienceStatus {
     watchdog: parking_lot::RwLock<WatchdogStatus>,
-    reconciler: parking_lot::RwLock<ReconcilerStatus>,
-    app_config: parking_lot::RwLock<Vec<AppWebhookConfigStatus>>,
-    config_checked_at_us: parking_lot::RwLock<Option<i64>>,
+    app_config: parking_lot::RwLock<AppConfigSnapshot>,
     /// Queue counters as last published by the webhook queue worker.
     ///
     /// The status sampler reads these instead of the store: a quiet engine
@@ -115,25 +110,17 @@ impl WebhookResilienceStatus {
         update(&mut self.watchdog.write());
     }
 
-    pub(crate) fn reconciler(&self) -> ReconcilerStatus {
-        self.reconciler.read().clone()
-    }
-
-    pub(crate) fn update_reconciler(&self, update: impl FnOnce(&mut ReconcilerStatus)) {
-        update(&mut self.reconciler.write());
-    }
-
-    pub(crate) fn app_config(&self) -> Vec<AppWebhookConfigStatus> {
-        self.app_config.read().clone()
-    }
-
-    pub(crate) fn config_checked_at_us(&self) -> Option<i64> {
-        *self.config_checked_at_us.read()
+    /// Read the App verdict and publication timestamp from one snapshot.
+    pub(crate) fn app_config_snapshot(&self) -> (Vec<AppWebhookConfigStatus>, Option<i64>) {
+        let snapshot = self.app_config.read();
+        (snapshot.statuses.clone(), snapshot.checked_at_us)
     }
 
     pub(crate) fn set_app_config(&self, statuses: Vec<AppWebhookConfigStatus>, checked_at_us: i64) {
-        *self.app_config.write() = statuses;
-        *self.config_checked_at_us.write() = Some(checked_at_us);
+        *self.app_config.write() = AppConfigSnapshot {
+            statuses,
+            checked_at_us: Some(checked_at_us),
+        };
     }
 
     /// Last published queue counters, or `None` when nothing has read them.

@@ -85,15 +85,12 @@ pub(crate) async fn check_webhook_config_once(
             .set_app_config(Vec::new(), now_us());
         return Vec::new();
     }
-    if let Err(retry_after) = shared.state.github_breaker.acquire() {
-        // A probe during a known outage or while a half-open probe is live
-        // would overwrite a good verdict with a transport error and add load
-        // to a failing dependency.
+    if let Some(retry_after) = shared.state.github_breaker.retry_after() {
         tracing::debug!(
             retry_in_secs = retry_after.as_secs(),
             "GitHub breaker open or probe in progress; skipping App webhook health check"
         );
-        return shared.state.webhook_status.app_config();
+        return shared.state.webhook_status.app_config_snapshot().0;
     }
 
     let api_base = crate::github::github_api_base();
@@ -107,8 +104,13 @@ pub(crate) async fn check_webhook_config_once(
         };
         let mut errors: Vec<String> = Vec::new();
 
-        match crate::github_app::read_app_subscription_at(&api_base, &app.app_id, &app.private_key)
-            .await
+        match crate::github_app::read_app_subscription_at_with_breaker(
+            &api_base,
+            &app.app_id,
+            &app.private_key,
+            Some(&shared.state.github_breaker),
+        )
+        .await
         {
             Ok(subscription) => {
                 // One canonical warning message, shared with the startup
@@ -132,8 +134,13 @@ pub(crate) async fn check_webhook_config_once(
             Err(error) => errors.push(format!("subscription: {error}")),
         }
 
-        match crate::github_app::read_app_hook_config_at(&api_base, &app.app_id, &app.private_key)
-            .await
+        match crate::github_app::read_app_hook_config_at_with_breaker(
+            &api_base,
+            &app.app_id,
+            &app.private_key,
+            Some(&shared.state.github_breaker),
+        )
+        .await
         {
             Ok(config) => status.hook_url = config.url,
             Err(error) => errors.push(format!("hook config: {error}")),
@@ -250,7 +257,7 @@ mod tests {
         assert!(statuses[0].url_drifted(), "{statuses:?}");
         assert!(!statuses[0].healthy());
         assert_eq!(
-            shared.state.webhook_status.app_config().len(),
+            shared.state.webhook_status.app_config_snapshot().0.len(),
             1,
             "the verdict must be published, not just returned"
         );

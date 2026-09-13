@@ -143,7 +143,7 @@ footer a{color:var(--cyan)}
   </header>
 
   <nav class="toc" id="toc">
-    <a href="#happy">happy path</a><a href="#s1">1 · DB down pre-202</a><a href="#s2">2 · transient post-202</a><a href="#s3">3 · edge failure</a><a href="#s4">4 · acked, row lost</a><a href="#s5">5 · delayed / throttled</a><a href="#s6">6 · GitHub API outage</a><a href="#s7">7 · never attempted</a><a href="#s8">8 · config drift</a><a href="#stack">remediation stack</a>
+    <a href="#happy">happy path</a><a href="#s1">1 · DB down pre-202</a><a href="#s2">2 · transient post-202</a><a href="#s3">3 · edge failure</a><a href="#s4">4 · acked, row lost</a><a href="#s5">5 · delayed / throttled</a><a href="#s6">6 · GitHub API outage</a><a href="#s7">7 · config drift</a><a href="#stack">remediation stack</a>
   </nav>
 
   <div class="deck">
@@ -167,7 +167,6 @@ footer a{color:var(--cyan)}
   <div class="filters">
     <button class="fbtn on" data-f="all">all scenarios</button>
     <button class="fbtn" data-f="have">protected today</button>
-    <button class="fbtn" data-f="gap">needs reconciler</button>
   </div>
 
   <!-- HAPPY -->
@@ -219,8 +218,8 @@ footer a{color:var(--cyan)}
   </section>
 
   <!-- S3 -->
-  <section class="scn" id="s3" data-k="gap">
-    <div class="scn-head"><div class="num">03</div><div><h2><span>SCENARIO 3 · EDGE FAILURE → DELIVERY WATCHDOG</span>Funnel down, host rebooting, 500s — GitHub holds the evidence</h2></div><span class="tag gap">○ needs reconciler</span></div>
+  <section class="scn" id="s3" data-k="have">
+    <div class="scn-head"><div class="num">03</div><div><h2><span>SCENARIO 3 · EDGE FAILURE → DELIVERY WATCHDOG</span>Funnel down, host rebooting, 500s — GitHub holds the evidence</h2></div><span class="tag have">● have now</span></div>
     <div class="diagram"><div class="dlabel"><span>FLOW · poll GitHub history, redeliver what failed</span><i>GET /app/hook/deliveries?status=failure</i></div>
       <div class="flow">
         <div class="node gh"><span class="badge">1</span><div class="t">GitHub attempts</div><div class="s">records <code>failure</code> + <code>status_code</code> + <code>throttled_at</code></div></div><div class="conn lost"></div>
@@ -230,13 +229,13 @@ footer a{color:var(--cyan)}
       </div>
     </div>
     <div class="cols"><div class="col"><h4>Why polling is required</h4><ul><li>GitHub <b>never retries on its own</b> — a dead host is just a red row in Recent deliveries.</li><li>The 3-day history is the <b>only other copy</b> of a delivery that never reached us.</li><li>Poll cadence must stay <b>well inside 3 days</b> with a persisted watermark.</li></ul></div>
-    <div class="col"><h4>Proposed watchdog</h4><ul><li>List <code>?status=failure</code>, fetch full payload via <b>delivery id</b>, <b>redeliver only when local store is healthy</b>.</li><li>Per-delivery <b>backoff</b>; re-check status after each redelivery (the API only <b>schedules</b> an attempt).</li><li>Alert when <b>last successful poll goes stale</b> — a blind watchdog is worse than none.</li></ul></div></div>
+    <div class="col"><h4>Implemented watchdog</h4><ul><li>List <code>?status=failure</code> and successful deliveries, fetch full payload via <b>delivery id</b>, and <b>redeliver only when local store is healthy</b>.</li><li>Per-delivery <b>backoff</b>; re-check status after each redelivery (the API only <b>schedules</b> an attempt).</li><li>Alert when <b>last successful poll goes stale</b> — a blind watchdog is worse than none.</li></ul></div></div>
     <div class="foot"><span class="snip"><b>GET</b> /app/hook/deliveries?status=failure&amp;per_page=100</span><span class="snip"><b>POST</b> /app/hook/deliveries/{id}/attempts</span></div>
   </section>
 
   <!-- S4 -->
-  <section class="scn" id="s4" data-k="gap">
-    <div class="scn-head"><div class="num">04</div><div><h2><span>SCENARIO 4 · THE PHANTOM ACK</span>GitHub says success, but we have no row — local loss after 202</h2></div><span class="tag gap">○ needs reconciler</span></div>
+  <section class="scn" id="s4" data-k="have">
+    <div class="scn-head"><div class="num">04</div><div><h2><span>SCENARIO 4 · THE PHANTOM ACK</span>GitHub says success, but we have no row — local loss after 202</h2></div><span class="tag have">● have now</span></div>
     <div class="diagram"><div class="dlabel"><span>FLOW · correlate remote-success against local rows</span><i>guid ↔ delivery_id join</i></div>
       <div class="flow">
         <div class="node gh"><span class="badge">✓</span><div class="t">GitHub: success</div><div class="s"><code>guid abc-123 · 202 · delivered_at</code></div></div><div class="conn"></div>
@@ -251,24 +250,24 @@ footer a{color:var(--cyan)}
   </section>
 
   <!-- S5 -->
-  <section class="scn" id="s5" data-k="gap">
-    <div class="scn-head"><div class="num">05</div><div><h2><span>SCENARIO 5 · SLOW GITHUB</span>Delayed, throttled, or out-of-order deliveries</h2></div><span class="tag gap">○ needs grace period</span></div>
+  <section class="scn" id="s5" data-k="have">
+    <div class="scn-head"><div class="num">05</div><div><h2><span>SCENARIO 5 · SLOW GITHUB</span>Delayed, throttled, or out-of-order deliveries</h2></div><span class="tag have">● have now</span></div>
     <div class="diagram"><div class="dlabel"><span>FLOW · wait, then verify — never synthesize eagerly</span><i>throttled_at is the tell</i></div>
       <div class="flow">
         <div class="node gh"><span class="badge">1</span><div class="t">Event occurs</div><div class="s">push lands · PR opened</div></div><div class="conn"></div>
         <div class="node fail"><span class="badge">⏳</span><div class="t">Delivery lags</div><div class="s">minutes late · <code>throttled_at</code> set · order shuffled</div></div><div class="conn"></div>
         <div class="node edge"><span class="badge">2</span><div class="t">Grace period</div><div class="s">don't declare missing for N minutes</div></div><div class="conn good"></div>
-        <div class="node work"><span class="badge">3</span><div class="t">Reconcile by time</div><div class="s">use payload timestamps, not arrival order</div></div>
+        <div class="node work"><span class="badge">3</span><div class="t">Verify delivery order</div><div class="s">use payload timestamps, not arrival order</div></div>
       </div>
     </div>
     <div class="cols"><div class="col"><h4>Traps</h4><ul><li>Treating “no webhook in 30s” as lost <b>creates duplicate runs</b> when the real one lands late.</li><li>Ordering by arrival breaks <b>push sequencing</b>; payload timestamps are authoritative.</li></ul></div>
-    <div class="col"><h4>Correct handling</h4><ul><li>Watchdog waits out a <b>grace window</b>, checks <code>delivered_at / throttled_at</code>.</li><li>Subscribe to <b>only needed events</b> to reduce throttle pressure.</li><li>Source-state repair (scenario 07) runs <b>after</b> the grace window, with idempotency keys.</li></ul></div></div>
+    <div class="col"><h4>Correct handling</h4><ul><li>Watchdog waits out a <b>grace window</b>, checks <code>delivered_at / throttled_at</code>.</li><li>Subscribe to <b>only needed events</b> to reduce throttle pressure.</li><li>Events with no GitHub delivery record are not synthesized; that source-state safety net is deferred in <code>internal/opportunities.md</code>.</li></ul></div></div>
     <div class="foot"><span class="snip src">docs: troubleshooting-webhooks — “deliveries are not immediate”</span></div>
   </section>
 
   <!-- S6 -->
-  <section class="scn" id="s6" data-k="gap">
-    <div class="scn-head"><div class="num">06</div><div><h2><span>SCENARIO 6 · GITHUB IS DOWN</span>API 5xx / 429 / timeouts while we hold a 202'd delivery</h2></div><span class="tag gap">○ needs circuit breaker</span></div>
+  <section class="scn" id="s6" data-k="have">
+    <div class="scn-head"><div class="num">06</div><div><h2><span>SCENARIO 6 · GITHUB IS DOWN</span>API 5xx / 429 / timeouts while we hold a 202'd delivery</h2></div><span class="tag have">● have now</span></div>
     <div class="diagram"><div class="dlabel"><span>FLOW · park, don't dead-letter, a dependency outage</span><i>6 attempts today is too few for a real outage</i></div>
       <div class="flow">
         <div class="node okk"><span class="badge">✓</span><div class="t">202 held</div><div class="s">delivery queued locally</div></div><div class="conn"></div>
@@ -277,30 +276,13 @@ footer a{color:var(--cyan)}
         <div class="node store"><span class="badge">park</span><div class="t">Long-horizon retry</div><div class="s">stay <code>received</code> · exp backoff · alert while open</div></div>
       </div>
     </div>
-    <div class="cols"><div class="col"><h4>Current gap</h4><ul><li>GitHub-dependency errors are transient, but the queue caps at <b>6 attempts</b> — a 30-minute GitHub incident can <b>dead-letter good pushes</b>.</li><li>Every queued delivery would <b>hammer GitHub independently</b> during recovery.</li></ul></div>
-    <div class="col"><h4>Correct handling</h4><ul><li>Split taxonomy: <b>bad payload → dead-letter fast</b>; <b>GitHub unavailable → park long</b>.</li><li>One <b>shared breaker</b> pauses GitHub-dependent claims; watermark never advances on failed polls.</li><li>Respect <b>rate-limit headers</b>; back off globally, not per-row.</li></ul></div></div>
-    <div class="foot"><span class="snip src">github.rs:1812–1826 fetch_workflows transient · needs outage horizon</span><span class="snip">x-ratelimit-reset / retry-after → sleep, don't spin</span></div>
+    <div class="cols"><div class="col"><h4>What the breaker prevents</h4><ul><li>Without outage classification, the finite attempt cap could <b>dead-letter good pushes</b> during a GitHub incident.</li><li>Without admission control, every queued delivery would <b>hammer GitHub independently</b> during recovery.</li></ul></div>
+    <div class="foot"><span class="snip src">github.rs:1737–1758 · dependency outage reclassification and long-horizon retry</span><span class="snip">x-ratelimit-reset / retry-after → sleep, don't spin</span></div>
   </section>
 
   <!-- S7 -->
-  <section class="scn" id="s7" data-k="gap">
-    <div class="scn-head"><div class="num">07</div><div><h2><span>SCENARIO 7 · NO DELIVERY EXISTS</span>GitHub never attempted it — the delivery API can't help</h2></div><span class="tag plan">◇ source-state net</span></div>
-    <div class="diagram"><div class="dlabel"><span>FLOW · compare branch/PR heads against runs we created</span><i>current-state backstop, not exact replay</i></div>
-      <div class="flow">
-        <div class="node gh"><span class="badge">∅</span><div class="t">No delivery row</div><div class="s">unsubscribed event · push-tag limit · never generated</div></div><div class="conn"></div>
-        <div class="node edge"><span class="badge">1</span><div class="t">Poll repo state</div><div class="s">branch heads · open PR heads · <code>/commits /pulls</code></div></div><div class="conn"></div>
-        <div class="node store"><span class="badge">2</span><div class="t">Diff vs runs</div><div class="s">head SHA without a run for that workflow+ref?</div></div><div class="conn good"></div>
-        <div class="node work"><span class="badge">3</span><div class="t">Synthesize once</div><div class="s">through existing adapters · canonical idempotency key</div></div>
-      </div>
-    </div>
-    <div class="cols"><div class="col"><h4>The race to avoid</h4><ul><li>Reconciler creates a run at <b>T+5m</b>; the delayed real webhook lands at <b>T+6m</b> with a different GUID → <b>duplicate run + duplicate checks</b>.</li><li>Delivery-ID dedup alone can't catch this — the synthetic run has <b>no delivery ID</b>.</li></ul></div>
-    <div class="col"><h4>Correct handling</h4><ul><li>Idempotency key: <b>repo + event + ref/PR + workflow path + head SHA</b>, persisted durably.</li><li>Feed synthesis through the <b>same event adapters</b> as webhooks (<code>dispatch.rs</code> pattern).</li><li>Accept approximation: REST state can't rebuild <b>multi-commit pushes or action-specific PR semantics</b> exactly.</li></ul></div></div>
-    <div class="foot"><span class="snip src">key = repo | event | ref | workflow | sha</span><span class="snip src">runs.rs:307 submit_run_inner_with_webhook_delivery — extend key</span></div>
-  </section>
-
-  <!-- S8 -->
-  <section class="scn" id="s8" data-k="have">
-    <div class="scn-head"><div class="num">08</div><div><h2><span>SCENARIO 8 · SILENT MISCONFIGURATION</span>Webhook inactive, narrowed, or pointed at a dead URL</h2></div><span class="tag have">● partial now</span></div>
+  <section class="scn" id="s7" data-k="have">
+    <div class="scn-head"><div class="num">07</div><div><h2><span>SCENARIO 7 · SILENT MISCONFIGURATION</span>Webhook inactive, narrowed, or pointed at a dead URL</h2></div><span class="tag have">● have now</span></div>
     <div class="diagram"><div class="dlabel"><span>FLOW · startup check → periodic health</span><i>bootstrap.rs:1179–1197 today</i></div>
       <div class="flow">
         <div class="node gh"><span class="badge">1</span><div class="t">GET /app</div><div class="s">read subscription + permissions at boot</div></div><div class="conn"></div>
@@ -315,17 +297,16 @@ footer a{color:var(--cyan)}
   </section>
 
   <!-- STACK -->
-  <section class="scn" id="stack" data-k="gap">
-    <div class="scn-head"><div class="num">✦</div><div><h2><span>REMEDIATION STACK · BUILD ORDER</span>Cheapest certainty first, approximation last</h2></div><span class="tag plan">◇ proposal</span></div>
+  <section class="scn" id="stack" data-k="have">
+    <div class="scn-head"><div class="num">✦</div><div><h2><span>RESILIENCE STACK · CURRENT OPERATIONS</span>Cheapest certainty first, approximation deferred</h2></div><span class="tag have">● implemented</span></div>
     <div class="matrix">
       <div class="mrow head"><div>#</div><div>Layer</div><div>Repairs</div><div>Key mechanism</div></div>
       <div class="mrow"><div>1</div><div><b>Delivery watchdog</b></div><div>failed deliveries (03) + phantom acks (04)</div><div>App-JWT poll + <code>POST …/attempts</code>, same-GUID dedup</div></div>
       <div class="mrow"><div>2</div><div><b>Local correlation</b></div><div>remote-success / local-missing join</div><div>persisted cursor, GUID ↔ row comparison</div></div>
       <div class="mrow"><div>3</div><div><b>Outage breaker</b></div><div>GitHub down mid-processing (06), throttled (05)</div><div>shared breaker, Retry-After, long park horizon</div></div>
-      <div class="mrow"><div>4</div><div><b>State reconciler</b></div><div>never-attempted events (07)</div><div>branch/PR head diff + canonical idempotency key</div></div>
-      <div class="mrow"><div>5</div><div><b>Health monitor</b></div><div>config drift (08)</div><div>periodic /app read-back + staleness alerts</div></div>
+      <div class="mrow"><div>4</div><div><b>Health monitor</b></div><div>config drift (07)</div><div>periodic /app read-back + staleness alerts</div></div>
     </div>
-    <div class="cols" style="margin-bottom:24px"><div class="col"><h4>What each layer cannot do</h4><ul><li>Watchdog can't fix events with <b>no delivery record</b> — needs layer 4.</li><li>State repair can't <b>replay exact history</b> — the delivery payload stays authoritative.</li><li>Neither helps while <b>GitHub is fully down</b> — retain watermark, retry, don't advance.</li></ul></div>
+    <div class="cols" style="margin-bottom:24px"><div class="col"><h4>What each layer cannot do</h4><ul><li>Watchdog can't fix events with <b>no delivery record</b> — there is no automatic repair for those.</li><li>Neither helps while <b>GitHub is fully down</b> — retain watermark, retry, don't advance.</li></ul></div>
     <div class="col"><h4>Deliberately out of scope here</h4><ul><li><b>HA ingress gateway</b>: second durable queue buys host-downtime 2xx, costs another failure domain. Build only if “ack while Preloop is down” is required.</li><li><b>Active-active Preloop</b>: instances diverge in memory today — needs shared-bus refactor first.</li></ul></div></div>
   </section>
 

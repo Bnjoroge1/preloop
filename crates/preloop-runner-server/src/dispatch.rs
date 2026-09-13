@@ -541,9 +541,12 @@ async fn submit_and_report(
     };
     if let Some(jobs) = jobs {
         for job_id in jobs {
-            let _ =
+            if let Err(error) =
                 crate::github::report_check_run_queued(shared, repository, sha, &job_id, run_id)
-                    .await;
+                    .await
+            {
+                warn!(%run_id, %job_id, ?error, "failed to report queued GitHub check run");
+            }
             let status = {
                 let inner = shared.state.inner.lock().await;
                 inner

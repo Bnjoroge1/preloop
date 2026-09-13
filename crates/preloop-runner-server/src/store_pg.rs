@@ -1017,6 +1017,18 @@ impl Store for PgStore {
         let mut client = self.connection.lock().await;
         let tx = client.transaction().await?;
         let run_id = projection.run.run_id;
+        tx.execute(
+            "INSERT INTO workflow_run_counters(repository_key, workflow_path, next_run_number)
+             VALUES ('', $1, $2)
+             ON CONFLICT(repository_key, workflow_path) DO UPDATE SET
+               next_run_number = GREATEST(workflow_run_counters.next_run_number,
+                                          EXCLUDED.next_run_number)",
+            &[
+                &projection.run.workflow_path_str,
+                &(projection.run.run_number.saturating_add(1) as i64),
+            ],
+        )
+        .await?;
         self.store_run_tx(&tx, &projection.run).await?;
         tx.execute("DELETE FROM jobs WHERE run_id = $1", &[&run_id.to_string()])
             .await?;
@@ -1060,7 +1072,8 @@ impl Store for PgStore {
             "INSERT INTO workflow_run_counters(repository_key, workflow_path, next_run_number)
              VALUES ('', $1, $2)
              ON CONFLICT(repository_key, workflow_path) DO UPDATE SET
-               next_run_number = EXCLUDED.next_run_number",
+               next_run_number = GREATEST(workflow_run_counters.next_run_number,
+                                          EXCLUDED.next_run_number)",
             &[&workflow_path, &(next_run_number as i64)],
         )
         .await?;
@@ -1539,7 +1552,8 @@ impl Store for PgStore {
         let client = self.connection.lock().await;
         let row = client
             .query_opt(
-                "SELECT scope, cursor_delivered_at_us, last_poll_at_us, last_success_at_us
+                "SELECT scope, cursor_delivered_at_us, cursor_delivered_at_guid,
+                        scan_cursor, last_poll_at_us, last_success_at_us
                  FROM webhook_watchdog WHERE scope = $1",
                 &[&scope],
             )
@@ -1547,8 +1561,10 @@ impl Store for PgStore {
         Ok(row.map(|row| WebhookWatchdogCursor {
             scope: row.get(0),
             cursor_delivered_at_us: row.get(1),
-            last_poll_at_us: row.get(2),
-            last_success_at_us: row.get(3),
+            cursor_delivered_at_guid: row.get(2),
+            scan_cursor: row.get(3),
+            last_poll_at_us: row.get(4),
+            last_success_at_us: row.get(5),
         }))
     }
 
@@ -1560,15 +1576,46 @@ impl Store for PgStore {
         client
             .execute(
                 "INSERT INTO webhook_watchdog (
-                     scope, cursor_delivered_at_us, last_poll_at_us, last_success_at_us
-                 ) VALUES ($1, $2, $3, $4)
+                     scope, cursor_delivered_at_us, cursor_delivered_at_guid,
+                     scan_cursor, last_poll_at_us, last_success_at_us
+                 ) VALUES ($1, $2, $3, $4, $5, $6)
                  ON CONFLICT(scope) DO UPDATE SET
-                     cursor_delivered_at_us = EXCLUDED.cursor_delivered_at_us,
-                     last_poll_at_us = EXCLUDED.last_poll_at_us,
-                     last_success_at_us = EXCLUDED.last_success_at_us",
+                     cursor_delivered_at_us = GREATEST(
+                         webhook_watchdog.cursor_delivered_at_us,
+                         EXCLUDED.cursor_delivered_at_us
+                     ),
+                     cursor_delivered_at_guid = CASE
+                         WHEN EXCLUDED.cursor_delivered_at_us IS NULL
+                             THEN webhook_watchdog.cursor_delivered_at_guid
+                         WHEN webhook_watchdog.cursor_delivered_at_us IS NULL
+                              OR EXCLUDED.cursor_delivered_at_us
+                                 > webhook_watchdog.cursor_delivered_at_us
+                             THEN EXCLUDED.cursor_delivered_at_guid
+                         WHEN EXCLUDED.cursor_delivered_at_us
+                              < webhook_watchdog.cursor_delivered_at_us
+                             THEN webhook_watchdog.cursor_delivered_at_guid
+                         WHEN EXCLUDED.cursor_delivered_at_guid IS NULL
+                             THEN webhook_watchdog.cursor_delivered_at_guid
+                         WHEN webhook_watchdog.cursor_delivered_at_guid IS NULL
+                              OR EXCLUDED.cursor_delivered_at_guid
+                                 > webhook_watchdog.cursor_delivered_at_guid
+                             THEN EXCLUDED.cursor_delivered_at_guid
+                         ELSE webhook_watchdog.cursor_delivered_at_guid
+                     END,
+                     scan_cursor = EXCLUDED.scan_cursor,
+                     last_poll_at_us = GREATEST(
+                         webhook_watchdog.last_poll_at_us,
+                         EXCLUDED.last_poll_at_us
+                     ),
+                     last_success_at_us = GREATEST(
+                         webhook_watchdog.last_success_at_us,
+                         EXCLUDED.last_success_at_us
+                     )",
                 &[
                     &cursor.scope,
                     &cursor.cursor_delivered_at_us,
+                    &cursor.cursor_delivered_at_guid,
+                    &cursor.scan_cursor,
                     &cursor.last_poll_at_us,
                     &cursor.last_success_at_us,
                 ],
@@ -1592,9 +1639,18 @@ impl Store for PgStore {
                      github_delivery_id = EXCLUDED.github_delivery_id,
                      app_id = EXCLUDED.app_id,
                      reason = EXCLUDED.reason,
-                     attempts = EXCLUDED.attempts,
-                     last_attempt_at_us = EXCLUDED.last_attempt_at_us,
-                     resolved_at_us = EXCLUDED.resolved_at_us,
+                     attempts = GREATEST(
+                         webhook_redeliveries.attempts,
+                         EXCLUDED.attempts
+                     ),
+                     last_attempt_at_us = GREATEST(
+                         webhook_redeliveries.last_attempt_at_us,
+                         EXCLUDED.last_attempt_at_us
+                     ),
+                     resolved_at_us = COALESCE(
+                         webhook_redeliveries.resolved_at_us,
+                         EXCLUDED.resolved_at_us
+                     ),
                      last_error = EXCLUDED.last_error",
                 &[
                     &record.delivery_guid,
@@ -1661,39 +1717,6 @@ impl Store for PgStore {
             )
             .await?;
         Ok(rows_affected > 0)
-    }
-
-    async fn reserve_synthetic_webhook_event(
-        &self,
-        key: &str,
-        repository: &str,
-        event: &str,
-        git_ref: &str,
-        head_sha: &str,
-        now_us: i64,
-    ) -> anyhow::Result<bool> {
-        let client = self.connection.lock().await;
-        let rows_affected = client
-            .execute(
-                "INSERT INTO webhook_synthetic_events (
-                     idempotency_key, repository, event, git_ref, head_sha, created_at_us
-                 ) VALUES ($1, $2, $3, $4, $5, $6)
-                 ON CONFLICT(idempotency_key) DO NOTHING",
-                &[&key, &repository, &event, &git_ref, &head_sha, &now_us],
-            )
-            .await?;
-        Ok(rows_affected > 0)
-    }
-
-    async fn clear_synthetic_webhook_reservation(&self, key: &str) -> anyhow::Result<()> {
-        let client = self.connection.lock().await;
-        client
-            .execute(
-                "DELETE FROM webhook_synthetic_events WHERE idempotency_key = $1",
-                &[&key],
-            )
-            .await?;
-        Ok(())
     }
 }
 
@@ -1988,14 +2011,19 @@ const MIGRATIONS: &[(u32, &str, &str)] = &[
         CREATE INDEX IF NOT EXISTS webhook_redeliveries_open_idx
           ON webhook_redeliveries (resolved_at_us, first_seen_at_us);
 
-        CREATE TABLE IF NOT EXISTS webhook_synthetic_events (
-          idempotency_key TEXT PRIMARY KEY,
-          repository TEXT NOT NULL,
-          event TEXT NOT NULL,
-          git_ref TEXT NOT NULL,
-          head_sha TEXT NOT NULL,
-          created_at_us BIGINT NOT NULL
-        );
+        "#,
+    ),
+    (
+        10,
+        "drop-source-state-reconciler",
+        "DROP TABLE IF EXISTS webhook_synthetic_events;",
+    ),
+    (
+        11,
+        "webhook-watchdog-safe-pagination",
+        r#"
+        ALTER TABLE webhook_watchdog ADD COLUMN IF NOT EXISTS cursor_delivered_at_guid TEXT;
+        ALTER TABLE webhook_watchdog ADD COLUMN IF NOT EXISTS scan_cursor TEXT;
         "#,
     ),
 ];

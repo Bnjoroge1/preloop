@@ -101,6 +101,29 @@ impl DeliveryItem {
         (200..300).contains(&self.status_code)
     }
 }
+/// Compare GitHub history positions without relying on timestamp uniqueness.
+fn item_is_at_or_before(
+    delivered_at_us: i64,
+    guid: &str,
+    watermark_us: i64,
+    watermark_guid: Option<&str>,
+) -> bool {
+    delivered_at_us < watermark_us
+        || (delivered_at_us == watermark_us
+            && watermark_guid.is_some_and(|watermark_guid| guid <= watermark_guid))
+}
+
+fn newest_marker(
+    current: Option<(i64, String)>,
+    delivered_at_us: i64,
+    guid: &str,
+) -> Option<(i64, String)> {
+    let candidate = (delivered_at_us, guid.to_owned());
+    Some(match current {
+        Some(current) => current.max(candidate),
+        None => candidate,
+    })
+}
 
 fn env_u64(name: &str, default: u64) -> u64 {
     std::env::var(name)
@@ -213,7 +236,9 @@ pub(crate) async fn watchdog_poll_once(
     }
     shared.state.webhook_status.update_watchdog(|status| {
         status.enabled = true;
-        status.last_poll_at_us = Some(now_us());
+        let now = now_us();
+        status.first_poll_at_us.get_or_insert(now);
+        status.last_poll_at_us = Some(now);
     });
 
     if let Some(retry_after) = shared.state.github_breaker.retry_after() {
@@ -288,14 +313,17 @@ async fn poll_app(
     let watermark = previous
         .as_ref()
         .and_then(|cursor| cursor.cursor_delivered_at_us);
+    let watermark_guid = previous
+        .as_ref()
+        .and_then(|cursor| cursor.cursor_delivered_at_guid.clone());
     let grace_boundary = now_us() - grace_us();
 
     let mut outcome = WatchdogPollOutcome::default();
-    let mut newest_examined: Option<i64> = None;
-    let mut cursor: Option<String> = None;
+    let mut newest_examined: Option<(i64, String)> = None;
+    let mut cursor = previous.and_then(|cursor| cursor.scan_cursor);
     let mut reached_watermark = false;
     let mut has_more_pages = false;
-    for _page in 0..max_pages() {
+    for _page in 0..max_pages().max(1) {
         let (items, next_cursor) = list_deliveries(shared, &api_base, &jwt, cursor.as_deref())
             .await
             .map_err(|error| anyhow::anyhow!("listing deliveries: {error}"))?;
@@ -311,7 +339,9 @@ async fn poll_app(
                 // delivery on every poll forever.
                 continue;
             };
-            if watermark.is_some_and(|mark| delivered_at_us < mark) {
+            if watermark.is_some_and(|mark| {
+                item_is_at_or_before(delivered_at_us, &item.guid, mark, watermark_guid.as_deref())
+            }) {
                 reached_watermark = true;
                 continue;
             }
@@ -319,8 +349,7 @@ async fn poll_app(
                 outcome.skipped_grace += 1;
                 continue;
             }
-            newest_examined =
-                Some(newest_examined.map_or(delivered_at_us, |newest| newest.max(delivered_at_us)));
+            newest_examined = newest_marker(newest_examined, delivered_at_us, &item.guid);
             examined.push(item);
         }
 
@@ -377,16 +406,32 @@ async fn poll_app(
     }
 
     let now = now_us();
-    let advanced = if reached_watermark || !has_more_pages {
+    let (advanced, advanced_guid) = if reached_watermark || !has_more_pages {
         match (watermark, newest_examined) {
-            (Some(mark), Some(newest)) => Some(mark.max(newest)),
-            (None, Some(newest)) => Some(newest),
-            (mark, None) => mark,
+            (Some(mark), Some((newest, guid))) => {
+                if newest > mark
+                    || (newest == mark
+                        && watermark_guid
+                            .as_ref()
+                            .is_none_or(|previous_guid| guid > *previous_guid))
+                {
+                    (Some(newest), Some(guid))
+                } else {
+                    (Some(mark), watermark_guid)
+                }
+            }
+            (None, Some((newest, guid))) => (Some(newest), Some(guid)),
+            (mark, None) => (mark, watermark_guid),
         }
     } else {
         // Truncated at max_pages(): do not advance the watermark across an
-        // unvisited range, otherwise skipped older deliveries are permanently lost.
-        watermark
+        // unvisited range. Resume from the saved opaque cursor next pass.
+        (watermark, watermark_guid)
+    };
+    let scan_cursor = if reached_watermark || !has_more_pages {
+        None
+    } else {
+        cursor
     };
     shared
         .state
@@ -394,6 +439,8 @@ async fn poll_app(
         .store_webhook_watchdog_cursor(&WebhookWatchdogCursor {
             scope: app.app_id.clone(),
             cursor_delivered_at_us: advanced,
+            cursor_delivered_at_guid: advanced_guid,
+            scan_cursor,
             last_poll_at_us: Some(now),
             last_success_at_us: Some(now),
         })

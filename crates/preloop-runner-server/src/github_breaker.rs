@@ -33,15 +33,6 @@ pub(crate) enum GithubFailureKind {
     RateLimited { retry_after: Option<Duration> },
 }
 
-impl GithubFailureKind {
-    pub(crate) fn as_str(&self) -> &'static str {
-        match self {
-            Self::Unavailable => "unavailable",
-            Self::RateLimited { .. } => "rate_limited",
-        }
-    }
-}
-
 /// Breaker tuning. Defaults are deliberately conservative: three consecutive
 /// dependency failures before opening, so one unlucky 502 does not stall the
 /// queue, and a five-minute ceiling so a long outage is retried steadily

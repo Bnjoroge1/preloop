@@ -75,9 +75,8 @@ graph TD
 
 Delivery is only half the story: GitHub never resends a failed webhook, so
 everything downstream of that `202` — the delivery watchdog, the GitHub
-circuit breaker, the App health monitor, the source-state reconciler, and
-`preloop webhooks replay` — is documented in
-[Webhook resilience](./webhook-resilience.md).
+circuit breaker, the App health monitor, and `preloop webhooks replay` — is
+documented in [Webhook resilience](./webhook-resilience.md).
 
 ---
 

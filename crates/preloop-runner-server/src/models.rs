@@ -563,9 +563,17 @@ pub(crate) struct WebhookQueueStats {
 pub(crate) struct WebhookWatchdogCursor {
     /// GitHub App id the cursor belongs to.
     pub(crate) scope: String,
-    /// Newest `delivered_at` the watchdog has fully examined. Never advanced
-    /// past the grace window, and never advanced on a failed poll.
+    /// Newest `(delivered_at, guid)` the watchdog has fully examined. Never
+    /// advanced past the grace window, and never advanced on a failed poll.
+    #[serde(default)]
     pub(crate) cursor_delivered_at_us: Option<i64>,
+    /// GUID tie-breaker for deliveries sharing the same timestamp.
+    #[serde(default)]
+    pub(crate) cursor_delivered_at_guid: Option<String>,
+    /// Opaque GitHub pagination cursor to resume when a bounded pass did not
+    /// reach the watermark.
+    #[serde(default)]
+    pub(crate) scan_cursor: Option<String>,
     /// When a poll was last attempted, successful or not.
     pub(crate) last_poll_at_us: Option<i64>,
     /// When a poll last completed without error. Staleness here is an alert:

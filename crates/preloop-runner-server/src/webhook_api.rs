@@ -155,20 +155,20 @@ pub(crate) async fn replay_webhook_delivery(
 pub(crate) async fn webhook_health(
     State(shared): State<Arc<SharedState>>,
 ) -> Result<Json<Value>, ApiError> {
-    let stats = shared
-        .state
-        .store
-        .webhook_queue_stats()
-        .await
-        .map_err(|error| ApiError::internal(format!("reading webhook queue stats: {error}")))?;
     let now = now_us();
+    let queue = match shared.state.store.webhook_queue_stats().await {
+        Ok(stats) => stats_json(&stats, now),
+        Err(error) => {
+            tracing::warn!(?error, "failed to read webhook queue health");
+            json!({
+                "error": format!("reading webhook queue stats: {error}"),
+            })
+        }
+    };
     let watchdog = shared.state.webhook_status.watchdog();
-    let reconciler = shared.state.webhook_status.reconciler();
     let breaker = shared.state.github_breaker.snapshot();
-    let apps: Vec<Value> = shared
-        .state
-        .webhook_status
-        .app_config()
+    let (app_config, app_config_checked_at_us) = shared.state.webhook_status.app_config_snapshot();
+    let apps: Vec<Value> = app_config
         .into_iter()
         .map(|app| {
             json!({
@@ -185,7 +185,7 @@ pub(crate) async fn webhook_health(
         .collect();
 
     Ok(Json(json!({
-        "queue": stats_json(&stats, now),
+        "queue": queue,
         "watchdog": {
             "enabled": watchdog.enabled,
             "last_poll_at": watchdog.last_poll_at_us.and_then(rfc3339),
@@ -198,14 +198,6 @@ pub(crate) async fn webhook_health(
             "open_repairs": watchdog.open_repairs,
             "last_error": watchdog.last_error,
         },
-        "reconciler": {
-            "enabled": reconciler.enabled,
-            "last_run_at": reconciler.last_run_at_us.and_then(rfc3339),
-            "last_success_at": reconciler.last_success_at_us.and_then(rfc3339),
-            "synthesized": reconciler.synthesized,
-            "repositories_scanned": reconciler.repositories_scanned,
-            "last_error": reconciler.last_error,
-        },
         "github_breaker": {
             "open": breaker.open,
             "retry_in_seconds": breaker.retry_in_seconds,
@@ -215,11 +207,7 @@ pub(crate) async fn webhook_health(
             "last_error": breaker.last_error,
         },
         "apps": apps,
-        "app_config_checked_at": shared
-            .state
-            .webhook_status
-            .config_checked_at_us()
-            .and_then(rfc3339),
+        "app_config_checked_at": app_config_checked_at_us.and_then(rfc3339),
     })))
 }
 

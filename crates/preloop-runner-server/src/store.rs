@@ -199,22 +199,6 @@ pub(crate) trait Store: Send + Sync {
         delivery_guid: &str,
         resolved_at_us: i64,
     ) -> anyhow::Result<bool>;
-    /// Reserve a synthesized source-state event under its canonical
-    /// idempotency key. `Ok(false)` means it was already reserved, which is
-    /// what stops the reconciler from racing a late real webhook into a
-    /// duplicate run. Reservations are never pruned: they are tiny, and
-    /// forgetting one re-fires CI for a head that already ran.
-    async fn reserve_synthetic_webhook_event(
-        &self,
-        key: &str,
-        repository: &str,
-        event: &str,
-        git_ref: &str,
-        head_sha: &str,
-        now_us: i64,
-    ) -> anyhow::Result<bool>;
-    /// Clear a synthetic webhook event reservation if subsequent enqueueing failed.
-    async fn clear_synthetic_webhook_reservation(&self, key: &str) -> anyhow::Result<()>;
 }
 
 /// Decorator that records `preloop.store.operation.duration` for every
@@ -600,34 +584,6 @@ impl Store for InstrumentedStore {
             self.inner
                 .resolve_webhook_redelivery(delivery_guid, resolved_at_us)
                 .await,
-        )
-    }
-
-    async fn reserve_synthetic_webhook_event(
-        &self,
-        key: &str,
-        repository: &str,
-        event: &str,
-        git_ref: &str,
-        head_sha: &str,
-        now_us: i64,
-    ) -> anyhow::Result<bool> {
-        let start = Instant::now();
-        self.record(
-            "reserve_synthetic_webhook_event",
-            start,
-            self.inner
-                .reserve_synthetic_webhook_event(key, repository, event, git_ref, head_sha, now_us)
-                .await,
-        )
-    }
-
-    async fn clear_synthetic_webhook_reservation(&self, key: &str) -> anyhow::Result<()> {
-        let start = Instant::now();
-        self.record(
-            "clear_synthetic_webhook_reservation",
-            start,
-            self.inner.clear_synthetic_webhook_reservation(key).await,
         )
     }
 }
@@ -2241,8 +2197,12 @@ impl SqliteStore {
         let mut connection = self.connection.lock().expect("store mutex poisoned");
         let tx = connection.transaction()?;
         let run_id = projection.run.run_id;
+        self.store_workflow_run_counter_tx(
+            &tx,
+            &projection.run.workflow_path_str,
+            projection.run.run_number.saturating_add(1),
+        )?;
         self.store_run_tx(&tx, &projection.run)?;
-        tx.execute("DELETE FROM jobs WHERE run_id = ?1", [run_id.to_string()])?;
         for (kind, job, position) in &projection.jobs {
             self.insert_job(&tx, job, kind, *position)?;
         }
@@ -2294,10 +2254,6 @@ impl SqliteStore {
         self.maybe_checkpoint_wal(&connection)?;
         Ok(())
     }
-
-    /// Persist the run-number allocator without rewriting the encrypted
-    /// runtime snapshot. Run submission is a hot path, and the full snapshot
-    /// grows with the number of workflow paths.
     pub(crate) fn store_workflow_run_counter(
         &self,
         workflow_path: &str,
@@ -2305,16 +2261,27 @@ impl SqliteStore {
     ) -> anyhow::Result<()> {
         let mut connection = self.connection.lock().expect("store mutex poisoned");
         let tx = connection.transaction()?;
+        self.store_workflow_run_counter_tx(&tx, workflow_path, next_run_number)?;
+        tx.commit()
+            .map_err(|error| anyhow::anyhow!("committing workflow run counter: {error}"))?;
+        self.maybe_checkpoint_wal(&connection)?;
+        Ok(())
+    }
+
+    fn store_workflow_run_counter_tx(
+        &self,
+        tx: &Transaction<'_>,
+        workflow_path: &str,
+        next_run_number: u64,
+    ) -> anyhow::Result<()> {
         tx.execute(
             "INSERT INTO workflow_run_counters(repository_key, workflow_path, next_run_number)
              VALUES ('', ?1, ?2)
              ON CONFLICT(repository_key, workflow_path) DO UPDATE SET
-               next_run_number = excluded.next_run_number",
+               next_run_number = MAX(workflow_run_counters.next_run_number,
+                                     excluded.next_run_number)",
             params![workflow_path, next_run_number as i64],
         )?;
-        tx.commit()
-            .map_err(|error| anyhow::anyhow!("committing workflow run counter: {error}"))?;
-        self.maybe_checkpoint_wal(&connection)?;
         Ok(())
     }
 
@@ -3061,15 +3028,18 @@ impl SqliteStore {
             .map_err(|_| anyhow::anyhow!("sqlite lock poisoned"))?;
         let cursor = connection
             .query_row(
-                "SELECT scope, cursor_delivered_at_us, last_poll_at_us, last_success_at_us
+                "SELECT scope, cursor_delivered_at_us, cursor_delivered_at_guid,
+                        scan_cursor, last_poll_at_us, last_success_at_us
                  FROM webhook_watchdog WHERE scope = ?1",
                 params![scope],
                 |row| {
                     Ok(WebhookWatchdogCursor {
                         scope: row.get(0)?,
                         cursor_delivered_at_us: row.get(1)?,
-                        last_poll_at_us: row.get(2)?,
-                        last_success_at_us: row.get(3)?,
+                        cursor_delivered_at_guid: row.get(2)?,
+                        scan_cursor: row.get(3)?,
+                        last_poll_at_us: row.get(4)?,
+                        last_success_at_us: row.get(5)?,
                     })
                 },
             )
@@ -3088,15 +3058,58 @@ impl SqliteStore {
         let tx = connection.transaction()?;
         tx.execute(
             "INSERT INTO webhook_watchdog (
-                 scope, cursor_delivered_at_us, last_poll_at_us, last_success_at_us
-             ) VALUES (?1, ?2, ?3, ?4)
+                 scope, cursor_delivered_at_us, cursor_delivered_at_guid,
+                 scan_cursor, last_poll_at_us, last_success_at_us
+             ) VALUES (?1, ?2, ?3, ?4, ?5, ?6)
              ON CONFLICT(scope) DO UPDATE SET
-                 cursor_delivered_at_us = excluded.cursor_delivered_at_us,
-                 last_poll_at_us = excluded.last_poll_at_us,
-                 last_success_at_us = excluded.last_success_at_us",
+                 cursor_delivered_at_us = CASE
+                     WHEN webhook_watchdog.cursor_delivered_at_us IS NULL
+                         THEN excluded.cursor_delivered_at_us
+                     WHEN excluded.cursor_delivered_at_us IS NULL
+                         THEN webhook_watchdog.cursor_delivered_at_us
+                     ELSE MAX(webhook_watchdog.cursor_delivered_at_us,
+                              excluded.cursor_delivered_at_us)
+                 END,
+                 cursor_delivered_at_guid = CASE
+                     WHEN excluded.cursor_delivered_at_us IS NULL
+                         THEN webhook_watchdog.cursor_delivered_at_guid
+                     WHEN webhook_watchdog.cursor_delivered_at_us IS NULL
+                          OR excluded.cursor_delivered_at_us
+                             > webhook_watchdog.cursor_delivered_at_us
+                         THEN excluded.cursor_delivered_at_guid
+                     WHEN excluded.cursor_delivered_at_us
+                          < webhook_watchdog.cursor_delivered_at_us
+                         THEN webhook_watchdog.cursor_delivered_at_guid
+                     WHEN excluded.cursor_delivered_at_guid IS NULL
+                         THEN webhook_watchdog.cursor_delivered_at_guid
+                     WHEN webhook_watchdog.cursor_delivered_at_guid IS NULL
+                          OR excluded.cursor_delivered_at_guid
+                             > webhook_watchdog.cursor_delivered_at_guid
+                         THEN excluded.cursor_delivered_at_guid
+                     ELSE webhook_watchdog.cursor_delivered_at_guid
+                 END,
+                 scan_cursor = excluded.scan_cursor,
+                 last_poll_at_us = CASE
+                     WHEN webhook_watchdog.last_poll_at_us IS NULL
+                         THEN excluded.last_poll_at_us
+                     WHEN excluded.last_poll_at_us IS NULL
+                         THEN webhook_watchdog.last_poll_at_us
+                     ELSE MAX(webhook_watchdog.last_poll_at_us,
+                              excluded.last_poll_at_us)
+                 END,
+                 last_success_at_us = CASE
+                     WHEN webhook_watchdog.last_success_at_us IS NULL
+                         THEN excluded.last_success_at_us
+                     WHEN excluded.last_success_at_us IS NULL
+                         THEN webhook_watchdog.last_success_at_us
+                     ELSE MAX(webhook_watchdog.last_success_at_us,
+                              excluded.last_success_at_us)
+                 END",
             params![
                 cursor.scope,
                 cursor.cursor_delivered_at_us,
+                cursor.cursor_delivered_at_guid,
+                cursor.scan_cursor,
                 cursor.last_poll_at_us,
                 cursor.last_success_at_us,
             ],
@@ -3124,9 +3137,19 @@ impl SqliteStore {
                  github_delivery_id = excluded.github_delivery_id,
                  app_id = excluded.app_id,
                  reason = excluded.reason,
-                 attempts = excluded.attempts,
-                 last_attempt_at_us = excluded.last_attempt_at_us,
-                 resolved_at_us = excluded.resolved_at_us,
+                 attempts = MAX(webhook_redeliveries.attempts, excluded.attempts),
+                 last_attempt_at_us = CASE
+                     WHEN webhook_redeliveries.last_attempt_at_us IS NULL
+                         THEN excluded.last_attempt_at_us
+                     WHEN excluded.last_attempt_at_us IS NULL
+                         THEN webhook_redeliveries.last_attempt_at_us
+                     ELSE MAX(webhook_redeliveries.last_attempt_at_us,
+                              excluded.last_attempt_at_us)
+                 END,
+                 resolved_at_us = COALESCE(
+                     webhook_redeliveries.resolved_at_us,
+                     excluded.resolved_at_us
+                 ),
                  last_error = excluded.last_error",
             params![
                 record.delivery_guid,
@@ -3208,47 +3231,6 @@ impl SqliteStore {
         tx.commit()?;
         self.maybe_checkpoint_wal(&connection)?;
         Ok(rows_affected > 0)
-    }
-
-    pub(crate) fn reserve_synthetic_webhook_event(
-        &self,
-        key: &str,
-        repository: &str,
-        event: &str,
-        git_ref: &str,
-        head_sha: &str,
-        now_us: i64,
-    ) -> anyhow::Result<bool> {
-        let mut connection = self
-            .connection
-            .lock()
-            .map_err(|_| anyhow::anyhow!("sqlite lock poisoned"))?;
-        let tx = connection.transaction()?;
-        let rows_affected = tx.execute(
-            "INSERT INTO webhook_synthetic_events (
-                 idempotency_key, repository, event, git_ref, head_sha, created_at_us
-             ) VALUES (?1, ?2, ?3, ?4, ?5, ?6)
-             ON CONFLICT(idempotency_key) DO NOTHING",
-            params![key, repository, event, git_ref, head_sha, now_us],
-        )?;
-        tx.commit()?;
-        self.maybe_checkpoint_wal(&connection)?;
-        Ok(rows_affected > 0)
-    }
-
-    pub(crate) fn clear_synthetic_webhook_reservation(&self, key: &str) -> anyhow::Result<()> {
-        let mut connection = self
-            .connection
-            .lock()
-            .map_err(|_| anyhow::anyhow!("sqlite lock poisoned"))?;
-        let tx = connection.transaction()?;
-        tx.execute(
-            "DELETE FROM webhook_synthetic_events WHERE idempotency_key = ?1",
-            params![key],
-        )?;
-        tx.commit()?;
-        self.maybe_checkpoint_wal(&connection)?;
-        Ok(())
     }
 }
 
@@ -3606,45 +3588,6 @@ impl Store for SqliteStore {
         .await
         .map_err(|error| anyhow::anyhow!("resolve webhook redelivery task panicked: {error}"))?
     }
-
-    async fn reserve_synthetic_webhook_event(
-        &self,
-        key: &str,
-        repository: &str,
-        event: &str,
-        git_ref: &str,
-        head_sha: &str,
-        now_us: i64,
-    ) -> anyhow::Result<bool> {
-        let store = self.clone();
-        let key = key.to_owned();
-        let repository = repository.to_owned();
-        let event = event.to_owned();
-        let git_ref = git_ref.to_owned();
-        let head_sha = head_sha.to_owned();
-        tokio::task::spawn_blocking(move || {
-            store.reserve_synthetic_webhook_event(
-                &key,
-                &repository,
-                &event,
-                &git_ref,
-                &head_sha,
-                now_us,
-            )
-        })
-        .await
-        .map_err(|error| anyhow::anyhow!("reserve synthetic webhook task panicked: {error}"))?
-    }
-
-    async fn clear_synthetic_webhook_reservation(&self, key: &str) -> anyhow::Result<()> {
-        let store = self.clone();
-        let key = key.to_owned();
-        tokio::task::spawn_blocking(move || store.clear_synthetic_webhook_reservation(&key))
-            .await
-            .map_err(|error| {
-                anyhow::anyhow!("clear synthetic reservation task panicked: {error}")
-            })?
-    }
 }
 
 #[derive(Debug, Serialize, Deserialize)]
@@ -3949,14 +3892,19 @@ const MIGRATIONS: &[(u32, &str, &str)] = &[
         CREATE INDEX IF NOT EXISTS webhook_redeliveries_open_idx
           ON webhook_redeliveries (resolved_at_us, first_seen_at_us);
 
-        CREATE TABLE IF NOT EXISTS webhook_synthetic_events (
-          idempotency_key TEXT PRIMARY KEY,
-          repository TEXT NOT NULL,
-          event TEXT NOT NULL,
-          git_ref TEXT NOT NULL,
-          head_sha TEXT NOT NULL,
-          created_at_us INTEGER NOT NULL
-        ) STRICT;
+        "#,
+    ),
+    (
+        10,
+        "drop-source-state-reconciler",
+        "DROP TABLE IF EXISTS webhook_synthetic_events;",
+    ),
+    (
+        11,
+        "webhook-watchdog-safe-pagination",
+        r#"
+        ALTER TABLE webhook_watchdog ADD COLUMN cursor_delivered_at_guid TEXT;
+        ALTER TABLE webhook_watchdog ADD COLUMN scan_cursor TEXT;
         "#,
     ),
 ];

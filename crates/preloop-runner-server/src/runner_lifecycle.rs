@@ -451,6 +451,7 @@ async fn purge_runner_identity_with_phantom_check(
     inner.runner_client_ids.retain(|_, id| *id != runner_id);
     inner.runner_public_keys.remove(&runner_id);
     inner.runner_rsa_public_keys.remove(&runner_id);
+    inner.pool_proven_runners.remove(&runner_id);
     inner.runner_registered_at.remove(&runner_id);
     // Sessions claiming this runner: drop them so subsequent polls stop.
     let doomed_sessions: Vec<String> = inner
@@ -534,7 +535,11 @@ async fn purge_runner_identity_with_phantom_check(
         .queue_depth
         .store(inner.queue.len(), std::sync::atomic::Ordering::Release);
     runtime_scheduling::sync_next_job_labels(&inner, &shared.state.next_job_runs_on);
+    let snapshot = crate::store::StoreSnapshot::from_inner(&inner);
     drop(inner);
+    if let Err(error) = shared.state.store.store_inner(&snapshot).await {
+        tracing::warn!(?error, runner_id, "failed to persist purged runner state");
+    }
     shared.state.message_notify.notify_waiters();
     true
 }

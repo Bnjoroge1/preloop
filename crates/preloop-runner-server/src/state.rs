@@ -383,12 +383,13 @@ pub struct AppState {
     pub(crate) events: broadcast::Sender<NdjsonEvent>,
     pub(crate) message_notify: Arc<Notify>,
     pub(crate) webhook_queue_notify: Arc<Notify>,
-    /// Circuit breaker shared by every GitHub-dependent call in the webhook
-    /// path. Per-`AppState` rather than global so parallel tests pointing at
-    /// stub APIs cannot trip each other.
+    /// Circuit breaker for durable webhook delivery work. Lifecycle check-run
+    /// updates use a separate breaker so an ingress outage cannot suppress
+    /// status transitions for runs already in progress.
     pub(crate) github_breaker: Arc<crate::github_breaker::GithubBreaker>,
-    /// Live status published by the delivery watchdog, the source-state
-    /// reconciler and the App webhook health monitor.
+    pub(crate) github_lifecycle_breaker: Arc<crate::github_breaker::GithubBreaker>,
+    /// Live status published by the delivery watchdog and App webhook health
+    /// monitor.
     pub(crate) webhook_status: Arc<crate::webhook_status::WebhookResilienceStatus>,
     /// Backoff ladder for transient webhook delivery failures, indexed by the
     /// delivery's attempt count (the last entry repeats). State rather than a
@@ -1030,6 +1031,7 @@ impl AppState {
             message_notify: Arc::new(Notify::new()),
             webhook_queue_notify: Arc::new(Notify::new()),
             github_breaker: Arc::new(crate::github_breaker::GithubBreaker::default()),
+            github_lifecycle_breaker: Arc::new(crate::github_breaker::GithubBreaker::default()),
             webhook_status: Arc::new(crate::webhook_status::WebhookResilienceStatus::default()),
             webhook_retry_backoff: crate::github::WEBHOOK_RETRY_BACKOFF.to_vec(),
             next_request_id: Arc::new(std::sync::atomic::AtomicI64::new(next_request_id)),
@@ -1410,6 +1412,9 @@ impl InnerState {
 pub(crate) struct InnerState {
     pub(crate) runs: BTreeMap<RunId, RunRecord>,
     pub(crate) workflow_run_counters: BTreeMap<String, u64>,
+    /// Webhook run submissions currently building outside the state lock.
+    /// Entries prevent a replay from doing the same expensive work twice.
+    pub(crate) webhook_run_reservations: BTreeSet<(String, String)>,
     pub(crate) queue: VecDeque<QueuedJob>,
     /// When each ready-queue job was first seen by the reaper, used to fail
     /// jobs no runner can ever claim. Maintained by the reaper itself, so it

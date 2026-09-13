@@ -22,7 +22,6 @@ pub mod scheduler;
 mod shared_http;
 mod webhook_api;
 mod webhook_health;
-mod webhook_reconciler;
 mod webhook_status;
 mod webhook_watchdog;
 pub use errors::ApiError;

@@ -1534,6 +1534,41 @@ impl AppSubscription {
     }
 }
 
+/// Read a GitHub App endpoint as JSON.
+///
+/// The optional breaker is used by periodic health checks; startup reads pass
+/// `None` because the breaker is not initialized at that point.
+async fn read_app_json_at(
+    api_base: &str,
+    path: &str,
+    app_id: &str,
+    private_key: &rsa::RsaPrivateKey,
+    breaker: Option<&crate::github_breaker::GithubBreaker>,
+) -> anyhow::Result<serde_json::Value> {
+    let app_jwt = sign_app_jwt(app_id, private_key)?;
+    let request = CLIENT
+        .get(format!("{api_base}{path}"))
+        .header("User-Agent", "preloop")
+        .header("Authorization", format!("Bearer {app_jwt}"))
+        .header("Accept", "application/vnd.github+json");
+    let response = match breaker {
+        Some(breaker) => crate::github_breaker::send_observed(breaker, request).await?,
+        None => request
+            .send()
+            .await
+            .with_context(|| format!("GET {api_base}{path}"))?,
+    };
+    let status = response.status();
+    let body = response.text().await.unwrap_or_default();
+    if !status.is_success() {
+        bail!(
+            "GET {path} failed with {status}: {}",
+            body.chars().take(1024).collect::<String>()
+        );
+    }
+    serde_json::from_str(&body).with_context(|| format!("GET {path} returned a non-JSON body"))
+}
+
 /// Read an App's webhook subscription and permissions via `GET /app`.
 ///
 /// Authenticates with the App JWT — the only credential `/app` accepts.
@@ -1545,25 +1580,16 @@ pub(crate) async fn read_app_subscription_at(
     app_id: &str,
     private_key: &rsa::RsaPrivateKey,
 ) -> anyhow::Result<AppSubscription> {
-    let app_jwt = sign_app_jwt(app_id, private_key)?;
-    let response = CLIENT
-        .get(format!("{api_base}/app"))
-        .header("User-Agent", "preloop")
-        .header("Authorization", format!("Bearer {app_jwt}"))
-        .header("Accept", "application/vnd.github+json")
-        .send()
-        .await
-        .with_context(|| format!("GET {api_base}/app"))?;
-    let status = response.status();
-    let body = response.text().await.unwrap_or_default();
-    if !status.is_success() {
-        bail!(
-            "GET /app failed with {status}: {}",
-            body.chars().take(1024).collect::<String>()
-        );
-    }
-    let payload: serde_json::Value =
-        serde_json::from_str(&body).with_context(|| "GET /app returned a non-JSON body")?;
+    read_app_subscription_at_with_breaker(api_base, app_id, private_key, None).await
+}
+
+pub(crate) async fn read_app_subscription_at_with_breaker(
+    api_base: &str,
+    app_id: &str,
+    private_key: &rsa::RsaPrivateKey,
+    breaker: Option<&crate::github_breaker::GithubBreaker>,
+) -> anyhow::Result<AppSubscription> {
+    let payload = read_app_json_at(api_base, "/app", app_id, private_key, breaker).await?;
     let events = payload
         .get("events")
         .and_then(serde_json::Value::as_array)
@@ -1608,33 +1634,24 @@ pub(crate) struct AppHookConfig {
 
 /// Read an App's webhook delivery configuration via `GET /app/hook/config`.
 ///
-/// Authenticates with the App JWT, the only credential the endpoint accepts.
-/// Failure is an error, never a default: a config that could not be read
-/// must not be reported as a healthy one.
+/// The optional breaker is used by periodic health checks; startup reads pass
+/// `None` because the breaker is not initialized at that point.
 pub(crate) async fn read_app_hook_config_at(
     api_base: &str,
     app_id: &str,
     private_key: &rsa::RsaPrivateKey,
 ) -> anyhow::Result<AppHookConfig> {
-    let app_jwt = sign_app_jwt(app_id, private_key)?;
-    let response = CLIENT
-        .get(format!("{api_base}/app/hook/config"))
-        .header("User-Agent", "preloop")
-        .header("Authorization", format!("Bearer {app_jwt}"))
-        .header("Accept", "application/vnd.github+json")
-        .send()
-        .await
-        .with_context(|| format!("GET {api_base}/app/hook/config"))?;
-    let status = response.status();
-    let body = response.text().await.unwrap_or_default();
-    if !status.is_success() {
-        bail!(
-            "GET /app/hook/config failed with {status}: {}",
-            body.chars().take(1024).collect::<String>()
-        );
-    }
-    let payload: serde_json::Value = serde_json::from_str(&body)
-        .with_context(|| "GET /app/hook/config returned a non-JSON body")?;
+    read_app_hook_config_at_with_breaker(api_base, app_id, private_key, None).await
+}
+
+pub(crate) async fn read_app_hook_config_at_with_breaker(
+    api_base: &str,
+    app_id: &str,
+    private_key: &rsa::RsaPrivateKey,
+    breaker: Option<&crate::github_breaker::GithubBreaker>,
+) -> anyhow::Result<AppHookConfig> {
+    let payload =
+        read_app_json_at(api_base, "/app/hook/config", app_id, private_key, breaker).await?;
     let field = |name: &str| {
         payload
             .get(name)

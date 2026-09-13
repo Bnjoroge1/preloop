@@ -725,7 +725,6 @@ fn collect_snapshot_inputs(inner: &InnerState) -> SnapshotInputs {
 struct WebhookConditionInputs {
     stats: Option<crate::models::WebhookQueueStats>,
     watchdog: crate::webhook_status::WatchdogStatus,
-    reconciler: crate::webhook_status::ReconcilerStatus,
     breaker: crate::github_breaker::BreakerSnapshot,
     app_config: Vec<crate::webhook_status::AppWebhookConfigStatus>,
 }
@@ -803,8 +802,9 @@ fn webhook_conditions(
                 crate::webhook_status::age_seconds(last, now_us) > WEBHOOK_WATCHDOG_STALE_SECONDS
             }
             // Never succeeded: only alarming once the process has been up
-            // long enough for a poll to have happened and finished.
-            None => inputs.watchdog.last_poll_at_us.is_some_and(|poll| {
+            // long enough for an attempted poll to prove the watchdog is
+            // actually unable to complete.
+            None => inputs.watchdog.first_poll_at_us.is_some_and(|poll| {
                 crate::webhook_status::age_seconds(poll, now_us) > WEBHOOK_WATCHDOG_STALE_SECONDS
             }),
         };
@@ -864,18 +864,6 @@ fn webhook_conditions(
             "webhook_config_drift",
             "warning",
             format!("GitHub App {}: {}", app.app_id, detail.join("; ")),
-        ));
-    }
-    if let Some(error) = inputs
-        .reconciler
-        .enabled
-        .then_some(inputs.reconciler.last_error.as_ref())
-        .flatten()
-    {
-        conditions.push(condition(
-            "webhook_reconciler_failing",
-            "warning",
-            format!("source-state reconciler is failing: {error}"),
         ));
     }
     conditions
@@ -1092,9 +1080,8 @@ fn collect_webhook_condition_inputs(state: &AppState) -> WebhookConditionInputs 
     WebhookConditionInputs {
         stats: state.webhook_status.queue_stats(),
         watchdog: state.webhook_status.watchdog(),
-        reconciler: state.webhook_status.reconciler(),
         breaker: state.github_breaker.snapshot(),
-        app_config: state.webhook_status.app_config(),
+        app_config: state.webhook_status.app_config_snapshot().0,
     }
 }
 
@@ -1453,12 +1440,6 @@ pub async fn serve(config: ServerConfig) -> anyhow::Result<()> {
     tokio::spawn(async move {
         crate::webhook_health::run_webhook_health_monitor(health_shared).await;
     });
-    if !crate::webhook_reconciler::reconciler_repositories().is_empty() {
-        let reconciler_shared = shared.clone();
-        tokio::spawn(async move {
-            crate::webhook_reconciler::run_webhook_reconciler(reconciler_shared).await;
-        });
-    }
 
     // Claims held by machines the restart destroyed can never be completed by
     // anyone; settle them before serving so the pool is not handed a queue of

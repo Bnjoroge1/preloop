@@ -276,27 +276,6 @@ fn existing_webhook_run(
         })
 }
 
-async fn persist_workflow_run_counter(
-    shared: &Arc<SharedState>,
-    workflow_path: &str,
-    run_number: u64,
-) {
-    // The in-memory counter is authoritative; persistence is best effort and
-    // must happen after the state lock is released.
-    if let Err(error) = shared
-        .state
-        .store
-        .store_workflow_run_counter(workflow_path, run_number.saturating_add(1))
-        .await
-    {
-        tracing::warn!(
-            %error,
-            %workflow_path,
-            "failed to persist workflow run counter; next run number may repeat after restart"
-        );
-    }
-}
-
 pub(crate) async fn submit_run_inner(
     shared: &Arc<SharedState>,
     submission: WorkflowSubmission,
@@ -306,11 +285,95 @@ pub(crate) async fn submit_run_inner(
 
 /// Submit a run originating from one durable webhook delivery.
 ///
+/// A replay that arrives while the first delivery is still constructing a
+/// large matrix waits for that construction instead of duplicating the work.
+pub(crate) async fn submit_run_inner_with_webhook_delivery(
+    shared: &Arc<SharedState>,
+    submission: WorkflowSubmission,
+    webhook_delivery_id: Option<&str>,
+) -> Result<RunAccepted, ApiError> {
+    let Some(delivery_id) = webhook_delivery_id else {
+        return submit_run_inner_with_webhook_delivery_unreserved(shared, submission, None).await;
+    };
+    let Some(workflow_path) = submission.workflow_path.as_deref() else {
+        return submit_run_inner_with_webhook_delivery_unreserved(
+            shared,
+            submission,
+            Some(delivery_id),
+        )
+        .await;
+    };
+    let key = (delivery_id.to_owned(), workflow_path.to_owned());
+    loop {
+        let reservation_acquired = {
+            let mut inner = shared.state.inner.lock().await;
+            if let Some(existing) = existing_webhook_run(&inner, delivery_id, workflow_path) {
+                return Ok(existing);
+            }
+            inner.webhook_run_reservations.insert(key.clone())
+        };
+        if reservation_acquired {
+            let reservation = WebhookRunReservation::new(Arc::clone(shared), key.clone());
+            let result = submit_run_inner_with_webhook_delivery_unreserved(
+                shared,
+                submission,
+                Some(delivery_id),
+            )
+            .await;
+            reservation.release().await;
+            return result;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+    }
+}
+struct WebhookRunReservation {
+    shared: Arc<SharedState>,
+    key: Option<(String, String)>,
+}
+
+impl WebhookRunReservation {
+    fn new(shared: Arc<SharedState>, key: (String, String)) -> Self {
+        Self {
+            shared,
+            key: Some(key),
+        }
+    }
+
+    async fn release(mut self) {
+        if let Some(key) = self.key.take() {
+            release_webhook_run_reservation(&self.shared, key).await;
+        }
+    }
+}
+
+impl Drop for WebhookRunReservation {
+    fn drop(&mut self) {
+        let Some(key) = self.key.take() else {
+            return;
+        };
+        let shared = Arc::clone(&self.shared);
+        if let Ok(handle) = tokio::runtime::Handle::try_current() {
+            handle.spawn(async move {
+                release_webhook_run_reservation(&shared, key).await;
+            });
+        }
+    }
+}
+
+async fn release_webhook_run_reservation(shared: &Arc<SharedState>, key: (String, String)) {
+    let mut inner = shared.state.inner.lock().await;
+    inner.webhook_run_reservations.remove(&key);
+    drop(inner);
+    shared.state.message_notify.notify_waiters();
+}
+
+/// Submit a run originating from one durable webhook delivery.
+///
 /// The delivery worker is at-least-once: a process crash after run creation
 /// but before the queue row is marked done can replay the payload. Persisting
 /// the delivery ID on the run lets the replay return the existing run instead
 /// of creating a second one.
-pub(crate) async fn submit_run_inner_with_webhook_delivery(
+async fn submit_run_inner_with_webhook_delivery_unreserved(
     shared: &Arc<SharedState>,
     mut submission: WorkflowSubmission,
     webhook_delivery_id: Option<&str>,
@@ -1210,7 +1273,6 @@ pub(crate) async fn submit_run_inner_with_webhook_delivery(
                 },
             );
             drop(inner);
-            persist_workflow_run_counter(shared, &workflow_path, run_number).await;
             shared
                 .state
                 .emit(NdjsonEvent::RunAccepted {
@@ -1439,7 +1501,6 @@ pub(crate) async fn submit_run_inner_with_webhook_delivery(
                         }
                     }
                     drop(inner);
-                    persist_workflow_run_counter(shared, &workflow_path, run_number).await;
                     shared
                         .state
                         .emit(NdjsonEvent::RunAccepted {
@@ -1515,7 +1576,6 @@ pub(crate) async fn submit_run_inner_with_webhook_delivery(
                 },
             );
             drop(inner);
-            persist_workflow_run_counter(shared, &workflow_path, run_number).await;
             shared
                 .state
                 .emit(NdjsonEvent::RunAccepted {
@@ -1763,7 +1823,6 @@ pub(crate) async fn submit_run_inner_with_webhook_delivery(
         runtime_scheduling::sync_next_job_labels(&inner, &shared.state.next_job_runs_on);
         let cancel_count = inner.cancellation_queue.len();
         drop(inner);
-        persist_workflow_run_counter(shared, &workflow_path, run_number).await;
         // The sweep above only recorded the intent to expand; the subtree build
         // runs here with the lock released.
         let expansion = drain_expansions(shared).await;
@@ -1879,14 +1938,17 @@ pub(crate) async fn submit_run(
                 )
             };
             for job_id in &jobs {
-                let _ = crate::github::report_check_run_queued(
+                if let Err(error) = crate::github::report_check_run_queued(
                     &shared,
                     &repository,
                     &sha,
                     job_id,
                     run_id,
                 )
-                .await;
+                .await
+                {
+                    tracing::warn!(%run_id, %job_id, ?error, "failed to report queued GitHub check run");
+                }
                 let status = {
                     let inner = shared.state.inner.lock().await;
                     inner

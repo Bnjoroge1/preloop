@@ -99,10 +99,9 @@ async fn request(method: reqwest::Method, path: &str) -> anyhow::Result<serde_js
         anyhow::bail!("server returned {status}: {detail}");
     }
     if body.trim().is_empty() {
-        Ok(serde_json::Value::Null)
-    } else {
-        Ok(serde_json::from_str(&body)?)
+        anyhow::bail!("server returned an empty JSON response for {url}");
     }
+    Ok(serde_json::from_str(&body)?)
 }
 
 fn human_age(seconds: f64) -> String {
@@ -153,7 +152,7 @@ async fn list(args: ListArgs) -> anyhow::Result<()> {
     for delivery in deliveries {
         println!(
             "{:<38} {:<16} {:<11} {:>4} {:>7}  {}",
-            truncate(delivery["delivery_id"].as_str().unwrap_or("?"), 38),
+            delivery["delivery_id"].as_str().unwrap_or("?"),
             truncate(delivery["event"].as_str().unwrap_or("?"), 16),
             delivery["state"].as_str().unwrap_or("?"),
             delivery["attempts"].as_u64().unwrap_or(0),
@@ -185,13 +184,17 @@ async fn health(args: HealthArgs) -> anyhow::Result<()> {
     }
 
     let queue = &document["queue"];
-    println!(
-        "queue      {} received, {} processing, {} dead-letter",
-        queue["received"], queue["processing"], queue["dead_letters"]
-    );
-    match queue["oldest_pending_age_seconds"].as_f64() {
-        Some(age) => println!("oldest     {} unprocessed", human_age(age)),
-        None => println!("oldest     nothing pending"),
+    if let Some(error) = queue["error"].as_str() {
+        println!("queue      UNAVAILABLE — {error}");
+    } else {
+        println!(
+            "queue      {} received, {} processing, {} dead-letter",
+            queue["received"], queue["processing"], queue["dead_letters"]
+        );
+        match queue["oldest_pending_age_seconds"].as_f64() {
+            Some(age) => println!("oldest     {} unprocessed", human_age(age)),
+            None => println!("oldest     nothing pending"),
+        }
     }
 
     let watchdog = &document["watchdog"];
@@ -244,18 +247,7 @@ async fn health(args: HealthArgs) -> anyhow::Result<()> {
             println!("           last error: {error}");
         }
     } else {
-        println!("github     reachable");
-    }
-
-    let reconciler = &document["reconciler"];
-    if reconciler["enabled"].as_bool().unwrap_or(false) {
-        println!(
-            "reconciler {} repositories scanned, {} events synthesized",
-            reconciler["repositories_scanned"], reconciler["synthesized"]
-        );
-        if let Some(error) = reconciler["last_error"].as_str() {
-            println!("           last error: {error}");
-        }
+        println!("github     breaker closed — calls permitted");
     }
 
     let empty = Vec::new();

@@ -282,7 +282,7 @@ patched, not duplicated.
 
 Queue depth and oldest pending age, delivery-watchdog freshness (loudly
 flagged when stale or disabled), open repairs, GitHub circuit-breaker state,
-reconciler counters, and per-App webhook configuration drift.
+and per-App webhook configuration drift.
 
 | Flag | Description |
 |---|---|
