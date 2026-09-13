@@ -25,3 +25,43 @@ jobs:
 
 
       - run: "echo \"result=${{ needs.build.result }}\""
+
+  replay-extra-2:
+    runs-on: self-hosted
+    steps:
+      - run: "echo \"replay placeholder 2\""
+
+  replay-extra-3:
+    runs-on: self-hosted
+    steps:
+      - run: "echo \"replay placeholder 3\""
+
+  replay-extra-4:
+    runs-on: self-hosted
+    steps:
+      - run: "echo \"replay placeholder 4\""
+
+  replay-extra-5:
+    runs-on: self-hosted
+    steps:
+      - run: "echo \"replay placeholder 5\""
+
+  replay-extra-6:
+    runs-on: self-hosted
+    steps:
+      - run: "echo \"replay placeholder 6\""
+
+  replay-extra-7:
+    runs-on: self-hosted
+    steps:
+      - run: "echo \"replay placeholder 7\""
+
+  replay-extra-8:
+    runs-on: self-hosted
+    steps:
+      - run: "echo \"replay placeholder 8\""
+
+  replay-extra-9:
+    runs-on: self-hosted
+    steps:
+      - run: "echo \"replay placeholder 9\""

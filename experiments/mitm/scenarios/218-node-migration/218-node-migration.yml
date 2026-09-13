@@ -6,3 +6,8 @@ jobs:
     steps:
       - uses: "./.github/actions/node20-action"
       - run: "echo \"after node20 action\""
+
+  replay-extra-2:
+    runs-on: self-hosted
+    steps:
+      - run: "echo \"replay placeholder 2\""

@@ -20,3 +20,8 @@ jobs:
           fail-main: "true"
         uses: "./.github/actions/lifecycle"
       - run: "echo \"unreachable\""
+
+  replay-extra-2:
+    runs-on: self-hosted
+    steps:
+      - run: "echo \"replay placeholder 2\""

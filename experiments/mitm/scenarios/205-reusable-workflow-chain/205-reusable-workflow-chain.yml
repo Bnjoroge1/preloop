@@ -31,3 +31,8 @@ jobs:
           DEPLOY_TOKEN: "${{ secrets.deploy_token }}"
 
       - run: "echo \"artifact=edge-${{ inputs.environment-name }}.zip\" >> \"$GITHUB_OUTPUT\""
+
+  replay-extra-2:
+    runs-on: self-hosted
+    steps:
+      - run: "echo \"replay placeholder 2\""

@@ -251,7 +251,7 @@ def render_step(records: list[tuple[int, str, Any]], lines: list[str], notes: li
         occupied[target] = len(rendered)
 
 
-def render_workflow(name: str, payload: dict[str, Any]) -> tuple[str, list[str]]:
+def render_workflow(name: str, payload: dict[str, Any], replay_job_count: int = 1) -> tuple[str, list[str]]:
     lines = [f"name: {name}", "on: workflow_dispatch"]
     notes: list[str] = ["trigger inferred as workflow_dispatch"]
 
@@ -311,11 +311,37 @@ def render_workflow(name: str, payload: dict[str, Any]) -> tuple[str, list[str]]
     lines.append("    steps:")
     for step in payload.get("steps", []):
         render_step(step_records(step), lines, notes)
-    if payload.get("jobName") not in (None, "__default"):
-        notes.append("expanded job identity reconstructed from one acquirejob cell")
+    for index in range(2, replay_job_count + 1):
+        lines.extend(
+            [
+                "",
+                f"  replay-extra-{index}:",
+                "    runs-on: self-hosted",
+                "    steps:",
+
+                f'      - run: "echo \\"replay placeholder {index}\\""',
+            ]
+        )
+    if replay_job_count > 1:
+        notes.append(
+            f"capture delivered {replay_job_count} jobs; extra replay jobs preserve queue cardinality"
+        )
     notes.append("strategy.matrix pre-expansion is not recoverable from this capture")
     notes.append("comments and original scalar/flow formatting are not recoverable")
     return "\n".join(lines).rstrip() + "\n", sorted(set(notes))
+def captured_job_count(capture: Path) -> int:
+    count = 0
+    for line in (capture / "flows.jsonl").read_text().splitlines():
+        flow = json.loads(line)
+        path = str(flow.get("path", ""))
+        response = flow.get("response_body_json") or {}
+        if (
+            ("/messages?" in path or "/message?" in path)
+            and response.get("messageType") == "RunnerJobRequest"
+        ):
+            count += 1
+    return count
+
 
 
 def acquire_payload(capture: Path) -> dict[str, Any]:
@@ -394,8 +420,9 @@ def main() -> int:
     args = parser.parse_args()
     names = args.names or sorted(path.name for path in args.golden_root.iterdir() if path.is_dir())
     for name in names:
-        payload = acquire_payload(args.golden_root / name)
-        workflow, notes = render_workflow(name, payload)
+        capture = args.golden_root / name
+        payload = acquire_payload(capture)
+        workflow, notes = render_workflow(name, payload, captured_job_count(capture))
         destination = args.output_root / name
         destination.mkdir(parents=True, exist_ok=True)
         (destination / f"{name}.yml").write_text(workflow)

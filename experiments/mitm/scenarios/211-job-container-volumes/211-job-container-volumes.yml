@@ -23,3 +23,8 @@ jobs:
 
 
       - run: "node --version && npm --version"
+
+  replay-extra-2:
+    runs-on: self-hosted
+    steps:
+      - run: "echo \"replay placeholder 2\""

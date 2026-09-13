@@ -165,10 +165,15 @@ specs for human implementation.
 
 The v2.337.0 capture set contains four cells under
 `.runner-watch/golden/v2.337.0/`: `gh-official` (27), `gh-preloop` (11),
-`pl-official` (19), and `pl-preloop` (27). Only `gh-official` is used by the
-reconstruction gate: it is the cell whose 27 captures all contain a populated
-`acquirejob` response. The other cells remain comparison material; they are not
-silently presented as official-runner provenance.
+`pl-official` (19), and `pl-preloop` (27). `gh-official` is the cell used by
+the reconstruction and replay gate: its 27 captures all contain a populated
+`acquirejob` response. The other cells remain comparison material; they are
+not silently presented as official-runner provenance.
+
+`benchmarks/conformance/targets.toml` is the single CI target list. The
+conformance workflow starts one replay server and iterates that list, currently
+replaying v2.336.0 plus the recovered v2.337.0 `gh-official` cell. Adding a
+future version is one target entry, not another workflow job.
 
 `experiments/mitm/bin/reconstruct_scenario.py` decodes the first populated
 `acquirejob` response and emits the workflow plus the standard submit/wait

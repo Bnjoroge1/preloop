@@ -22,3 +22,8 @@ jobs:
 
       - run: "echo \"failure branch\""
         if: "failure()"
+
+  replay-extra-2:
+    runs-on: self-hosted
+    steps:
+      - run: "echo \"replay placeholder 2\""

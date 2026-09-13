@@ -23,3 +23,8 @@ jobs:
           [ "$(printf '%s\n' "$MULTILINE_OUT" | wc -l)" = "4" ] || exit 1
         env:
           MULTILINE_OUT: "${{ steps.gen.outputs.block }}"
+
+  replay-extra-2:
+    runs-on: self-hosted
+    steps:
+      - run: "echo \"replay placeholder 2\""
