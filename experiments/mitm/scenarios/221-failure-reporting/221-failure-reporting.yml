@@ -1,0 +1,17 @@
+name: 221-failure-reporting
+on: workflow_dispatch
+jobs:
+  flaky:
+    runs-on: self-hosted
+    steps:
+      - run: "echo \"compiling\""
+      - run: |
+          echo "test suite"
+          echo "1 passing, 1 failing"
+          exit 1
+      - run: "echo \"skipped cleanup\""
+
+  replay-extra-2:
+    runs-on: self-hosted
+    steps:
+      - run: "echo \"replay placeholder 2\""

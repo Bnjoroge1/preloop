@@ -133,6 +133,9 @@ struct ConformArgs {
     /// Skip cargo test --workspace before replay.
     #[arg(long)]
     skip_cargo_test: bool,
+    /// Optional cell below the version directory, for example gh-official.
+    #[arg(long)]
+    cell: Option<String>,
     /// Also gate normalized response *values* (finding #4) for every shared
     /// endpoint except known-volatile ones (tokens, OIDC, signed blob URLs,
     /// connectionData). Off by default: the default gate preserves the legacy
@@ -1863,7 +1866,10 @@ async fn conform(config: &Config, args: &ConformArgs) -> anyhow::Result<()> {
         }
     }
     let version_dir = normalize_version_dir(&args.runner);
-    let golden_root = config.general.golden_dir.join(&version_dir);
+    let mut golden_root = config.general.golden_dir.join(&version_dir);
+    if let Some(cell) = &args.cell {
+        golden_root = golden_root.join(cell);
+    }
     if !golden_root.exists() {
         bail!("golden dir not found: {}", golden_root.display());
     }
@@ -3565,6 +3571,7 @@ async fn run_all(config: &Config, args: &RunArgs) -> anyhow::Result<()> {
                 preloop_url: preloop_url.clone(),
                 scenario: None,
                 skip_cargo_test: args.skip_cargo_test,
+                cell: None,
                 value_gate_strict: false,
             },
         )

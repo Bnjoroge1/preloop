@@ -1,0 +1,30 @@
+name: 211-job-container-volumes
+on: workflow_dispatch
+jobs:
+  default-container-env:
+    runs-on: self-hosted
+    container:
+    steps:
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+      - run: "node --version && npm --version"
+
+  replay-extra-2:
+    runs-on: self-hosted
+    steps:
+      - run: "echo \"replay placeholder 2\""

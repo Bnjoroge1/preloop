@@ -1,0 +1,38 @@
+name: 205-reusable-workflow-chain
+on: workflow_dispatch
+jobs:
+  ci-build:
+    runs-on: self-hosted
+    outputs:
+      artifact: "${{ steps.pack.outputs.artifact }}"
+    steps:
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+      - run: |
+          echo "env=${{ inputs.environment-name }} verbose=${{ inputs.verbose }}"
+          echo "token length=${#DEPLOY_TOKEN}"
+          [ -n "$DEPLOY_TOKEN" ] || exit 1
+        env:
+          DEPLOY_TOKEN: "${{ secrets.deploy_token }}"
+
+      - run: "echo \"artifact=edge-${{ inputs.environment-name }}.zip\" >> \"$GITHUB_OUTPUT\""
+
+  replay-extra-2:
+    runs-on: self-hosted
+    steps:
+      - run: "echo \"replay placeholder 2\""

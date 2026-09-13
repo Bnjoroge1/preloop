@@ -1,0 +1,13 @@
+name: 220-label-routing
+on: workflow_dispatch
+jobs:
+  labeled:
+    runs-on: self-hosted
+    steps:
+      - run: "echo \"routed by label list\""
+      - run: "echo \"runner name=${{ runner.name }} os=${{ runner.os }} arch=${{ runner.arch }} temp=${{ runner.temp }}\""
+
+  replay-extra-2:
+    runs-on: self-hosted
+    steps:
+      - run: "echo \"replay placeholder 2\""

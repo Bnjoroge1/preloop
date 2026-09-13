@@ -1,0 +1,30 @@
+name: 226-multiline-outputs
+on: workflow_dispatch
+jobs:
+  outputs:
+    runs-on: self-hosted
+    outputs:
+      multiline: "${{ steps.gen.outputs.block }}"
+      with_equals: "${{ steps.gen.outputs.kv }}"
+    steps:
+
+      - run: |
+          {
+            echo "block<<MARKER"
+            printf 'line with = sign\n'
+            printf 'line with "quotes" and '"'"'apos'"'"'\n'
+            printf '  leading spaces\n'
+            printf 'tab\there\n'
+            echo "MARKER"
+          } >> "$GITHUB_OUTPUT"
+          echo "kv=a=b=c" >> "$GITHUB_OUTPUT"
+      - run: |
+          printf '%s\n' "$MULTILINE_OUT"
+          [ "$(printf '%s\n' "$MULTILINE_OUT" | wc -l)" = "4" ] || exit 1
+        env:
+          MULTILINE_OUT: "${{ steps.gen.outputs.block }}"
+
+  replay-extra-2:
+    runs-on: self-hosted
+    steps:
+      - run: "echo \"replay placeholder 2\""

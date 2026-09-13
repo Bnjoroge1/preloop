@@ -1,0 +1,20 @@
+name: 225-docker-build-run
+on: workflow_dispatch
+jobs:
+  buildx:
+    runs-on: self-hosted
+    steps:
+      - name: "build image"
+        run: |
+          mkdir -p ctx
+          cat > ctx/Dockerfile <<'DOCKERFILE'
+          FROM alpine:3.19
+          RUN apk add --no-cache curl
+          CMD ["sh", "-c", "curl --version"]
+          DOCKERFILE
+          docker build -t edge-conformance:v1 ctx
+      - name: "run image"
+        run: "docker run --rm edge-conformance:v1 | grep -q curl && echo \"docker build/run ok\""
+      - name: "cleanup"
+        if: "always()"
+        run: "docker rmi edge-conformance:v1 || true"

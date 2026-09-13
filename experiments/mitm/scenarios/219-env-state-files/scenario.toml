@@ -1,0 +1,16 @@
+description = "Reconstructed v2.337.0 workflow from the gh-official acquirejob capture for 219-env-state-files."
+duration_seconds_max = 300
+
+[[steps]]
+kind = "submit_workflow"
+path = "219-env-state-files.yml"
+
+[[steps]]
+kind = "wait_for_event"
+event = "job_assigned"
+timeout = 120
+
+[[steps]]
+kind = "wait_for_event"
+event = "job_completed"
+timeout = 240

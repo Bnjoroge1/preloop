@@ -1,0 +1,23 @@
+name: 219-env-state-files
+on: workflow_dispatch
+jobs:
+  files:
+    runs-on: self-hosted
+    steps:
+      - name: "produce"
+        env:
+          GITHUB_ARTIFACTS: ""
+        run: |
+          echo "multi-line<<DELIM" >> "$GITHUB_ENV"
+          echo "line one" >> "$GITHUB_ENV"
+          echo "line two" >> "$GITHUB_ENV"
+          echo "DELIM" >> "$GITHUB_ENV"
+          echo "state-token=tok-${{ github.run_attempt }}" >> "$GITHUB_STATE"
+          echo "after state"
+      - name: "consume"
+        run: |
+          echo "multi-line is:"
+          echo "$multi_line"
+      - name: "list-artifacts-env"
+        run: |
+          if [ -n "$GITHUB_ARTIFACTS_LIST" ]; then echo "list present"; else echo "list empty (flag off)"; fi

@@ -1,0 +1,11 @@
+name: 212-docker-action
+on: workflow_dispatch
+jobs:
+  docker-action:
+    runs-on: self-hosted
+    steps:
+
+      - with:
+          greeting: "from-docker-action"
+        uses: "./.github/actions/docker-hello"
+      - run: "echo \"after docker action\""
