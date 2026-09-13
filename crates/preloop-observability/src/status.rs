@@ -47,6 +47,16 @@ pub struct RunsSnapshot {
 }
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct ActiveRunSnapshot {
+    pub run_id: String,
+    pub workflow: String,
+    pub status: String,
+    pub event: String,
+    pub started_at: Option<DateTime<Utc>>,
+    pub assigned_runners: Vec<String>,
+}
+
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct JobsSnapshot {
     pub ready: u32,
     pub dependency_blocked: u32,
@@ -89,6 +99,21 @@ pub struct RunnersSnapshot {
     pub stale: u32,
     pub max_poll_age_seconds: Option<f64>,
     pub max_lease_age_seconds: Option<f64>,
+    /// Live runner -> job pairings. Empty when nothing is executing; this is
+    /// the answer to "which job is on which runner" that pool counts alone
+    /// cannot give.
+    #[serde(default)]
+    pub assignments: Vec<RunnerAssignment>,
+}
+
+/// One live runner -> job pairing: which job a busy runner is executing and
+/// for how long. Inverted from the assignment table at snapshot time.
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct RunnerAssignment {
+    pub runner_id: i64,
+    pub run_id: String,
+    pub job_id: String,
+    pub assigned_seconds_ago: f64,
 }
 
 // ---------------------------------------------------------------------------
@@ -366,6 +391,7 @@ pub struct StorageSnapshot {
 }
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[serde(default)]
 pub struct GithubSnapshot {
     pub configured: bool,
     pub last_webhook_at: Option<DateTime<Utc>>,
@@ -455,6 +481,8 @@ pub struct OperationalSnapshot {
     pub overall: Overall,
     pub service: ServiceSnapshot,
     pub runs: RunsSnapshot,
+    #[serde(default)]
+    pub active_runs: Vec<ActiveRunSnapshot>,
     pub jobs: JobsSnapshot,
     pub concurrency: ConcurrencySnapshot,
     pub scheduler: SchedulerSnapshot,
@@ -488,6 +516,7 @@ impl Default for OperationalSnapshot {
                 shutdown_requested: false,
             },
             runs: RunsSnapshot::default(),
+            active_runs: Vec::new(),
             jobs: JobsSnapshot::default(),
             concurrency: ConcurrencySnapshot::default(),
             scheduler: SchedulerSnapshot::default(),

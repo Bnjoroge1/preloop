@@ -351,6 +351,9 @@ pub(crate) struct TaskAgentJobRequestRecord {
     pub(crate) locked_until: String,
     /// When a runner removed this job from the ready queue.
     pub(crate) claimed_at: Option<std::time::SystemTime>,
+    /// Runner identity that claimed this request. Kept after completion so
+    /// late AgentRequest reads and retries remain bound to the original owner.
+    pub(crate) owner_runner_id: Option<i64>,
     /// When the runner request was handed to the session.
     pub(crate) started_at: Option<std::time::SystemTime>,
     pub(crate) last_renewed_at: Option<std::time::SystemTime>,
@@ -416,6 +419,9 @@ pub(crate) struct QueuedJob {
     /// Explicit runner group from object-valued `runs-on`.
     pub(crate) runner_group: Option<String>,
     pub(crate) message: azdo::AgentJobRequestMessage,
+    /// Original `environment:` value, retained until `needs` is hydrated.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(crate) environment: Option<serde_json::Value>,
     /// Raw job-level concurrency (evaluated when the job becomes ready).
     pub(crate) concurrency: Option<preloop_gha_parser::Concurrency>,
     /// Matrix values for this expansion (for concurrency expression eval).
@@ -635,6 +641,10 @@ pub(crate) struct WebhookRedeliveryRecord {
 pub(crate) struct PendingCache {
     pub(crate) key: String,
     pub(crate) version: String,
+    #[serde(default)]
+    pub(crate) namespace: String,
+    #[serde(default)]
+    pub(crate) job_backend_id: String,
     pub(crate) bytes: Vec<u8>,
 }
 

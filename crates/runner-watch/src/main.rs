@@ -133,6 +133,9 @@ struct ConformArgs {
     /// Skip cargo test --workspace before replay.
     #[arg(long)]
     skip_cargo_test: bool,
+    /// Optional cell below the version directory, for example gh-official.
+    #[arg(long)]
+    cell: Option<String>,
     /// Also gate normalized response *values* (finding #4) for every shared
     /// endpoint except known-volatile ones (tokens, OIDC, signed blob URLs,
     /// connectionData). Off by default: the default gate preserves the legacy
@@ -1863,7 +1866,10 @@ async fn conform(config: &Config, args: &ConformArgs) -> anyhow::Result<()> {
         }
     }
     let version_dir = normalize_version_dir(&args.runner);
-    let golden_root = config.general.golden_dir.join(&version_dir);
+    let mut golden_root = config.general.golden_dir.join(&version_dir);
+    if let Some(cell) = &args.cell {
+        golden_root = golden_root.join(cell);
+    }
     if !golden_root.exists() {
         bail!("golden dir not found: {}", golden_root.display());
     }
@@ -3106,15 +3112,32 @@ fn write_conformance_summary(
         ));
     }
     lines.push(String::new());
+    // List the diverging scenarios first and mark them inline. Previously
+    // every scenario was listed identically, so a red report told a reader
+    // the count but not which ones — and the only file naming them
+    // (conformance-fail.toml) was not part of the uploaded CI artifact.
+    let failed: std::collections::BTreeSet<&str> = failures
+        .iter()
+        .map(|(scenario, _)| scenario.as_str())
+        .collect();
+    if !failed.is_empty() {
+        lines.push("Diverging:".to_string());
+        for scenario in &failed {
+            lines.push(format!("- ❌ {scenario}"));
+        }
+        lines.push(String::new());
+    }
     for report in reports {
-        lines.push(format!(
-            "- [{}]({})",
-            report
-                .file_stem()
-                .and_then(OsStr::to_str)
-                .unwrap_or("scenario"),
-            report.display()
-        ));
+        let scenario = report
+            .file_stem()
+            .and_then(OsStr::to_str)
+            .unwrap_or("scenario");
+        let mark = if failed.contains(scenario) {
+            "❌ "
+        } else {
+            ""
+        };
+        lines.push(format!("- {mark}[{scenario}]({})", report.display()));
     }
     lines.push(String::new());
     lines.push("## Replay methodology and known gaps".to_string());
@@ -3548,6 +3571,7 @@ async fn run_all(config: &Config, args: &RunArgs) -> anyhow::Result<()> {
                 preloop_url: preloop_url.clone(),
                 scenario: None,
                 skip_cargo_test: args.skip_cargo_test,
+                cell: None,
                 value_gate_strict: false,
             },
         )

@@ -1359,6 +1359,41 @@ fn node_externals_at(runner_root: &str) -> Vec<Vec<String>> {
     .collect()
 }
 
+/// Default unprivileged account the guest runner drops into, matching the
+/// hosted `runner` user. [`RunnerPoolConfig::runner_user`] may override it.
+pub const DEFAULT_RUNNER_USER: &str = "runner";
+/// Default UID for [`DEFAULT_RUNNER_USER`], matching the hosted image.
+pub const DEFAULT_RUNNER_UID: u32 = 1001;
+
+/// Create the unprivileged runner account and hand it every path a job writes.
+///
+/// Part of [`base_install_script`] — and therefore of the environment
+/// fingerprint — on purpose. Run as a separate post-bake `exec`, a change here
+/// left the fingerprint untouched, so the pool adopted the previous golden and
+/// silently served jobs an account the new code no longer matched. Keep every
+/// step idempotent: the same script runs against an already-prepared rootfs.
+///
+/// The Rust homes are the subtle ones. `ToolchainLayer::Rust` installs them as
+/// root at fixed system addresses (`/usr/local/rustup`, `/usr/local/cargo`)
+/// that `guest_env_prefix` exports to every user, so without this ownership
+/// the runner cannot write them and `rustup toolchain install` dies with
+/// `could not create home directory`.
+pub fn runner_account_script(user: &str, uid: u32) -> String {
+    format!(
+        "getent passwd {user} >/dev/null 2>&1 || useradd -m -u {uid} -s /bin/bash {user} 2>/dev/null; \
+         printf '%s\\n' '{user} ALL=(ALL) NOPASSWD: ALL' > /etc/sudoers.d/preloop-{user} \
+           && chmod 0440 /etc/sudoers.d/preloop-{user}; \
+         mkdir -p /run/user/{uid} /opt/hostedtoolcache /usr/local/rustup /usr/local/cargo; \
+         chown {uid}:{uid} /run/user/{uid} {root} 2>/dev/null; \
+         chown -R {uid}:{uid} /usr/local/rustup /usr/local/cargo 2>/dev/null; \
+         chmod -R 777 /opt/hostedtoolcache 2>/dev/null; \
+         grep -q AGENT_TOOLSDIRECTORY /etc/environment 2>/dev/null || \
+           printf 'AGENT_TOOLSDIRECTORY=/opt/hostedtoolcache\\nRUNNER_TOOL_CACHE=/opt/hostedtoolcache\\n' >> /etc/environment; \
+         getent group docker >/dev/null 2>&1 && usermod -aG docker {user} 2>/dev/null || true",
+        root = RUNNER_ROOT
+    )
+}
+
 /// The guest bootstrap script, one shell round trip.
 ///
 /// Every `exec` is a host process spawn plus a vsock round trip, and this runs
@@ -1504,8 +1539,10 @@ pub fn base_install_script() -> String {
          install -d -m 0777 /opt/hostedtoolcache && \
          printf 'AGENT_TOOLSDIRECTORY=/opt/hostedtoolcache\\nRUNNER_TOOL_CACHE=/opt/hostedtoolcache\\n' >> /etc/environment && \
          (useradd -m -u 1000 -s /bin/bash ubuntu 2>/dev/null || true) && \
+         ({runner_account}) && \
          apt-get clean && \
          rm -rf /usr/share/doc/* /usr/share/man/* /usr/share/info/*",
+        runner_account = runner_account_script(DEFAULT_RUNNER_USER, DEFAULT_RUNNER_UID),
         docker_packages = docker_apt_packages(),
         compiler_packages = compiler_apt_packages(),
         base_packages_pinned = base_packages_pinned()
@@ -1758,7 +1795,6 @@ async fn write_bake_manifest<P: VmProvider>(
 }
 
 /// PATH the guest runner process exports to every step.
-///
 /// Hosted images carry the toolchain bin directories on the runner's own PATH,
 /// which is what makes `cargo install`-style actions work: `taiki-e/install-action`
 /// drops `cargo-hack` in `$CARGO_HOME/bin` and the next step runs `cargo hack`.
@@ -1766,22 +1802,18 @@ async fn write_bake_manifest<P: VmProvider>(
 /// has to install rustup itself, so on an image that already has rustup — ours,
 /// and GitHub's — the directory is on PATH or the tool is simply unreachable.
 ///
-/// The cargo bin dir must match the user the runner executes steps as: a root
-/// runner (no switching) installs into `/root/.cargo`, a switched runner into
-/// `/home/<user>/.cargo`. The root-only path must never be exported to an
-/// unprivileged runner — `/root` is 0700, so every tool lookup stats it and
-/// gets EACCES (nodejs/ci: `EACCES: permission denied, stat
-/// '/root/.cargo/bin/git'`), and the Go layer untars into the world-readable
-/// `/usr/local/go`. Absent directories cost nothing.
-pub fn guest_runner_path(config: &RunnerPoolConfig) -> String {
-    let cargo_bin = match config.runner_user.as_deref() {
-        None | Some("root") => "/root/.cargo/bin".to_owned(),
-        Some(user) => format!("/home/{user}/.cargo/bin"),
-    };
-    format!(
-        "{cargo_bin}:/usr/local/go/bin:/usr/local/sbin:/usr/local/bin:\
-         /usr/sbin:/usr/bin:/sbin:/bin"
-    )
+/// The cargo bin dir is the fixed system address `/usr/local/cargo/bin`,
+/// matching the exported `CARGO_HOME` (see `guest_env_prefix`): it is
+/// identical for root and switched runners by construction. A per-user
+/// `$HOME/.cargo/bin` here would reintroduce the EACCES trap the homes fix
+/// removes — `/root` is 0700, so exporting `/root/.cargo/bin` to an
+/// unprivileged runner makes every tool lookup fail statting it
+/// (nodejs/ci: `EACCES: permission denied, stat '/root/.cargo/bin/git'`).
+/// Absent directories cost nothing.
+pub fn guest_runner_path(_config: &RunnerPoolConfig) -> String {
+    "/usr/local/cargo/bin:/usr/local/go/bin:/usr/local/sbin:/usr/local/bin:\
+     /usr/sbin:/usr/bin:/sbin:/bin"
+        .to_owned()
 }
 
 /// `env` prefix for guest runner invocations, empty when nothing needs setting.
@@ -1820,6 +1852,17 @@ fn guest_env_prefix(config: &RunnerPoolConfig, name: &MachineName) -> Vec<String
         env.push(format!("PRELOOP_FAILURE_MARKER={GUEST_FAILURE_MARKER}"));
         env.push(format!("PRELOOP_PAUSE_MARKER={GUEST_PAUSE_MARKER}"));
     }
+    // Rust toolchain homes. rustup resolves toolchains under RUSTUP_HOME and
+    // shims under CARGO_HOME, both defaulting to the *calling* user's $HOME.
+    // The bake installs as root while job steps run as the unprivileged
+    // runner user, so a $HOME-derived location is invisible across that
+    // boundary (/root is 0700). The bake therefore installs to these fixed
+    // system addresses (see ToolchainLayer::Rust install_commands), and they
+    // are exported here so every user resolves the identical toolchain.
+    // Order is irrelevant (env entries are independent); they sit last so
+    // the historical PATH/MACHINE_NAME-first prefix is undisturbed.
+    env.push("RUSTUP_HOME=/usr/local/rustup".to_owned());
+    env.push("CARGO_HOME=/usr/local/cargo".to_owned());
     if !env.is_empty() {
         env.insert(0, "/usr/bin/env".to_owned());
     }
@@ -2955,11 +2998,46 @@ impl<P: VmProvider + 'static> RunnerPool<P> {
         if stock_base || official_base {
             for layer in curated_toolchains() {
                 for command in layer.install_commands() {
-                    if let Err(error) = self.provider.exec(&name, &command).await {
+                    let output = self.provider.exec(&name, &command).await?;
+                    if output.exit_code != 0 {
                         let _ = self.provider.delete(&name).await;
-                        return Err(error.into());
+                        return Err(OrchestratorError::Config(format!(
+                            "toolchain install failed for {layer} (exit {}): {}",
+                            output.exit_code,
+                            String::from_utf8_lossy(&output.stderr)
+                                .lines()
+                                .last()
+                                .unwrap_or("unknown error")
+                        )));
                     }
                 }
+            }
+            // Toolchain installation runs as root and recreates writable
+            // rustup state beneath these homes. Re-apply runner ownership
+            // after every layer; doing it only in the base script leaves
+            // `/usr/local/rustup/tmp` root-owned and job-time rustup updates
+            // fail with EACCES.
+            let output = self
+                .provider
+                .exec(
+                    &name,
+                    &[
+                        "sh".to_owned(),
+                        "-c".to_owned(),
+                        runner_account_script(DEFAULT_RUNNER_USER, DEFAULT_RUNNER_UID),
+                    ],
+                )
+                .await?;
+            if output.exit_code != 0 {
+                let _ = self.provider.delete(&name).await;
+                return Err(OrchestratorError::Config(format!(
+                    "final runner-account ownership failed (exit {}): {}",
+                    output.exit_code,
+                    String::from_utf8_lossy(&output.stderr)
+                        .lines()
+                        .last()
+                        .unwrap_or("unknown error")
+                )));
             }
         }
         // Bake the externals *pointer*, not the externals: the packed rootfs
@@ -2989,6 +3067,42 @@ impl<P: VmProvider + 'static> RunnerPool<P> {
                     .last()
                     .unwrap_or("unknown")
             )));
+        }
+        // `base_install_script` already prepared the default account, and that
+        // fragment is fingerprinted. Re-run it here only for a configured
+        // non-default user, whose identity the fingerprint cannot know: the
+        // script is idempotent, so the default case is a cheap no-op skip.
+        let runner_user = self
+            .config
+            .runner_user
+            .as_deref()
+            .unwrap_or(DEFAULT_RUNNER_USER);
+        let runner_uid = self.config.runner_uid.unwrap_or(DEFAULT_RUNNER_UID);
+        if runner_user != DEFAULT_RUNNER_USER || runner_uid != DEFAULT_RUNNER_UID {
+            let output = self
+                .provider
+                .exec(
+                    &name,
+                    &[
+                        "sh".to_owned(),
+                        "-c".to_owned(),
+                        runner_account_script(runner_user, runner_uid),
+                    ],
+                )
+                .await?;
+            if output.exit_code != 0 {
+                // A golden whose runner account is wrong cannot run a job:
+                // every step fails on permissions, which reads as flaky CI.
+                let _ = self.provider.delete(&name).await;
+                return Err(OrchestratorError::Config(format!(
+                    "baking runner account {runner_user} failed (exit {}): {}",
+                    output.exit_code,
+                    String::from_utf8_lossy(&output.stderr)
+                        .lines()
+                        .last()
+                        .unwrap_or("unknown")
+                )));
+            }
         }
         let env_spec = EnvironmentSpec::for_base(self.config.base_image.clone());
         if let Err(error) = write_bake_manifest(self.provider.as_ref(), &name, &env_spec).await {
@@ -3776,6 +3890,11 @@ async fn provision_slot<P: VmProvider + 'static>(
             })
         }
         Err(error) => {
+            // A configure failure can happen after the guest has already
+            // registered the runner. Purge by machine name before deleting
+            // the VM so that registration cannot outlive its provisioned
+            // host and retain a live listen credential.
+            notify_runner_gone(config, &name).await;
             if let Some(ps) = &config.pool_status {
                 ps.record_provision_failure();
             }
@@ -4637,6 +4756,7 @@ async fn provision_runner<P: VmProvider + 'static>(
     // guest cannot fabricate a pairing because only this exact configure
     // invocation ever sees the token value.
     let mut provision_token_file: Option<PathBuf> = None;
+    let mut provision_token_value: Option<String> = None;
     if let Some(pending) = &config.pending_registrations {
         let token = uuid::Uuid::new_v4().to_string();
         let dir = config
@@ -4649,13 +4769,14 @@ async fn provision_runner<P: VmProvider + 'static>(
         }) {
             Ok(path) => {
                 if let Ok(mut guard) = pending.write() {
-                    guard.insert(token.clone(), std::time::SystemTime::now());
+                    let issued_at = std::time::SystemTime::now();
+                    guard.insert(token.clone(), issued_at);
                     // Mirror the mint into the consolidated status handle so
                     // `PoolStatus::snapshot().pending_registrations` counts
                     // tokens issued after startup too. The server-side
                     // consume removes it from both stores.
                     if let Some(ps) = &config.pool_status {
-                        ps.insert_pending(token, std::time::SystemTime::now());
+                        ps.insert_pending(token.clone(), issued_at);
                         // Same 600s window as the legacy pending-map prune
                         // below, so stale tokens don't inflate
                         // `pending_registrations` forever.
@@ -4668,6 +4789,7 @@ async fn provision_runner<P: VmProvider + 'static>(
                             .unwrap_or(false)
                     });
                 }
+                provision_token_value = Some(token);
                 secrets.push((
                     "PRELOOP_PROVISION_TOKEN".to_owned(),
                     SecretSource::HostFile(path.clone()),
@@ -4690,13 +4812,26 @@ async fn provision_runner<P: VmProvider + 'static>(
             }
         }
     }
-    provider
+    let configure_result = provider
         .exec_with_secret_env(name, &as_runner_user(config, &configure), &secrets)
-        .await?;
+        .await;
     drop(staged);
-    if let Some(path) = provision_token_file {
+    if configure_result.is_err() {
+        if let Some(token) = provision_token_value.as_deref() {
+            if let Some(pending) = &config.pending_registrations {
+                if let Ok(mut guard) = pending.write() {
+                    guard.remove(token);
+                }
+            }
+            if let Some(ps) = &config.pool_status {
+                ps.remove_pending(token);
+            }
+        }
+    }
+    if let Some(path) = provision_token_file.take() {
         let _ = std::fs::remove_file(path);
     }
+    configure_result?;
 
     // Bring the container engine up before the runner accepts work, so a job
     // declaring `container:` or `services:` does not race the daemon. Failure
@@ -5515,9 +5650,21 @@ chmod +x "$dest/bin/node"
             .expect("the runner is launched with an explicit PATH");
         let entries: Vec<&str> = path.split(':').collect();
         assert!(
-            entries.contains(&"/root/.cargo/bin"),
+            entries.contains(&"/usr/local/cargo/bin"),
             "cargo-installed binaries must be reachable: {path}"
         );
+        // Toolchain homes are fixed system addresses, identical for root
+        // and switched runners: a $HOME-derived location would be invisible
+        // across the bake-user/step-user boundary (/root is 0700).
+        for expected in [
+            "RUSTUP_HOME=/usr/local/rustup",
+            "CARGO_HOME=/usr/local/cargo",
+        ] {
+            assert!(
+                env.iter().any(|entry| entry == expected),
+                "guest env must pin {expected}: {env:?}"
+            );
+        }
         assert!(
             entries.contains(&"/usr/local/go/bin"),
             "the go layer untars into /usr/local/go: {path}"

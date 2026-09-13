@@ -286,13 +286,15 @@ impl PgStore {
     ) -> anyhow::Result<()> {
         let blob = self.cipher.seal(&serde_json::to_vec(&meta)?)?;
         tx.execute(
-            "INSERT INTO runtime_snapshots(snapshot_id, format_version, meta_blob, written_at_us)
-             VALUES (1, $1, $2, $3)
+            "INSERT INTO runtime_snapshots(snapshot_id, format_version, meta_blob, written_at_us, revision)
+             VALUES (1, $1, $2, $3, $4)
              ON CONFLICT(snapshot_id) DO UPDATE SET
                format_version = EXCLUDED.format_version,
                meta_blob = EXCLUDED.meta_blob,
-               written_at_us = EXCLUDED.written_at_us",
-            &[&(SNAPSHOT_FORMAT as i64), &blob, &now_us()],
+               written_at_us = EXCLUDED.written_at_us,
+               revision = EXCLUDED.revision
+             WHERE EXCLUDED.revision > runtime_snapshots.revision",
+            &[&(SNAPSHOT_FORMAT as i64), &blob, &now_us(), &(meta.revision as i64)],
         )
         .await?;
         Ok(())

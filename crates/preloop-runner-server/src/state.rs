@@ -188,6 +188,13 @@ impl AppState {
     pub(crate) fn job_uuid_from_token(&self, token: &str) -> Option<uuid::Uuid> {
         self.results_job_from_token(token).map(|(_, job)| job)
     }
+    pub(crate) fn job_runtime_claims_from_token(
+        &self,
+        token: &str,
+    ) -> Option<crate::auth::JobRuntimeClaims> {
+        let (plan_id, job_id) = self.results_job_from_token(token)?;
+        Some(crate::auth::JobRuntimeClaims { plan_id, job_id })
+    }
 
     /// Agent job UUID a debug-worker token was minted for.
     ///
@@ -269,11 +276,11 @@ impl AppState {
 ///
 /// `Strict` is the default and the only safe choice for a deployment reachable
 /// over a network: it accepts exactly the system credential. `Permissive`
-/// accepts any non-empty credential — matching what GitHub itself cannot do
-/// for us (validate third-party registration tokens) but recreating the
-/// original "anyone who can reach the port can register a runner" hole, so it
-/// exists only for the conformance harness, which replays real GitHub-issued
-/// registration tokens this control plane could never have minted.
+/// accepts any non-empty credential on the TCP registration endpoint —
+/// matching what GitHub itself cannot do for us (validate third-party
+/// registration tokens) but recreating the original "anyone who can reach the
+/// port can register a runner" hole. The mounted socket remains strict even
+/// in permissive mode, so workflow code cannot mint a new runner identity.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum RegistrationPolicy {
     /// Only the system credential may register a runner.
@@ -512,6 +519,10 @@ pub struct AppState {
     /// global `inner` mutex, and never acquire `inner` while holding it —
     /// the secrets handlers touch neither ordering partner.
     pub(crate) secret_mutation: Arc<Mutex<()>>,
+    /// Serializes full-state snapshots with the snapshot capture. A snapshot
+    /// taken before another request mutates `inner` must not be allowed to
+    /// overwrite that newer mutation after an async store write completes.
+    pub(crate) store_mutation: Arc<Mutex<()>>,
     /// The config file this engine is pinned to, resolved once at startup.
     ///
     /// Every engine-side read and write of configuration goes through this
@@ -1061,6 +1072,7 @@ impl AppState {
             scheduler: None,
             secrets,
             secret_mutation: Arc::new(Mutex::new(())),
+            store_mutation: Arc::new(Mutex::new(())),
             github_app,
             github_apps,
             dispatch_token_cache: Arc::new(crate::dispatch_auth::InstallationTokenCache::default()),
@@ -1410,6 +1422,8 @@ impl InnerState {
 
 #[derive(Default)]
 pub(crate) struct InnerState {
+    /// Snapshot sequence allocated while the state mutex is held; restored from metadata.
+    pub(crate) metadata_revision: std::sync::atomic::AtomicU64,
     pub(crate) runs: BTreeMap<RunId, RunRecord>,
     pub(crate) workflow_run_counters: BTreeMap<String, u64>,
     /// Webhook run submissions currently building outside the state lock.

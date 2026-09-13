@@ -9,6 +9,53 @@ Releases before v0.27.0 predate the changelog.
 
 ## [Unreleased]
 
+### Fixed
+
+- Runner teardown now releases stale job bindings immediately, status snapshots
+  expose active runs and stalled claimable queues, and GitHub Check Run updates
+  report every annotation in API-sized batches.
+- CI jobs target the cpane microVM pool; only release packaging and the
+  aarch64 golden bake use GitHub-hosted runners.
+- A restart no longer leaves the pool full of phantom capacity or fails old
+  queued jobs while replacement VMs are warming. Persisted ephemeral runner
+  identities are purged before the server accepts traffic, unfinished request
+  correlations are released from dead runner ownership before redelivery, and
+  pre-provisioned successors without polling sessions are no longer reported as idle. A run
+  left `in_progress` with nothing executing it raises a
+  `run_in_progress_without_execution` condition instead of vanishing from the
+  operator's view.
+
+## [0.32.7] - 2026-09-10
+
+### Fixed
+
+- The release golden bake works again. `SMOLVM_MAX_IMAGE_BYTES` had been
+  dropped from both architecture steps by a comment-only cleanup, so every
+  `build-golden` attempt aborted in `smolvm create`: the pinned runner-large
+  base unpacks to roughly 17 GiB through `docker save`, over smolvm's 8 GiB
+  default local-archive cap. No golden had been produced since 2026-08-10.
+- The aarch64 golden builds on hosted Apple Silicon again. It had been
+  repointed at a `[self-hosted, macOS, ARM64]` runner that was never
+  registered, so the job was never dispatched and GitHub cancelled it at the
+  24-hour ceiling on every release since 2026-08-09.
+- CI Rust jobs install the pinned 1.97 toolchain and `lld` again. The
+  prebaked-golden change that removed them landed while the bake was broken,
+  leaving jobs to fail immediately with `cargo: command not found`. The
+  toolchain step now precedes `rust-cache`, whose `rustc -vV` probe needs it.
+- Legacy runner compatibility aliases now require runner-management or
+  one-time provisioning credentials for registration in strict production mode,
+  bind sessions and message polling to the verified runner identity, and reject
+  unauthenticated reporting traffic. The JSON OAuth compatibility path now
+  requires the trusted system credential instead of treating a client id as
+  proof; permissive registration remains an explicit TCP-only conformance
+  opt-in, and the mounted socket stays strict.
+
+### Changed
+
+- Both golden bake jobs carry an explicit `timeout-minutes`, so a job that is
+  never dispatched fails in minutes rather than occupying a runner slot for a
+  full day.
+
 ## [0.32.5] - 2026-09-02
 
 ### Added
@@ -711,7 +758,8 @@ live-logs (8), and golden (8).
 Bootstrap the cargo-dist release pipeline for `preloop-cli` (binary
 installers for macOS and Linux).
 
-[Unreleased]: https://github.com/preloopdev/preloop/compare/v0.32.5...HEAD
+[Unreleased]: https://github.com/preloopdev/preloop/compare/v0.32.7...HEAD
+[0.32.7]: https://github.com/preloopdev/preloop/compare/v0.32.5...v0.32.7
 [0.32.5]: https://github.com/preloopdev/preloop/compare/v0.32.0...v0.32.5
 [0.30.3]: https://github.com/preloopdev/preloop/compare/v0.30.2...v0.30.3
 [0.29.8]: https://github.com/preloopdev/preloop/compare/v0.29.7...v0.29.8

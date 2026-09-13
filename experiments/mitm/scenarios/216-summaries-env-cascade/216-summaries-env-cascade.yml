@@ -1,0 +1,28 @@
+name: 216-summaries-env-cascade
+on: workflow_dispatch
+
+defaults:
+  run:
+    shell: "bash"
+    working-directory: "/tmp"
+
+jobs:
+  summary:
+    runs-on: self-hosted
+    steps:
+      - run: |
+          echo "### Edge Case Summary ${{ github.run_number }}" >> "$GITHUB_STEP_SUMMARY"
+          echo "" >> "$GITHUB_STEP_SUMMARY"
+          echo "| layer | value |" >> "$GITHUB_STEP_SUMMARY"
+          echo "|---|---|" >> "$GITHUB_STEP_SUMMARY"
+          echo "| LAYER1 | $LAYER1 |" >> "$GITHUB_STEP_SUMMARY"
+          pwd
+          echo "LAYER2=step" >> "$GITHUB_ENV"
+          echo "$PATH" | tr ':' '\n' | head -5
+      - run: |
+          echo "LAYER1=$LAYER1 LAYER2=$LAYER2"
+          echo "$PWD" # should be /tmp from defaults
+          echo "new-path" >> "$GITHUB_PATH"
+      - run: |
+          echo "PATH contains new-path: $(echo $PATH | grep -c new-path)"
+        working-directory: "${{ github.workspace }}"

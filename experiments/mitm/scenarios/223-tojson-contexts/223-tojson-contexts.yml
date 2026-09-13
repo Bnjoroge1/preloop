@@ -1,0 +1,23 @@
+name: 223-tojson-contexts
+on: workflow_dispatch
+jobs:
+  contexts:
+    runs-on: self-hosted
+    steps:
+
+      - run: "echo \"hello\""
+      - run: |
+          echo "needs-context=${{ toJSON(needs) }}"
+          echo "steps-context=${{ toJSON(steps) }}"
+          echo "job-context=${{ toJSON(job) }}"
+          echo "runner-context=${{ toJSON(runner) }}"
+          echo "github-slice=${{ toJSON(github.event) }}"
+      - run: "exit 1"
+
+        continue-on-error: true
+      - run: "echo \"${{ toJSON(steps.two) }}\""
+      - name: "env-in-if"
+        if: "success() && (env.WHO == 'world')"
+        env:
+          WHO: "world"
+        run: "echo \"env if worked\""

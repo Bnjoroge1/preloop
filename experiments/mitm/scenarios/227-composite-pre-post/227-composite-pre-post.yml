@@ -1,0 +1,27 @@
+name: 227-composite-pre-post
+on: workflow_dispatch
+jobs:
+  post-even-on-fail:
+    runs-on: self-hosted
+    steps:
+
+
+
+
+
+
+
+
+
+
+
+
+      - with:
+          fail-main: "true"
+        uses: "./.github/actions/lifecycle"
+      - run: "echo \"unreachable\""
+
+  replay-extra-2:
+    runs-on: self-hosted
+    steps:
+      - run: "echo \"replay placeholder 2\""

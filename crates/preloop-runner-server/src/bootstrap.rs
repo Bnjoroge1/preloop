@@ -300,6 +300,15 @@ pub(crate) async fn reap_once(shared: &Arc<SharedState>) {
             .map(|age| age >= MAX_QUEUED_GRACE)
             .unwrap_or(true);
         let grace = if pool_preparing {
+            // A restart restores the queue's original enqueue timestamps but
+            // destroys every pool VM. Give the replacement pool one process-
+            // local warm window before applying the durable queue-age ceiling;
+            // otherwise the first reaper tick fails every old queued job while
+            // the golden and its runners are demonstrably still starting.
+            if shared.state.started_at.elapsed() < MAX_QUEUED_GRACE {
+                inner.queued_at.remove(&key);
+                continue;
+            }
             // The pool is warming or booting a runner that may serve this
             // job, so hold the grace window rather than failing a job whose
             // runner is genuinely on the way. Bound the hold by
@@ -516,6 +525,13 @@ pub(crate) async fn reap_once(shared: &Arc<SharedState>) {
                 reason: Some(reason.clone()),
             })
             .await;
+        crate::github::report_check_run_completed(
+            shared,
+            *run_id,
+            job_id,
+            ExecutionStatus::Failure,
+        )
+        .await;
     }
 
     // Process completions for disconnected runners
@@ -549,6 +565,7 @@ async fn run_background_reaper(shared: Arc<SharedState>) {
 /// Everything the operational snapshot reads from `inner`, collected under a
 /// single lock acquisition. The 5s sampler and the startup seed after a store
 /// restore both build their snapshots from this, so the two cannot drift.
+#[derive(Default)]
 struct SnapshotInputs {
     queue_len: usize,
     pending_jobs_len: usize,
@@ -557,6 +574,10 @@ struct SnapshotInputs {
     runs_queued: u32,
     runs_in_progress: u32,
     runs_completed: u32,
+    active_runs: Vec<preloop_observability::status::ActiveRunSnapshot>,
+    /// `in_progress` runs with no queued, claimed, or pending job and no
+    /// assigned runner — nothing is executing them.
+    orphaned_run_ids: Vec<String>,
     registered: u32,
     /// Distinct session ids across the modern broker map and the legacy map
     /// (every session creation path inserts into both, so the sum would
@@ -565,6 +586,10 @@ struct SnapshotInputs {
     runner_idle: u32,
     runner_busy: u32,
     runner_stale: u32,
+    runner_assignments: Vec<preloop_observability::status::RunnerAssignment>,
+    oldest_ready_seconds: Option<f64>,
+    oldest_ready_run_id: Option<String>,
+    oldest_ready_job_id: Option<String>,
     /// Per queued job, in queue order: the `runs-on` labels and any explicit
     /// runner group. Only this label surface is needed for claimability —
     /// never the full message payload.
@@ -585,19 +610,109 @@ struct SnapshotInputs {
     released_bindings: u64,
 }
 
-/// Collect [`SnapshotInputs`] from `inner` while the state lock is held.
-fn collect_snapshot_inputs(inner: &InnerState) -> SnapshotInputs {
-    let mut runs_queued = 0u32;
-    let mut runs_in_progress = 0u32;
-    let mut runs_completed = 0u32;
-    for run in inner.runs.values() {
-        match run.status {
-            ExecutionStatus::Queued => runs_queued += 1,
-            ExecutionStatus::InProgress => runs_in_progress += 1,
-            s if s.is_terminal() => runs_completed += 1,
-            _ => {}
+fn count_run_statuses(statuses: impl IntoIterator<Item = ExecutionStatus>) -> (u32, u32, u32) {
+    let mut queued = 0;
+    let mut in_progress = 0;
+    let mut completed = 0;
+    for status in statuses {
+        match status {
+            ExecutionStatus::Queued => queued += 1,
+            ExecutionStatus::Pending | ExecutionStatus::InProgress => in_progress += 1,
+            ExecutionStatus::Success
+            | ExecutionStatus::Failure
+            | ExecutionStatus::Skipped
+            | ExecutionStatus::Cancelled => completed += 1,
         }
     }
+    (queued, in_progress, completed)
+}
+
+/// Collect [`SnapshotInputs`] from `inner` while the state lock is held.
+fn collect_snapshot_inputs(inner: &InnerState) -> SnapshotInputs {
+    let (runs_queued, runs_in_progress, runs_completed) =
+        count_run_statuses(inner.runs.values().map(|run| run.status));
+    let mut runner_ids_by_run: std::collections::BTreeMap<RunId, std::collections::BTreeSet<i64>> =
+        std::collections::BTreeMap::new();
+    for (key, assignment) in &inner.job_assignments {
+        if let Some(runner_id) = assignment.runner_id {
+            runner_ids_by_run
+                .entry(key.0)
+                .or_default()
+                .insert(runner_id);
+        }
+    }
+    for request in inner.job_requests.values() {
+        if request.result.is_none() {
+            if let Some(runner_id) = request.owner_runner_id {
+                runner_ids_by_run
+                    .entry(request.run_id)
+                    .or_default()
+                    .insert(runner_id);
+            }
+        }
+    }
+    let mut active_runs: Vec<_> = inner
+        .runs
+        .values()
+        .filter(|run| !run.status.is_terminal())
+        .map(|run| {
+            let assigned_runners = runner_ids_by_run
+                .get(&run.run_id)
+                .into_iter()
+                .flatten()
+                .filter_map(|runner_id| inner.runners.get(runner_id))
+                .map(|runner| runner.name.clone())
+                .collect();
+            preloop_observability::status::ActiveRunSnapshot {
+                run_id: run.run_id.to_string(),
+                workflow: run.workflow_path_str.clone(),
+                status: serde_json::to_value(run.status)
+                    .ok()
+                    .and_then(|value| value.as_str().map(str::to_owned))
+                    .unwrap_or_else(|| "unknown".to_owned()),
+                event: run.event.clone(),
+                started_at: run.started_at,
+                assigned_runners,
+            }
+        })
+        .collect();
+    active_runs.sort_by(|left, right| {
+        right
+            .started_at
+            .cmp(&left.started_at)
+            .then_with(|| right.run_id.cmp(&left.run_id))
+    });
+    // A run can sit `in_progress` while nothing is executing it: its claim
+    // leaked, its machine died, or a restart dropped the pairing. Those runs
+    // are exactly what an operator hunts for during a stall, so name them
+    // instead of leaving the aggregate counts to imply progress.
+    let live_run_ids: std::collections::BTreeSet<RunId> = inner
+        .queue
+        .iter()
+        .map(|job| job.run_id)
+        .chain(inner.claimed_jobs.keys().map(|(run_id, _)| *run_id))
+        .chain(inner.pending_jobs.iter().map(|job| job.run_id))
+        .collect();
+    let orphaned_run_ids: Vec<String> = active_runs
+        .iter()
+        .filter(|run| run.status == "in_progress" && run.assigned_runners.is_empty())
+        .filter(|run| {
+            run.run_id
+                .parse::<uuid::Uuid>()
+                .map(RunId)
+                .is_ok_and(|run_id| !live_run_ids.contains(&run_id))
+        })
+        .map(|run| run.run_id.clone())
+        .collect();
+    let now_unix_nanos = crate::models::now_unix_nanos();
+    let oldest_ready = inner
+        .queue
+        .iter()
+        .filter(|job| job.enqueued_at_unix_nanos != 0)
+        .min_by_key(|job| job.enqueued_at_unix_nanos);
+    let oldest_ready_seconds = oldest_ready.map(|job| {
+        now_unix_nanos.saturating_sub(job.enqueued_at_unix_nanos) as f64 / 1_000_000_000.0
+    });
     let session_ids: std::collections::BTreeSet<&String> = inner
         .broker_session_runners
         .keys()
@@ -605,9 +720,11 @@ fn collect_snapshot_inputs(inner: &InnerState) -> SnapshotInputs {
         .collect();
 
     // Runner state: busy = an owned session holds an active job assignment;
-    // stale = no poll within the crate's staleness threshold; idle = neither.
-    // Busy and stale are independent predicates — a runner that stopped
-    // polling mid-job is both — so idle is the remainder, not the complement.
+    // stale = every owned session stopped polling; idle = at least one live
+    // session and neither busy nor stale. A registered runner with no session
+    // is only a pre-provisioned successor: it cannot poll until its slot starts.
+    // Busy and stale remain independent — a runner that stopped polling
+    // mid-job is both.
     let now = std::time::Instant::now();
     let mut runner_idle = 0u32;
     let mut runner_busy = 0u32;
@@ -645,10 +762,18 @@ fn collect_snapshot_inputs(inner: &InnerState) -> SnapshotInputs {
         if stale {
             runner_stale += 1;
         }
-        if !busy && !stale {
+        if !owned.is_empty() && !busy && !stale {
             runner_idle += 1;
         }
     }
+    // Live runner -> job pairings, sourced from claimed job requests (each
+    // carries its claiming runner). NOT from the assignment table, which
+    // holds only pre-claim reservations removed at claim time.
+    let assignments = crate::runtime_scheduling::live_runner_assignments(
+        &inner.job_requests,
+        &inner.session_active_requests,
+        std::time::SystemTime::now(),
+    );
 
     // Live debug sessions: count open sessions and the age of the oldest.
     let debug_sessions = inner.debug_sessions.list();
@@ -688,6 +813,8 @@ fn collect_snapshot_inputs(inner: &InnerState) -> SnapshotInputs {
         pending_expansions_len: inner.pending_expansions.len(),
         expanding_len: inner.expanding.len(),
         runs_queued,
+        active_runs,
+        orphaned_run_ids,
         runs_in_progress,
         runs_completed,
         registered: inner.runners.len() as u32,
@@ -695,6 +822,10 @@ fn collect_snapshot_inputs(inner: &InnerState) -> SnapshotInputs {
         runner_idle,
         runner_busy,
         runner_stale,
+        runner_assignments: assignments,
+        oldest_ready_seconds,
+        oldest_ready_run_id: oldest_ready.map(|job| job.run_id.to_string()),
+        oldest_ready_job_id: oldest_ready.map(|job| job.job_id.0.clone()),
         queue_runner_reqs: inner
             .queue
             .iter()
@@ -878,7 +1009,7 @@ fn build_operational_snapshot_sync(
     scheduler_enabled: bool,
     state_dir: &std::path::Path,
     storage_components: Vec<preloop_observability::status::StorageComponent>,
-    github_configured: bool,
+    github_snapshot: preloop_observability::status::GithubSnapshot,
     store_backend: preloop_observability::status::StoreBackend,
     webhook: WebhookConditionInputs,
 ) -> preloop_observability::status::OperationalSnapshot {
@@ -914,15 +1045,77 @@ fn build_operational_snapshot_sync(
         (claimable, inputs.queue_len as u32 - claimable)
     };
 
-    let oldest_ready_seconds = None; // TODO: track queued_at
+    let oldest_ready_seconds = inputs.oldest_ready_seconds;
+    let queue_stalled = claimable > 0
+        && inputs.runner_idle > 0
+        && oldest_ready_seconds.is_some_and(|age| age >= 60.0);
+    let check_reporting_failed = github_snapshot
+        .last_check_failure_at
+        .is_some_and(|failure| {
+            github_snapshot
+                .last_check_success_at
+                .is_none_or(|success| failure > success)
+        });
+    let mut conditions = if queue_stalled {
+        vec![Condition {
+            code: "claimable_queue_stalled".to_owned(),
+            severity: "error".to_owned(),
+            message: format!(
+                "{claimable} claimable job(s) have waited at least {:.0}s while {} runner(s) report idle",
+                oldest_ready_seconds.unwrap_or_default(),
+                inputs.runner_idle
+            ),
+            exemplars: vec![ConditionExemplar {
+                run_id: inputs.oldest_ready_run_id.clone(),
+                job_id: inputs.oldest_ready_job_id.clone(),
+                runner_id: None,
+                machine_name: None,
+            }],
+        }]
+    } else {
+        Vec::new()
+    };
+    if check_reporting_failed {
+        conditions.push(Condition {
+            code: "github_check_update_failure".to_owned(),
+            severity: "error".to_owned(),
+            message: "GitHub Check Run reporting failed; job results may be missing from GitHub"
+                .to_owned(),
+            exemplars: Vec::new(),
+        });
+    }
+    let runs_without_execution = !inputs.orphaned_run_ids.is_empty();
+    if runs_without_execution {
+        conditions.push(Condition {
+            code: "run_in_progress_without_execution".to_owned(),
+            severity: "error".to_owned(),
+            message: format!(
+                "{} run(s) are in_progress with no queued, claimed, or assigned work",
+                inputs.orphaned_run_ids.len()
+            ),
+            exemplars: inputs
+                .orphaned_run_ids
+                .iter()
+                .take(3)
+                .map(|run_id| ConditionExemplar {
+                    run_id: Some(run_id.clone()),
+                    job_id: None,
+                    runner_id: None,
+                    machine_name: None,
+                })
+                .collect(),
+        });
+    }
     pool_snapshot.released_bindings = inputs.released_bindings;
 
     OperationalSnapshot {
-        schema_version: 1,
+        schema_version: 2,
         observed_at: now,
         snapshot_age_seconds: 0.0,
         overall: if shutdown_requested {
             Overall::ShuttingDown
+        } else if queue_stalled || check_reporting_failed || runs_without_execution {
+            Overall::Degraded
         } else {
             Overall::Ok
         },
@@ -937,6 +1130,7 @@ fn build_operational_snapshot_sync(
             in_progress: inputs.runs_in_progress,
             completed: inputs.runs_completed,
         },
+        active_runs: inputs.active_runs,
         jobs: JobsSnapshot {
             ready: inputs.queue_len as u32,
             dependency_blocked: inputs.pending_jobs_len as u32,
@@ -966,6 +1160,7 @@ fn build_operational_snapshot_sync(
             stale: inputs.runner_stale,
             max_poll_age_seconds: None,
             max_lease_age_seconds: None,
+            assignments: inputs.runner_assignments,
         },
         pool: pool_snapshot,
         vms: {
@@ -994,10 +1189,7 @@ fn build_operational_snapshot_sync(
         },
         limits: Vec::new(),
         tasks: Vec::new(),
-        github: GithubSnapshot {
-            configured: github_configured,
-            ..Default::default()
-        },
+        github: github_snapshot,
         debug: DebugSnapshot {
             active_sessions: inputs.debug_active_sessions,
             oldest_session_seconds: inputs.debug_oldest_session_seconds,
@@ -1006,7 +1198,13 @@ fn build_operational_snapshot_sync(
             otlp_enabled: observability.otlp_enabled(),
             ..Default::default()
         },
-        conditions: webhook_conditions(&webhook, crate::webhook_status::now_us()),
+        conditions: {
+            conditions.extend(webhook_conditions(
+                &webhook,
+                crate::webhook_status::now_us(),
+            ));
+            conditions
+        },
     }
 }
 
@@ -1044,6 +1242,7 @@ async fn publish_snapshot(
         collect_snapshot_inputs(&inner)
     };
     let pool_snapshot = shared.state.pool_status.snapshot();
+    let github_snapshot = shared.state.status_snapshot.read().github.clone();
     // The storage bytes are a synchronous filesystem read; run it on the
     // blocking pool so a stalled state filesystem cannot stall request
     // handling or shutdown on the executor.
@@ -1063,7 +1262,7 @@ async fn publish_snapshot(
         shared.state.scheduler.is_some(),
         &state_dir,
         storage_components,
-        shared.state.github_app.is_some(),
+        github_snapshot,
         store_backend.clone(),
         webhook,
     );
@@ -1269,11 +1468,19 @@ pub async fn serve(config: ServerConfig) -> anyhow::Result<()> {
             // Startup-time read, before the server accepts requests; the
             // 5s tick performs the same read on the blocking pool instead.
             collect_storage_components(&state.state_dir),
-            state.github_app.is_some(),
+            preloop_observability::status::GithubSnapshot {
+                configured: state.github_app.is_some(),
+                ..Default::default()
+            },
             store_backend.clone(),
             collect_webhook_condition_inputs(&state),
         );
         *state.status_snapshot.write() = init;
+    }
+    if !config.listen.ip().is_loopback()
+        && state.registration_policy == RegistrationPolicy::Permissive
+    {
+        anyhow::bail!("PRELOOP_REGISTRATION_POLICY=permissive is only allowed on loopback");
     }
     let oidc_issuer = normalize_oidc_issuer(
         config
@@ -1405,6 +1612,7 @@ pub async fn serve(config: ServerConfig) -> anyhow::Result<()> {
         state: state.clone(),
         shutdown: shutdown.clone(),
     });
+    crate::runner_lifecycle::purge_restored_ephemeral_runners(&shared).await;
 
     // 5s sampler — clone needed state under lock, release, then publish.
     let sampler_shared = shared.clone();
@@ -1608,5 +1816,151 @@ mod tests {
 
         let error = connection.await.unwrap();
         assert!(is_routine_unix_disconnect(error.as_ref()));
+    }
+    #[test]
+    fn pending_runs_count_as_in_progress() {
+        let counts = count_run_statuses([
+            ExecutionStatus::Queued,
+            ExecutionStatus::Pending,
+            ExecutionStatus::InProgress,
+            ExecutionStatus::Success,
+            ExecutionStatus::Failure,
+            ExecutionStatus::Skipped,
+            ExecutionStatus::Cancelled,
+        ]);
+        assert_eq!(counts, (1, 2, 4));
+    }
+
+    #[test]
+    fn registered_successor_without_a_session_is_not_idle_capacity() {
+        let mut inner = InnerState::default();
+        let runner_id = 7;
+        inner.runners.insert(
+            runner_id,
+            RegisteredRunner {
+                id: runner_id,
+                name: "prebuilt-successor".to_owned(),
+                labels: vec!["self-hosted".to_owned()],
+                ephemeral: true,
+                public_key: None,
+                runner_group_id: None,
+                runner_group_name: None,
+            },
+        );
+
+        assert_eq!(
+            collect_snapshot_inputs(&inner).runner_idle,
+            0,
+            "a configured successor cannot poll until its slot starts it"
+        );
+
+        inner
+            .broker_session_runners
+            .insert("live-session".to_owned(), runner_id);
+        assert_eq!(
+            collect_snapshot_inputs(&inner).runner_idle,
+            1,
+            "a session-backed runner with no active request is idle"
+        );
+    }
+
+    #[test]
+    fn status_degrades_when_claimable_work_waits_behind_idle_runner() {
+        let temp = tempfile::tempdir().unwrap();
+        let inputs = SnapshotInputs {
+            queue_len: 1,
+            runner_idle: 1,
+            oldest_ready_seconds: Some(61.0),
+            oldest_ready_run_id: Some("run-1".to_owned()),
+            oldest_ready_job_id: Some("build".to_owned()),
+            queue_runner_reqs: vec![(vec!["self-hosted".to_owned()], None)],
+            runner_caps: vec![RunnerCapabilities {
+                known: true,
+                labels: vec!["self-hosted".to_owned()],
+                ..Default::default()
+            }],
+            ..Default::default()
+        };
+        let snapshot = build_operational_snapshot_sync(
+            inputs,
+            Default::default(),
+            &preloop_observability::Observability::noop(),
+            std::time::Instant::now(),
+            false,
+            true,
+            temp.path(),
+            Vec::new(),
+            Default::default(),
+            Default::default(),
+        );
+        assert_eq!(
+            snapshot.overall,
+            preloop_observability::status::Overall::Degraded
+        );
+        assert_eq!(snapshot.conditions[0].code, "claimable_queue_stalled");
+        assert_eq!(
+            snapshot.conditions[0].exemplars[0].run_id.as_deref(),
+            Some("run-1")
+        );
+    }
+
+    #[test]
+    fn status_degrades_when_a_run_is_in_progress_with_nothing_executing_it() {
+        let temp = tempfile::tempdir().unwrap();
+        let inputs = SnapshotInputs {
+            runs_in_progress: 1,
+            orphaned_run_ids: vec!["run-orphan".to_owned()],
+            ..Default::default()
+        };
+        let snapshot = build_operational_snapshot_sync(
+            inputs,
+            Default::default(),
+            &preloop_observability::Observability::noop(),
+            std::time::Instant::now(),
+            false,
+            true,
+            temp.path(),
+            Vec::new(),
+            Default::default(),
+            Default::default(),
+        );
+        assert_eq!(
+            snapshot.overall,
+            preloop_observability::status::Overall::Degraded
+        );
+        assert_eq!(
+            snapshot.conditions[0].code,
+            "run_in_progress_without_execution"
+        );
+        assert_eq!(
+            snapshot.conditions[0].exemplars[0].run_id.as_deref(),
+            Some("run-orphan")
+        );
+    }
+    #[test]
+    fn status_degrades_after_latest_github_check_update_fails() {
+        let temp = tempfile::tempdir().unwrap();
+        let github = preloop_observability::status::GithubSnapshot {
+            configured: true,
+            last_check_failure_at: Some(chrono::Utc::now()),
+            ..Default::default()
+        };
+        let snapshot = build_operational_snapshot_sync(
+            Default::default(),
+            Default::default(),
+            &preloop_observability::Observability::noop(),
+            std::time::Instant::now(),
+            false,
+            true,
+            temp.path(),
+            Vec::new(),
+            github,
+            Default::default(),
+        );
+        assert_eq!(
+            snapshot.overall,
+            preloop_observability::status::Overall::Degraded
+        );
+        assert_eq!(snapshot.conditions[0].code, "github_check_update_failure");
     }
 }

@@ -1,0 +1,18 @@
+name: 215-concurrency-cancel-in-progress
+on: workflow_dispatch
+jobs:
+  worker:
+    runs-on: self-hosted
+    steps:
+
+
+
+
+      - name: "long"
+        run: |
+          echo "start"
+          sleep 60
+          echo "finish"
+      - name: "post-cancel"
+        if: "cancelled()"
+        run: "echo \"cancelled cleanly\""

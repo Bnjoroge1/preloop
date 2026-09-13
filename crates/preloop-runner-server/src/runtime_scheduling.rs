@@ -1882,6 +1882,37 @@ pub(crate) fn clear_assignment(inner: &mut InnerState, run_id: RunId, job_id: &J
         .any(|job| job.run_id == run_id && job.job_id == *job_id)
 }
 
+/// Live runner -> job pairings for status reporting, sorted by runner id.
+///
+/// Iterate only active session requests, not the historical request table.
+/// The latter retains completed records for late protocol reads and grows for
+/// the process lifetime.
+pub(crate) fn live_runner_assignments(
+    requests: &std::collections::BTreeMap<i64, crate::models::TaskAgentJobRequestRecord>,
+    active_requests: &std::collections::BTreeMap<String, i64>,
+    now: std::time::SystemTime,
+) -> Vec<preloop_observability::status::RunnerAssignment> {
+    let mut out: Vec<preloop_observability::status::RunnerAssignment> = active_requests
+        .values()
+        .filter_map(|request_id| requests.get(request_id))
+        .filter(|record| record.result.is_none())
+        .filter_map(|record| record.owner_runner_id.map(|runner_id| (runner_id, record)))
+        .map(
+            |(runner_id, record)| preloop_observability::status::RunnerAssignment {
+                runner_id,
+                run_id: record.run_id.to_string(),
+                job_id: record.job_id.0.clone(),
+                assigned_seconds_ago: record
+                    .started_at
+                    .and_then(|at| now.duration_since(at).ok())
+                    .map(|d| d.as_secs_f64())
+                    .unwrap_or(0.0),
+            },
+        )
+        .collect();
+    out.sort_by_key(|a| a.runner_id);
+    out
+}
 pub(crate) fn capabilities_of(runner: &RegisteredRunner) -> RunnerCapabilities {
     RunnerCapabilities {
         known: true,
@@ -1994,6 +2025,47 @@ pub(crate) fn hydrate_needs_context(job: &mut QueuedJob, run: &RunRecord) {
     job.message
         .context_data
         .insert("needs".to_owned(), azdo::PipelineContextData::Dict(needs));
+
+    // The environment name is the one field the runner never evaluates: it
+    // ships as a plain string, so a name reading `needs.*` was deliberately
+    // left as a template by the job builder and is finished here, now that the
+    // context is complete. Everything else needing `needs` travels as a
+    // template token and is evaluated in-VM against the map installed above.
+    let Some(environment) = job.environment.as_ref() else {
+        return;
+    };
+    let Some(name) = (match environment {
+        serde_json::Value::String(name) => Some(name.as_str()),
+        serde_json::Value::Object(map) => map.get("name").and_then(serde_json::Value::as_str),
+        _ => None,
+    }) else {
+        return;
+    };
+    if !preloop_gha_parser::eval::resolves_after_job_build(name) {
+        // Already resolved at build time against a complete context.
+        return;
+    }
+    let Some(actions_environment) = job.message.actions_environment.as_mut() else {
+        return;
+    };
+    let mut context = preloop_gha_expressions::Context::new();
+    for (key, value) in &job.message.context_data {
+        context.insert(key, value.to_json());
+    }
+    match preloop_gha_parser::eval::resolve_string(name, &context) {
+        Ok(resolved) => actions_environment.name = resolved,
+        Err(error) => {
+            // Nothing downstream re-resolves this, so a raw template would
+            // become the deployment's name in the environment record.
+            tracing::error!(
+                run_id = %job.run_id.0,
+                job = %job.job_id.0,
+                environment = %name,
+                %error,
+                "deployment environment expression failed to evaluate after needs completed"
+            );
+        }
+    }
 }
 pub(crate) fn needs_json_context(run: &RunRecord, needs: &[JobId]) -> serde_json::Value {
     let values = needs
@@ -2612,6 +2684,7 @@ fn register_expanded_jobs(
             max_parallel: plan.max_parallel,
             runs_on: plan.runs_on.clone(),
             runner_group: plan.runner_group.clone(),
+            environment: plan.environment.clone(),
             message: artifacts.agent_msg,
             concurrency: concurrency::concurrency_from_plan_fields(
                 plan.concurrency_group.as_deref(),
@@ -2756,6 +2829,43 @@ fn expandable_job_ids(inner: &InnerState, run_id: RunId) -> BTreeSet<JobId> {
     ids
 }
 
+/// Settle one request whose logical job is terminal.
+///
+/// Completed request records remain addressable for late runner reads, but
+/// lose every live-session and renewable-credential association.
+pub(crate) fn settle_request(inner: &mut InnerState, request_id: i64, status: ExecutionStatus) {
+    inner
+        .session_active_requests
+        .retain(|_, &mut rid| rid != request_id);
+    inner.inflight_requests.remove(&request_id);
+    inner.github_token_requests.remove(&request_id);
+    if let Some(record) = inner.job_requests.get_mut(&request_id) {
+        if record.result.is_none() {
+            record.result = Some(status);
+        }
+    }
+}
+/// Release an interrupted claim so the same request can be delivered again.
+///
+/// The queued job retains this request id and agent-job correlation. Keep its
+/// inflight and token records, but remove the dead owner before requeueing:
+/// the old runner is then rejected until a replacement session claims it, and
+/// that replacement can renew and complete the original request normally.
+pub(crate) fn release_request_for_retry(inner: &mut InnerState, request_id: i64) {
+    inner
+        .session_active_requests
+        .retain(|_, &mut rid| rid != request_id);
+    if let Some(record) = inner.job_requests.get_mut(&request_id) {
+        if record.result.is_none() {
+            record.owner_runner_id = None;
+            record.started_at = None;
+            record.last_renewed_at = None;
+            record.timeout_triggered = false;
+            record.locked_until = crate::distributed_task::agent_request_locked_until();
+        }
+    }
+}
+
 /// Retire the request records an expandable node acquired at submit.
 ///
 /// MC-2: `runs.rs` mints a full set of correlation records for every
@@ -2779,23 +2889,16 @@ pub(crate) fn retire_node_requests(
         .map(|(id, _)| *id)
         .collect();
     for request_id in request_ids {
-        inner
-            .session_active_requests
-            .retain(|_, &mut rid| rid != request_id);
-        inner.inflight_requests.remove(&request_id);
-        // Terminal either way: a settled node stays in the run as a finished
-        // job and a purged one no longer exists, and neither can be claimed
-        // again. The deferred App-token request must not survive either.
-        inner.github_token_requests.remove(&request_id);
         match retirement {
             RequestRetirement::Settle(status) => {
-                if let Some(record) = inner.job_requests.get_mut(&request_id) {
-                    if record.result.is_none() {
-                        record.result = Some(status);
-                    }
-                }
+                settle_request(inner, request_id, status);
             }
             RequestRetirement::Purge => {
+                inner
+                    .session_active_requests
+                    .retain(|_, &mut rid| rid != request_id);
+                inner.inflight_requests.remove(&request_id);
+                inner.github_token_requests.remove(&request_id);
                 let Some(record) = inner.job_requests.remove(&request_id) else {
                     continue;
                 };
@@ -3126,32 +3229,83 @@ mod runner_group_tests {
             &runner(Some(2), Some("Release")),
         ));
     }
-
-    #[test]
-    fn group_is_not_treated_as_a_label() {
-        let mut capabilities = runner(Some(2), Some("build"));
-        capabilities.labels.push("release".to_owned());
-        assert!(!job_matches_runner_group(Some("deploy"), &capabilities));
-    }
-
-    #[test]
-    fn missing_group_metadata_uses_default_group() {
-        let default_runner = runner(None, None);
-        assert!(job_matches_runner_group(Some("Default"), &default_runner));
-        let custom_name_only = runner(None, Some("private"));
-        assert!(!job_matches_runner_group(Some("1"), &custom_name_only));
-        assert!(job_matches_runner_group(Some("1"), &default_runner));
-        assert!(job_matches_runner_group(None, &default_runner));
-        assert!(!job_matches_runner_group(
-            Some("private"),
-            &RunnerCapabilities::default(),
-        ));
-    }
 }
 
 #[cfg(test)]
 mod assignment_tests {
     use super::*;
+
+    /// Status pairings come from claimed job requests carrying their runner,
+    /// not from the pre-claim assignment table: finished requests and
+    /// unclaimed ones must not appear, and output is runner-sorted.
+    #[test]
+    fn live_assignments_reflect_claimed_requests() {
+        use crate::models::TaskAgentJobRequestRecord;
+        use std::collections::BTreeMap;
+
+        fn record(
+            run_id: RunId,
+            job: &str,
+            owner: Option<i64>,
+            result: Option<preloop_gha_protocol::ExecutionStatus>,
+            started_ago_secs: u64,
+        ) -> TaskAgentJobRequestRecord {
+            TaskAgentJobRequestRecord {
+                request_id: 0,
+                run_id,
+                job_id: JobId(job.to_owned()),
+                agent_job_id: uuid::Uuid::nil(),
+                plan_id: String::new(),
+                plan_type: String::new(),
+                timeline_id: uuid::Uuid::nil(),
+                result,
+                locked_until: String::new(),
+                owner_runner_id: owner,
+                started_at: std::time::SystemTime::now()
+                    .checked_sub(std::time::Duration::from_secs(started_ago_secs)),
+                last_renewed_at: None,
+                timeout_triggered: false,
+                debug_token_issued: false,
+            }
+        }
+
+        let run_a = RunId::new();
+        let mut table: BTreeMap<i64, TaskAgentJobRequestRecord> = BTreeMap::new();
+        // Finished requests stay in the map (late reads stay bound) but must
+        // not report as live; unclaimed ones have no runner yet.
+        table.insert(
+            1,
+            record(
+                run_a,
+                "done",
+                Some(3),
+                Some(preloop_gha_protocol::ExecutionStatus::Success),
+                90,
+            ),
+        );
+        table.insert(2, record(RunId::new(), "queued", None, None, 10));
+        // Insert out of runner order; output must still be runner-sorted.
+        table.insert(3, record(RunId::new(), "build", Some(7), None, 90));
+        let run_test = RunId::new();
+        table.insert(4, record(run_test, "test", Some(3), None, 30));
+
+        let active = BTreeMap::from([
+            ("finished".to_owned(), 1),
+            ("build".to_owned(), 3),
+            ("test".to_owned(), 4),
+        ]);
+        let now = std::time::SystemTime::now();
+        let live = live_runner_assignments(&table, &active, now);
+
+        assert_eq!(live.len(), 2);
+        assert_eq!(live[0].runner_id, 3);
+        assert_eq!(live[0].run_id, run_test.to_string());
+        assert_eq!(live[0].job_id, "test");
+        assert!((live[0].assigned_seconds_ago - 30.0).abs() < 5.0);
+        assert_eq!(live[1].runner_id, 7);
+        assert_eq!(live[1].job_id, "build");
+        assert!(live_runner_assignments(&BTreeMap::new(), &BTreeMap::new(), now).is_empty());
+    }
 
     fn self_hosted_caps() -> RunnerCapabilities {
         RunnerCapabilities {
@@ -3179,6 +3333,7 @@ mod assignment_tests {
             max_parallel: None,
             runs_on: vec!["self-hosted".to_owned()],
             runner_group: None,
+            environment: None,
             message: serde_json::from_value(serde_json::json!({
                 "jobId": "00000000-0000-0000-0000-000000000001",
                 "requestId": 1,

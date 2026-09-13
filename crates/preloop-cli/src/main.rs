@@ -1949,7 +1949,7 @@ fn local_runner_pool_config(
             .ok()
             .and_then(|v| v.parse().ok()),
         debug_dir: Some(home.join("state").join("debug")),
-        runner_key_dir: Some(home.join("runner-keys")),
+        runner_key_dir: None,
         // Warm the golden with the images this project's workflows declare,
         // so `container:`/`services:` jobs do not re-pull on every run.
         preload_images: preloop_orchestrator::environment::scan_workflow_images(
@@ -1989,7 +1989,7 @@ fn runner_pool_labels() -> Vec<String> {
 }
 
 /// vCPUs given to each runner VM, honouring `PRELOOP_RUNNER_CPUS`.
-const RUNNER_CPUS: u16 = 4;
+const RUNNER_CPUS: u16 = 8;
 /// Low-memory on-demand provisioning is the default; opt into idle warm VMs.
 const DEFAULT_RUNNER_POOL_ENABLED: bool = false;
 /// Published or locally cached packed images avoid cold OCI bootstrap per job.
@@ -3642,6 +3642,29 @@ fn render_status_human(status: &serde_json::Value, runs: &[serde_json::Value], l
             .map(|v| format!("{v:.1}s"))
             .unwrap_or_else(|| "-".to_owned())
     );
+    // Live runner -> job pairings: which job each busy runner executes.
+    // Counts alone cannot distinguish a busy pool from a stalled one.
+    if let Some(list) = runners.get("assignments").and_then(|v| v.as_array()) {
+        for entry in list {
+            let runner = entry
+                .get("runner_id")
+                .and_then(|v| v.as_i64())
+                .map(|v| v.to_string())
+                .unwrap_or_else(|| "?".to_owned());
+            let run = entry
+                .get("run_id")
+                .and_then(|v| v.as_str())
+                .map(|v| v.get(..8).unwrap_or(v).to_owned())
+                .unwrap_or_else(|| "?".to_owned());
+            let job = entry.get("job_id").and_then(|v| v.as_str()).unwrap_or("?");
+            let age = entry
+                .get("assigned_seconds_ago")
+                .and_then(|v| v.as_f64())
+                .map(|v| format!("{v:.0}s"))
+                .unwrap_or_else(|| "-".to_owned());
+            println!("  runner {runner}: {run} / {job} ({age})");
+        }
+    }
 
     // 5. VM fleet stub
     println!("\n== vm fleet ==");
@@ -3917,6 +3940,8 @@ fn render_status_human(status: &serde_json::Value, runs: &[serde_json::Value], l
 fn condition_action(code: &str) -> &'static str {
     match code {
         "queue_no_registered_runner" => "register a runner or enable the pool",
+        "claimable_queue_stalled" => "inspect assignments; restart if bindings are stale",
+        "run_in_progress_without_execution" => "inspect the run; requeue or cancel it",
         "queue_label_mismatch" => "add a runner with that label",
         "concurrency_queue_overflow" => "raise concurrency queue max or reduce parallelism",
         "concurrency_group_starved" => "check concurrency group that starves others",

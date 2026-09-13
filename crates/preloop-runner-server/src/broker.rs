@@ -1,17 +1,5 @@
 use super::*;
 
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub(crate) enum RunnerAuthSource {
-    RunnerListenToken,
-    RuntimeJwt,
-}
-
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub(crate) struct AuthenticatedRunnerId {
-    pub(crate) runner_id: i64,
-    pub(crate) auth_source: RunnerAuthSource,
-}
-
 ///
 /// The two are deliberately separate counters. `Lifecycle` records a
 /// credential fencing carrier assumes cannot occur, so its count
@@ -53,42 +41,6 @@ pub(crate) fn record_listener_token_use(
             );
         }
     }
-}
-
-pub(crate) fn authenticated_runner_id_with_source(
-    shared: &Arc<SharedState>,
-    headers: &HeaderMap,
-    expected_runner_id: Option<i64>,
-) -> Result<AuthenticatedRunnerId, ApiError> {
-    let bearer = headers
-        .get(header::AUTHORIZATION)
-        .and_then(|value| value.to_str().ok())
-        .and_then(|value| value.strip_prefix("Bearer "))
-        .ok_or_else(|| ApiError::unauthorized("runner listen token required"))?;
-    // Accept runner listen tokens (normal path) or job runtime tokens
-    // (worker uses the SystemVssConnection AccessToken for renewjob/completejob).
-    if let Some(runner_id) = shared.state.runner_id_from_token(bearer) {
-        if expected_runner_id.is_some_and(|expected| expected != runner_id) {
-            return Err(ApiError::forbidden(
-                "runner token does not match broker path",
-            ));
-        }
-        return Ok(AuthenticatedRunnerId {
-            runner_id,
-            auth_source: RunnerAuthSource::RunnerListenToken,
-        });
-    }
-    // Fall back: accept runtime tokens (Actions.Results scope). These don't
-    // carry a runner_id, so we trust the path parameter.
-    if shared.state.verify_local_jwt_claims(bearer).is_some() {
-        let runner_id =
-            expected_runner_id.ok_or_else(|| ApiError::unauthorized("runner id required"))?;
-        return Ok(AuthenticatedRunnerId {
-            runner_id,
-            auth_source: RunnerAuthSource::RuntimeJwt,
-        });
-    }
-    Err(ApiError::unauthorized("runner listen token required"))
 }
 
 #[derive(Debug, Deserialize)]
@@ -162,7 +114,10 @@ pub(crate) fn format_reusable_workflow_ref(
     workflow_ref: &str,
     caller_ref: &str,
 ) -> String {
-    if let Some(path) = workflow_ref.strip_prefix("./") {
+    let local_path = workflow_ref
+        .strip_prefix("./")
+        .or_else(|| workflow_ref.strip_prefix("$/"));
+    if let Some(path) = local_path {
         let (path, git_ref) = path.split_once('@').unwrap_or((path, caller_ref));
         return format!("{repository}/{path}@{git_ref}");
     }
@@ -315,10 +270,19 @@ pub(crate) async fn next_message_broker_ref(
 
     loop {
         let mut inner = shared.state.inner.lock().await;
-        inner.mark_session_seen(&session_id);
         let runner_id = inner
             .runner_id_for_session(&session_id)
             .ok_or_else(|| ApiError::forbidden("broker session has no runner owner"))?;
+        if identity
+            .as_ref()
+            .and_then(|axum::Extension(identity)| identity.runner_id)
+            .is_some_and(|identity_runner| identity_runner != runner_id)
+        {
+            return Err(ApiError::forbidden(
+                "broker session belongs to another runner",
+            ));
+        }
+        inner.mark_session_seen(&session_id);
         if let Some(message) = inner
             .inflight_messages
             .get(&session_id)
@@ -393,6 +357,7 @@ pub(crate) async fn next_message_broker_ref(
             .session_active_requests
             .insert(session_id.clone(), request_id);
         if let Some(request) = inner.job_requests.get_mut(&request_id) {
+            request.owner_runner_id = Some(runner_id);
             request.claimed_at = Some(claimed_at);
             request.started_at = Some(claimed_at);
             request.last_renewed_at = Some(claimed_at);
@@ -463,7 +428,7 @@ pub(crate) async fn broker_session_root(
     State(shared): State<Arc<SharedState>>,
     headers: HeaderMap,
 ) -> Result<(StatusCode, Json<serde_json::Value>), ApiError> {
-    let runner_id = authenticated_runner_id(&shared, &headers, None)?;
+    let runner_id = authenticated_runner_id(&shared, &headers, None).await?;
     let session_id = uuid::Uuid::new_v4().to_string();
     {
         let mut inner = shared.state.inner.lock().await;
@@ -533,7 +498,7 @@ pub(crate) async fn broker_delete_session_root(
     Query(params): Query<std::collections::HashMap<String, String>>,
     headers: HeaderMap,
 ) -> Result<StatusCode, ApiError> {
-    let runner_id = authenticated_runner_id(&shared, &headers, None)?;
+    let runner_id = authenticated_runner_id(&shared, &headers, None).await?;
     let header_session = headers
         .get("x-actions-session")
         .and_then(|value| value.to_str().ok());
@@ -557,7 +522,7 @@ pub(crate) async fn broker_delete_session_by_path(
     Path(session_id): Path<String>,
     headers: HeaderMap,
 ) -> Result<StatusCode, ApiError> {
-    let runner_id = authenticated_runner_id(&shared, &headers, None)?;
+    let runner_id = authenticated_runner_id(&shared, &headers, None).await?;
     remove_broker_session(&shared, &session_id, runner_id).await?;
     shared
         .state
@@ -587,12 +552,90 @@ pub(crate) async fn remove_broker_session(
         None => Err(ApiError::not_found("broker session not found")),
     }
 }
-pub(crate) fn authenticated_runner_id(
+pub(crate) async fn authenticated_runner_id(
     shared: &Arc<SharedState>,
     headers: &HeaderMap,
     expected_runner_id: Option<i64>,
 ) -> Result<i64, ApiError> {
-    Ok(authenticated_runner_id_with_source(shared, headers, expected_runner_id)?.runner_id)
+    let bearer = headers
+        .get(header::AUTHORIZATION)
+        .and_then(|value| value.to_str().ok())
+        .and_then(|value| value.strip_prefix("Bearer "))
+        .ok_or_else(|| ApiError::unauthorized("runner listen token required"))?;
+    let runner_id = crate::auth::registered_runner_id(shared, bearer)
+        .await
+        .ok_or_else(|| ApiError::unauthorized("runner listen token required"))?;
+    if expected_runner_id.is_some_and(|expected| expected != runner_id) {
+        return Err(ApiError::forbidden(
+            "runner token does not match broker path",
+        ));
+    }
+    Ok(runner_id)
+}
+
+/// Authenticate a broker renew/complete call with either the live runner
+/// listen credential or the runtime token for the exact agent job in the body.
+pub(crate) async fn authenticated_runner_id_for_job(
+    shared: &Arc<SharedState>,
+    headers: &HeaderMap,
+    expected_runner_id: i64,
+    job_id: uuid::Uuid,
+) -> Result<i64, ApiError> {
+    let bearer = headers
+        .get(header::AUTHORIZATION)
+        .and_then(|value| value.to_str().ok())
+        .and_then(|value| value.strip_prefix("Bearer "))
+        .ok_or_else(|| ApiError::unauthorized("runner or job runtime token required"))?;
+    if let Some(runner_id) = crate::auth::registered_runner_id(shared, bearer).await {
+        if runner_id != expected_runner_id {
+            return Err(ApiError::forbidden(
+                "runner token does not match broker path",
+            ));
+        }
+        return Ok(runner_id);
+    }
+
+    let runtime_job = shared
+        .state
+        .job_uuid_from_token(bearer)
+        .ok_or_else(|| ApiError::unauthorized("runner or job runtime token required"))?;
+    if runtime_job != job_id {
+        return Err(ApiError::forbidden(
+            "job runtime token does not match broker job",
+        ));
+    }
+    let inner = shared.state.inner.lock().await;
+    if !inner.runners.contains_key(&expected_runner_id) {
+        return Err(ApiError::unauthorized(
+            "runner registration no longer exists",
+        ));
+    }
+    let request_id = inner
+        .agent_job_requests
+        .get(&job_id)
+        .copied()
+        .ok_or_else(|| ApiError::not_found("broker job request not found"))?;
+    let request = inner
+        .job_requests
+        .get(&request_id)
+        .ok_or_else(|| ApiError::not_found("broker job request not found"))?;
+    let exact_scope = format!("Actions.Results:{}:{}", request.plan_id, job_id);
+    let exact_runtime_scope = shared
+        .state
+        .verify_local_jwt_claims(bearer)
+        .and_then(|claims| {
+            claims
+                .get("scp")
+                .and_then(|value| value.as_str())
+                .map(str::to_owned)
+        })
+        .is_some_and(|scope| scope == exact_scope);
+    if request.owner_runner_id != Some(expected_runner_id) || !exact_runtime_scope {
+        return Err(ApiError::forbidden(
+            "job runtime token does not own broker request",
+        ));
+    }
+    Ok(expected_runner_id)
 }
 
 pub(crate) fn ensure_broker_request_owner(
@@ -600,6 +643,22 @@ pub(crate) fn ensure_broker_request_owner(
     request_id: i64,
     runner_id: i64,
 ) -> Result<(), ApiError> {
+    // Prefer the immutable owner recorded when the request was claimed. This
+    // survives session teardown/rebind and keeps late broker retries bound to
+    // the runner that actually received the job.
+    if let Some(owner) = inner
+        .job_requests
+        .get(&request_id)
+        .and_then(|request| request.owner_runner_id)
+    {
+        return if owner == runner_id {
+            Ok(())
+        } else {
+            Err(ApiError::forbidden(
+                "broker request belongs to another runner",
+            ))
+        };
+    }
     let session_id =
         inner
             .session_active_requests
@@ -637,7 +696,7 @@ pub(crate) async fn next_message_broker_ref_root(
     Query(params): Query<std::collections::HashMap<String, String>>,
     headers: HeaderMap,
 ) -> Result<Response, ApiError> {
-    let runner_id = authenticated_runner_id(&shared, &headers, None)?;
+    let runner_id = authenticated_runner_id(&shared, &headers, None).await?;
     if let Some(response) = runner_version_deprecated_response(&shared, &params) {
         return Ok(response);
     }
@@ -722,6 +781,7 @@ pub(crate) async fn next_message_broker_ref_root(
                     }
                     let request_id = queued.message.request_id;
                     if let Some(request) = inner.job_requests.get_mut(&request_id) {
+                        request.owner_runner_id = Some(runner_id);
                         request.claimed_at = Some(claimed_at);
                         request.started_at = Some(claimed_at);
                         request.last_renewed_at = Some(claimed_at);
@@ -774,15 +834,12 @@ pub(crate) async fn broker_acquire_job(
     headers: HeaderMap,
     Json(request): Json<BrokerAcquireJobRequest>,
 ) -> Result<Json<serde_json::Value>, ApiError> {
-    let auth = authenticated_runner_id_with_source(&shared, &headers, Some(runner_id))?;
-    if auth.auth_source == RunnerAuthSource::RunnerListenToken {
-        record_listener_token_use(
-            &shared.state,
-            ListenerTokenProbe::Acquire,
-            "broker.acquirejob",
-        );
-    }
-
+    authenticated_runner_id(&shared, &headers, Some(runner_id)).await?;
+    record_listener_token_use(
+        &shared.state,
+        ListenerTokenProbe::Acquire,
+        "broker.acquirejob",
+    );
     let (request_id, mut message, github_token_request, id_token_granted) = {
         let inner = shared.state.inner.lock().await;
         let request_id = inner
@@ -791,6 +848,19 @@ pub(crate) async fn broker_acquire_job(
             .copied()
             .ok_or_else(|| ApiError::not_found("broker job message not found"))?;
         ensure_broker_request_owner(&inner, request_id, runner_id)?;
+        // A settled attempt is never acquirable. `renewjob` already 409s and
+        // `completejob` ignores such a record, so without this a late runner
+        // acquires a terminal job: the engine mints a fresh installation
+        // token and the runner executes side effects a second time, then
+        // cannot report the result. Requeue paths keep `result` unset (see
+        // `release_request_for_retry`), so a genuine retry still acquires.
+        if inner
+            .job_requests
+            .get(&request_id)
+            .is_some_and(|record| record.result.is_some())
+        {
+            return Err(ApiError::conflict("broker request already completed"));
+        }
         let message = inner
             .broker_messages
             .get(&request_id)
@@ -1229,45 +1299,101 @@ async fn fail_unclaimable_request(shared: &Arc<SharedState>, request_id: i64) {
     shared.state.message_notify.notify_waiters();
 }
 
-/// Fail job claims pinned to sessions that did not survive a restart.
+/// Reconcile job claims whose runner session did not survive a restart.
 ///
-/// Pool machines are ephemeral: a control-plane restart destroys their VMs,
-/// but `session_active_requests` is persisted. Those claims come back pinned
-/// to sessions that will never poll again, so no fresh machine can take the
-/// job — the run, and the GitHub check run it created, sit queued forever
-/// while the pool idles. Failing them once at startup makes the reported
-/// state honest and releases the concurrency slot.
-///
-/// Only claims whose session is gone are touched. A queued job that was never
-/// claimed still has its queue row and is dispatched normally, and a runner
-/// that outlived the control plane keeps a live session, so its job is left
-/// to the ordinary disconnect reaper.
+/// A claim still absent from the ready queue is irrecoverable and fails as
+/// before. A request whose logical job was already requeued by runner purge is
+/// released for redelivery without concluding the retry. The latter also
+/// migrates snapshots written by versions that requeued the job but left its
+/// old runner ownership live.
 pub(crate) async fn reconcile_orphaned_claims(shared: &Arc<SharedState>) -> usize {
-    let orphaned: Vec<i64> = {
-        let inner = shared.state.inner.lock().await;
-        inner
+    let (recovered, unclaimable) = {
+        let mut inner = shared.state.inner.lock().await;
+        let live_requests: std::collections::BTreeSet<i64> = inner
             .session_active_requests
             .iter()
-            .filter(|(session_id, _)| !inner.sessions.contains_key(*session_id))
+            .filter(|(session_id, _)| inner.sessions.contains_key(*session_id))
             .map(|(_, request_id)| *request_id)
-            .filter(|request_id| {
-                inner
-                    .job_requests
-                    .get(request_id)
-                    .is_some_and(|record| record.result.is_none())
+            .collect();
+        let claimed_requests: Vec<(i64, RunId, JobId)> = inner
+            .job_requests
+            .iter()
+            .filter(|(request_id, record)| {
+                record.result.is_none()
+                    && !live_requests.contains(request_id)
+                    && (record.owner_runner_id.is_some()
+                        || inner
+                            .session_active_requests
+                            .values()
+                            .any(|active| active == *request_id))
             })
-            .collect()
+            .map(|(request_id, record)| (*request_id, record.run_id, record.job_id.clone()))
+            .collect();
+
+        let queued_jobs: std::collections::BTreeSet<(RunId, JobId)> = inner
+            .queue
+            .iter()
+            .map(|job| (job.run_id, job.job_id.clone()))
+            .collect();
+        let mut recovered = 0usize;
+        let mut unclaimable = Vec::new();
+        for (request_id, run_id, job_id) in claimed_requests {
+            let queued = queued_jobs.contains(&(run_id, job_id.clone()));
+            let terminal_status = inner
+                .runs
+                .get(&run_id)
+                .and_then(|run| run.jobs.get(&job_id).copied())
+                .filter(|status| {
+                    matches!(
+                        status,
+                        ExecutionStatus::Success
+                            | ExecutionStatus::Failure
+                            | ExecutionStatus::Cancelled
+                            | ExecutionStatus::Skipped
+                    )
+                });
+            if queued {
+                runtime_scheduling::release_request_for_retry(&mut inner, request_id);
+                recovered += 1;
+            } else if let Some(status) = terminal_status {
+                runtime_scheduling::settle_request(&mut inner, request_id, status);
+                recovered += 1;
+            } else {
+                unclaimable.push(request_id);
+            }
+        }
+        (recovered, unclaimable)
     };
-    for request_id in &orphaned {
+
+    if recovered > 0 {
+        let _store_guard = shared.state.store_mutation.lock().await;
+        let snapshot = {
+            let inner = shared.state.inner.lock().await;
+            crate::store::StoreSnapshot::from_inner(&inner)
+        };
+        if let Err(error) = shared.state.store.store_inner(&snapshot).await {
+            warn!(
+                recovered,
+                ?error,
+                "failed to persist reconciled orphaned attempts"
+            );
+        }
+        warn!(
+            recovered,
+            "released orphaned retry attempts from dead runner ownership"
+        );
+    }
+
+    for request_id in &unclaimable {
         fail_unclaimable_request(shared, *request_id).await;
     }
-    if !orphaned.is_empty() {
+    if !unclaimable.is_empty() {
         warn!(
-            count = orphaned.len(),
+            count = unclaimable.len(),
             "failed job claims orphaned by a control-plane restart"
         );
     }
-    orphaned.len()
+    recovered + unclaimable.len()
 }
 
 pub(crate) async fn mint_dispatch_github_token(
@@ -1458,15 +1584,20 @@ pub(crate) async fn broker_renew_job(
     headers: HeaderMap,
     Json(request): Json<BrokerRenewJobRequest>,
 ) -> Result<Json<serde_json::Value>, ApiError> {
-    let auth = authenticated_runner_id_with_source(&shared, &headers, Some(runner_id))?;
-    if auth.auth_source == RunnerAuthSource::RunnerListenToken {
+    let listen_token = match crate::auth::bearer_from_headers(&headers) {
+        Some(token) => crate::auth::registered_runner_id(&shared, token)
+            .await
+            .is_some(),
+        None => false,
+    };
+    authenticated_runner_id_for_job(&shared, &headers, runner_id, request.job_id).await?;
+    if listen_token {
         record_listener_token_use(
             &shared.state,
             ListenerTokenProbe::Lifecycle,
             "broker.renewjob",
         );
     }
-
     let mut inner = shared.state.inner.lock().await;
     let request_id = inner
         .agent_job_requests
@@ -1474,6 +1605,13 @@ pub(crate) async fn broker_renew_job(
         .copied()
         .ok_or_else(|| ApiError::not_found("broker renew request not found"))?;
     ensure_broker_request_owner(&inner, request_id, runner_id)?;
+    if inner
+        .job_requests
+        .get(&request_id)
+        .is_some_and(|record| record.result.is_some())
+    {
+        return Err(ApiError::conflict("broker request already completed"));
+    }
     let record = inner
         .job_requests
         .get_mut(&request_id)
@@ -1489,15 +1627,20 @@ pub(crate) async fn broker_complete_job(
     headers: HeaderMap,
     Json(request): Json<BrokerRenewJobRequest>,
 ) -> Result<StatusCode, ApiError> {
-    let auth = authenticated_runner_id_with_source(&shared, &headers, Some(runner_id))?;
-    if auth.auth_source == RunnerAuthSource::RunnerListenToken {
+    let listen_token = match crate::auth::bearer_from_headers(&headers) {
+        Some(token) => crate::auth::registered_runner_id(&shared, token)
+            .await
+            .is_some(),
+        None => false,
+    };
+    authenticated_runner_id_for_job(&shared, &headers, runner_id, request.job_id).await?;
+    if listen_token {
         record_listener_token_use(
             &shared.state,
             ListenerTokenProbe::Lifecycle,
             "broker.completejob",
         );
     }
-
     let status = match request.conclusion.as_deref() {
         Some(conclusion) => execution_status_from_runner_result(conclusion).ok_or_else(|| {
             ApiError::bad_request(format!("unknown broker conclusion `{conclusion}`"))
@@ -1530,43 +1673,52 @@ pub(crate) async fn broker_complete_job(
             .copied()
             .ok_or_else(|| ApiError::not_found("broker complete request not found"))?;
         ensure_broker_request_owner(&inner, request_id, runner_id)?;
-        debug!(request_id, job_id = %request.job_id, "broker complete: found request");
-        if let Some(record) = inner.job_requests.get_mut(&request_id) {
-            record.result = Some(status);
-            record.locked_until = agent_request_locked_until();
-        }
-        // Free the session so the next broker poll can take a new job immediately
-        // (otherwise the poll arm waits until it observes result.is_some()).
-        inner
-            .session_active_requests
-            .retain(|_, &mut rid| rid != request_id);
-        let run_job = inner.inflight_requests.remove(&request_id).or_else(|| {
-            job_request_tuple(&inner, request_id).map(|(_, run_id, job_id)| (run_id, job_id))
-        });
-        match run_job {
-            Some((run_id, job_id)) => {
-                info!(%run_id, %job_id, "broker complete: completing job");
-                Some(JobCompletion {
-                    run_id,
-                    job_id,
-                    // This request *is* the attempt that finished, so the
-                    // server never has to guess which dispatch reported.
-                    agent_job_id: inner
-                        .job_requests
-                        .get(&request_id)
-                        .map(|record| record.agent_job_id),
-                    status,
-                    outputs,
-                    annotations: request.annotations.clone(),
-                    step_results: request.step_results.clone(),
-                })
+        if inner
+            .job_requests
+            .get(&request_id)
+            .is_some_and(|record| record.result.is_some())
+        {
+            info!(request_id, "broker complete: ignoring duplicate completion");
+            None
+        } else {
+            debug!(request_id, job_id = %request.job_id, "broker complete: found request");
+            if let Some(record) = inner.job_requests.get_mut(&request_id) {
+                record.result = Some(status);
+                record.locked_until = agent_request_locked_until();
             }
-            None => {
-                warn!(
-                    request_id,
-                    "broker complete: no inflight_requests entry found"
-                );
-                None
+            // Free the session so the next broker poll can take a new job immediately
+            // (otherwise the poll arm waits until it observes result.is_some()).
+            inner
+                .session_active_requests
+                .retain(|_, &mut rid| rid != request_id);
+            let run_job = inner.inflight_requests.remove(&request_id).or_else(|| {
+                job_request_tuple(&inner, request_id).map(|(_, run_id, job_id)| (run_id, job_id))
+            });
+            match run_job {
+                Some((run_id, job_id)) => {
+                    info!(%run_id, %job_id, "broker complete: completing job");
+                    Some(JobCompletion {
+                        run_id,
+                        job_id,
+                        // This request *is* the attempt that finished, so the
+                        // server never has to guess which dispatch reported.
+                        agent_job_id: inner
+                            .job_requests
+                            .get(&request_id)
+                            .map(|record| record.agent_job_id),
+                        status,
+                        outputs,
+                        annotations: request.annotations.clone(),
+                        step_results: request.step_results.clone(),
+                    })
+                }
+                None => {
+                    warn!(
+                        request_id,
+                        "broker complete: no inflight_requests entry found"
+                    );
+                    None
+                }
             }
         }
     };

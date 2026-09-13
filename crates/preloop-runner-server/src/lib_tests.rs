@@ -1664,6 +1664,7 @@ jobs:
   deploy:
     needs: [build]
     runs-on: ubuntu-latest
+    environment: ${{ needs.build.outputs.environment }}
     steps:
       - run: echo deploy
 "#,
@@ -1682,7 +1683,7 @@ jobs:
             "run_id": run_id,
             "job_id": "build",
             "status": "success",
-            "outputs": {"artifact": "dist.tgz"}
+            "outputs": {"artifact": "dist.tgz", "environment": "staging"}
         }),
     )
     .await;
@@ -1694,6 +1695,14 @@ jobs:
         .find(|job| job.job_id.0 == "deploy")
         .expect("deploy job should be promoted");
     let needs = deploy.message.context_data.get("needs").unwrap();
+    assert_eq!(
+        deploy
+            .message
+            .actions_environment
+            .as_ref()
+            .map(|environment| environment.name.as_str()),
+        Some("staging")
+    );
     let azdo::PipelineContextData::Dict(needs) = needs else {
         panic!("needs context should be a dict");
     };
@@ -3201,6 +3210,40 @@ async fn list_runs_projects_step_records() {
     assert_eq!(steps[0]["name"], "Run echo one");
 }
 
+#[tokio::test]
+async fn list_runs_puts_active_work_before_newer_terminal_runs() {
+    let temp = tempfile::tempdir().unwrap();
+    let state = AppState::new(temp.path().to_path_buf()).await.unwrap();
+    let app = app(state.clone(), CancellationToken::new());
+    let first: RunId = submit_simple_run(&app).await["run_id"]
+        .as_str()
+        .unwrap()
+        .parse()
+        .unwrap();
+    let second: RunId = submit_simple_run(&app).await["run_id"]
+        .as_str()
+        .unwrap()
+        .parse()
+        .unwrap();
+    let (active, terminal) = if first < second {
+        (first, second)
+    } else {
+        (second, first)
+    };
+    {
+        let mut inner = state.inner.lock().await;
+        let completed = inner.runs.get_mut(&terminal).unwrap();
+        completed.status = ExecutionStatus::Success;
+        completed.completed_at = Some(chrono::Utc::now());
+    }
+
+    let listed = request_json(&app, Method::GET, "/api/v1/runs?limit=2", json!(null)).await;
+    let runs = listed.as_array().unwrap();
+    assert_eq!(runs[0]["run_id"], active.to_string());
+    assert_eq!(runs[0]["status"], "queued");
+    assert_eq!(runs[1]["run_id"], terminal.to_string());
+}
+
 /// A runner report persists the attempt, so a restart keeps step state.
 ///
 /// Step records deliberately do not ride in `runs.record_blob` (which reseals
@@ -4661,12 +4704,10 @@ async fn registration_and_oauth_return_runner_compatible_tokens() {
     );
 }
 
-/// The registration mint hands out a RunnerManage JWT. On the TCP surface it
-/// accepts any non-empty credential, exactly as GitHub accepts any token it
-/// issued — the conformance golden replays a real GitHub registration token
-/// and must get a 200. Through the mounted control socket, where workflow
-/// code inside a VM can reach, only the system credential — the token the
-/// pool injects into its own configure invocation — may mint.
+/// The registration mint hands out a RunnerManage JWT. Strict mode requires
+/// the system credential on both TCP and the mounted control socket; the
+/// conformance golden replays a real GitHub registration token that this
+/// control plane cannot verify, so those runs opt into `Permissive` explicitly.
 #[tokio::test]
 async fn registration_mint_credential_rules_are_strict_by_default() {
     let temp = tempfile::tempdir().unwrap();
@@ -4743,6 +4784,23 @@ async fn registration_mint_permissive_only_under_an_explicit_env_opt_in() {
     assert_eq!(
         minted["token_schema"], "OAuthAccessToken",
         "permissive policy is the conformance-harness opt-in"
+    );
+    // The conformance escape remains fail-closed on the mounted socket:
+    // workflow code must never mint another runner identity from inside a VM.
+    let socket_app = app
+        .clone()
+        .layer(middleware::from_fn(crate::auth::runner_surface_only));
+    assert_eq!(
+        request_status_with_bearer(
+            &socket_app,
+            Method::POST,
+            "/api/v3/actions/runner-registration",
+            json!({"url": "http://socket-workflow"}),
+            "any-non-empty-credential",
+        )
+        .await,
+        StatusCode::UNAUTHORIZED,
+        "permissive registration must remain strict on the guest socket"
     );
 }
 
@@ -4988,12 +5046,8 @@ async fn job_message_carries_github_token_as_a_secret() {
     let temp = tempfile::tempdir().unwrap();
     let state = AppState::new(temp.path().to_path_buf()).await.unwrap();
     let app = app(state.clone(), CancellationToken::new());
-    let runner_token = state
-        .local_jwt(json!({
-            "sub": "preloop-runner-listen-1",
-            "scp": "ActionsRuntime.RunnerListen",
-        }))
-        .unwrap();
+    let (_runner_id, runner_token) =
+        register_runner_with_token(&app, "runner-1", &["self-hosted"], None).await;
 
     let accepted = request_json(
         &app,
@@ -5082,12 +5136,8 @@ async fn environment_secrets_override_repo_and_global_per_job() {
     let temp = tempfile::tempdir().unwrap();
     let state = AppState::new(temp.path().to_path_buf()).await.unwrap();
     let app = app(state.clone(), CancellationToken::new());
-    let runner_token = state
-        .local_jwt(json!({
-            "sub": "preloop-runner-listen-1",
-            "scp": "ActionsRuntime.RunnerListen",
-        }))
-        .unwrap();
+    let (_runner_id, runner_token) =
+        register_runner_with_token(&app, "runner-1", &["self-hosted"], None).await;
 
     // Seed the three stored tiers with the same name so precedence is
     // observable, plus a name that exists only in the environment tier.
@@ -5291,6 +5341,13 @@ async fn current_service_broker_flow_uses_queued_job() {
             "scp": "ActionsRuntime.RunnerListen",
         }))
         .unwrap();
+    let _runner = request_json(
+        &app,
+        Method::POST,
+        "/runner/server/_apis/v1/Agent/1/0",
+        json!({"name": "runner-1", "version": "2.335.1"}),
+    )
+    .await;
 
     let workflow = "on:
   push:
@@ -5431,6 +5488,32 @@ jobs:
         .await
         .unwrap();
     assert_eq!(response.status(), StatusCode::NO_CONTENT);
+    let duplicate_completion = status_with_bearer(
+        &app,
+        &runner_token,
+        Method::POST,
+        "/broker/1/completejob",
+        json!({"jobId": runner_request_id, "planId": acquired["plan"]["planId"]}),
+    )
+    .await;
+    assert_eq!(
+        duplicate_completion,
+        StatusCode::NO_CONTENT,
+        "broker completion retries are idempotent"
+    );
+    let renew_after_completion = status_with_bearer(
+        &app,
+        &runner_token,
+        Method::POST,
+        "/broker/1/renewjob",
+        json!({"jobId": runner_request_id, "planId": acquired["plan"]["planId"]}),
+    )
+    .await;
+    assert_eq!(
+        renew_after_completion,
+        StatusCode::CONFLICT,
+        "completed broker requests cannot be renewed"
+    );
     let completed_run = request_json(
         &app,
         Method::GET,
@@ -6787,6 +6870,45 @@ async fn job_results_token_cannot_update_another_jobs_steps() {
 }
 
 #[tokio::test]
+async fn twirp_step_metadata_rejects_missing_step_backend_id() {
+    let temp = tempfile::tempdir().unwrap();
+    let state = AppState::new(temp.path().to_path_buf()).await.unwrap();
+    let app = app(state.clone(), CancellationToken::new());
+    let requests = [
+        (
+            "/twirp/results.services.receiver.Receiver/CreateStepSummaryMetadata",
+            json!({
+                "workflow_job_run_backend_id": "job-1",
+                "workflow_run_backend_id": "run-1",
+                "size": 321,
+            }),
+        ),
+        (
+            "/twirp/results.services.receiver.Receiver/CreateStepLogsMetadata",
+            json!({
+                "workflow_job_run_backend_id": "job-1",
+                "workflow_run_backend_id": "run-1",
+                "line_count": 7,
+            }),
+        ),
+    ];
+
+    for (uri, body) in requests {
+        let (status, payload) = request_json_status(&app, Method::POST, uri, body).await;
+        assert!(status.is_client_error(), "{uri} returned {status}");
+        assert!(
+            !matches!(payload.get("ok"), Some(Value::Bool(true))),
+            "{uri} must not report success"
+        );
+    }
+
+    assert!(
+        state.inner.lock().await.log_metadata.is_empty(),
+        "missing step ids must not create metadata"
+    );
+}
+
+#[tokio::test]
 async fn twirp_diag_route_rejects_runner_listen_scope() {
     let temp = tempfile::tempdir().unwrap();
     let state = AppState::new(temp.path().to_path_buf()).await.unwrap();
@@ -7412,30 +7534,26 @@ async fn artifact_v2_ownership_is_enforced_by_runtime_token_scope() {
 async fn disttask_message_delete_stays_reachable_for_protocol_tokens() {
     let temp = tempfile::tempdir().unwrap();
     let state = AppState::new(temp.path().to_path_buf()).await.unwrap();
-    let runtime_token = state.mint_runtime_token("plan-ack", &uuid::Uuid::new_v4());
-    let app = app(state, CancellationToken::new());
-
+    let app = app(state.clone(), CancellationToken::new());
+    let (runner_id, listen_token) =
+        register_runner_with_token(&app, "message-ack-runner", &["self-hosted"], None).await;
+    let (_, session) = create_disttask_session(&app, &listen_token, runner_id).await;
+    assert!(session.get("sessionId").and_then(Value::as_str).is_some());
+    let session_id = session["sessionId"].as_str().unwrap();
     let status = status_with_bearer(
         &app,
-        &runtime_token,
+        &listen_token,
         Method::DELETE,
-        "/runner/server/_apis/distributedtask/pools/1/messages/7?sessionId=session-1",
+        &format!("/runner/server/_apis/distributedtask/pools/1/messages/7?sessionId={session_id}"),
         Value::Null,
     )
     .await;
     assert_eq!(
         status,
         StatusCode::NO_CONTENT,
-        "message ack must stay on the distributedtask prefix under the protocol guard"
+        "message ack must stay on the distributedtask prefix under the runner protocol guard"
     );
 }
-
-/// Plan 000 step 4 probe. The gate counter must move only when a *job
-/// lifecycle* call (renewjob/completejob) arrives on the bare listen token —
-/// the credential Plan 004's fencing carrier assumes cannot appear there.
-/// `acquirejob` and message claims use the listen token by construction, so
-/// counting them in the same place would make the "gate stays zero" check
-/// unfalsifiable.
 #[tokio::test]
 async fn listener_token_probe_gates_only_job_lifecycle_calls() {
     use std::sync::atomic::Ordering::Relaxed;
@@ -7443,12 +7561,8 @@ async fn listener_token_probe_gates_only_job_lifecycle_calls() {
     let temp = tempfile::tempdir().unwrap();
     let state = AppState::new(temp.path().to_path_buf()).await.unwrap();
     let app = app(state.clone(), CancellationToken::new());
-    let listen_token = state
-        .local_jwt(json!({
-            "sub": "preloop-runner-listen-1",
-            "scp": "ActionsRuntime.RunnerListen",
-        }))
-        .unwrap();
+    let (runner_id, listen_token) =
+        register_runner_with_token(&app, "runner-1", &["self-hosted"], None).await;
 
     let workflow =
         "on: push\njobs:\n  build:\n    runs-on: ubuntu-latest\n    steps:\n      - run: echo hi\n";
@@ -7460,7 +7574,7 @@ async fn listener_token_probe_gates_only_job_lifecycle_calls() {
         Method::POST,
         "/runner/server/_apis/distributedtask/pools/1/sessions",
         json!({
-            "agent": {"id": 1, "name": "runner-1"},
+            "agent": {"id": runner_id, "name": "runner-1"},
             "ownerName": "owner",
             "sessionId": "00000000-0000-0000-0000-000000000000",
             "useFipsEncryption": false
@@ -7501,7 +7615,7 @@ async fn listener_token_probe_gates_only_job_lifecycle_calls() {
     let acquired = request_json_with_bearer(
         &app,
         Method::POST,
-        "/broker/1/acquirejob",
+        &format!("/broker/{runner_id}/acquirejob"),
         acquire,
         &listen_token,
     )
@@ -7522,7 +7636,7 @@ async fn listener_token_probe_gates_only_job_lifecycle_calls() {
     let renewed = request_json_with_bearer(
         &app,
         Method::POST,
-        "/broker/1/renewjob",
+        &format!("/broker/{runner_id}/renewjob"),
         renew.clone(),
         &runtime_token,
     )
@@ -7538,7 +7652,7 @@ async fn listener_token_probe_gates_only_job_lifecycle_calls() {
     let renewed = request_json_with_bearer(
         &app,
         Method::POST,
-        "/broker/1/renewjob",
+        &format!("/broker/{runner_id}/renewjob"),
         renew,
         &listen_token,
     )
@@ -7550,7 +7664,7 @@ async fn listener_token_probe_gates_only_job_lifecycle_calls() {
         &app,
         &listen_token,
         Method::POST,
-        "/broker/1/completejob",
+        &format!("/broker/{runner_id}/completejob"),
         json!({"jobId": agent_job_id.to_string(), "planId": plan_id, "conclusion": "succeeded"}),
     )
     .await;
@@ -7563,6 +7677,408 @@ async fn listener_token_probe_gates_only_job_lifecycle_calls() {
     );
 }
 
+#[tokio::test]
+async fn legacy_runner_aliases_require_registration_and_bound_runner_credentials() {
+    let temp = tempfile::tempdir().unwrap();
+    let state = AppState::new(temp.path().to_path_buf()).await.unwrap();
+    let app = app(state.clone(), CancellationToken::new());
+    let socket_app = app
+        .clone()
+        .layer(middleware::from_fn(crate::auth::runner_surface_only));
+    let prefixes = ["/runner/server/_apis/v1", "/_apis/v1", "/contoso/_apis/v1"];
+
+    // The TCP router and the guest-mounted socket must reject the complete
+    // legacy lifecycle surface before it can create or address an identity.
+    for surface in [&app, &socket_app] {
+        for prefix in prefixes {
+            for (method, suffix, body) in [
+                (Method::GET, "/Agent/1/0", Value::Null),
+                (
+                    Method::POST,
+                    "/Agent/1/0",
+                    json!({"name": "unauthorized", "labels": []}),
+                ),
+                (
+                    Method::POST,
+                    "/AgentSession/1/session",
+                    json!({"agent": {"id": 1, "name": "unauthorized"}}),
+                ),
+                (
+                    Method::GET,
+                    "/Message/1?sessionId=session&waitSeconds=0",
+                    Value::Null,
+                ),
+                (Method::GET, "/AgentRequest/1/1", Value::Null),
+                (Method::PATCH, "/Timeline/s/h/p/t", json!({})),
+                (Method::POST, "/Logfiles/s/h/p", json!({})),
+                (Method::POST, "/Logfiles/s/h/p/l", json!({})),
+                (Method::POST, "/TimeLineWebConsoleLog/s/h/p/t/r", json!({})),
+                (Method::POST, "/FinishJob/s/h/p", json!({})),
+                (Method::POST, "/ActionDownloadInfo/s/h/p", json!({})),
+            ] {
+                let uri = format!("{prefix}{suffix}");
+                assert_eq!(
+                    request_status_without_bearer(surface, method.clone(), &uri, body).await,
+                    StatusCode::UNAUTHORIZED,
+                    "{method} {uri} must reject an unauthenticated caller"
+                );
+            }
+        }
+    }
+    // The configure client also uses the distributedtask registration alias.
+    // It must enforce the same boundary on TCP and the guest socket.
+    for surface in [&app, &socket_app] {
+        assert_eq!(
+            request_status_without_bearer(
+                surface,
+                Method::POST,
+                "/runner/server/_apis/distributedtask/pools/1/agents",
+                json!({"name": "unauthorized", "labels": []}),
+            )
+            .await,
+            StatusCode::UNAUTHORIZED,
+            "distributedtask registration must reject an unauthenticated caller"
+        );
+    }
+
+    // The GitHub-compatible endpoint returns a narrowly scoped local
+    // RunnerManage credential. That credential is valid for all registration
+    // aliases, unlike an arbitrary locally signed JWT.
+    let registration = request_json_with_bearer(
+        &app,
+        Method::POST,
+        "/api/v3/actions/runner-registration",
+        json!({"url": "https://github.com/acme/repo"}),
+        DEFAULT_PRELOOP_SYSTEM_TOKEN,
+    )
+    .await;
+    let manage = registration["token"].as_str().unwrap();
+    let registration_paths = [
+        (
+            "/runner/server/_apis/distributedtask/pools/1/agents",
+            "distributedtask",
+        ),
+        ("/runner/server/_apis/v1/Agent/1/0", "runner-server"),
+        ("/_apis/v1/Agent/1/0", "root"),
+        ("/contoso/_apis/v1/Agent/1/0", "org"),
+    ];
+    let mut registered = Vec::new();
+    for (path, name) in registration_paths {
+        let body = json!({"name": name, "labels": ["self-hosted"]});
+        let response = request_json_with_bearer(&app, Method::POST, path, body, manage).await;
+        registered.push((
+            response["id"].as_i64().unwrap(),
+            response["authorization"]["clientId"]
+                .as_str()
+                .unwrap()
+                .to_owned(),
+        ));
+    }
+
+    // A pool-issued one-time credential is the alternate host-side
+    // registration path. It is consumed by the handler, not reusable.
+    stage_provision_token(&state, "one-time-provision");
+    let provisioned = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method(Method::POST)
+                .uri("/runner/server/_apis/distributedtask/pools/1/agents")
+                .header("x-preloop-provision-token", "one-time-provision")
+                .header(header::CONTENT_TYPE, "application/json")
+                .body(Body::from(
+                    json!({"name": "provisioned", "labels": []}).to_string(),
+                ))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(provisioned.status(), StatusCode::OK);
+    assert!(
+        state
+            .pending_registrations
+            .read()
+            .map(|pending| pending.is_empty())
+            .unwrap_or(false),
+        "the provision credential must be single-use"
+    );
+
+    // Knowing a client id is not an OAuth credential. The JSON compatibility
+    // flow is intentionally limited to the trusted local control-plane token;
+    // production runners use the signed client_assertion form.
+    let oauth_body = json!({
+        "grant_type": "client_credentials",
+        "client_id": registered[0].1.clone(),
+        "client_secret": "unused"
+    });
+    assert_eq!(
+        request_status_without_bearer(
+            &app,
+            Method::POST,
+            "/runner/server/_apis/v1/oauth2/token",
+            oauth_body.clone(),
+        )
+        .await,
+        StatusCode::UNAUTHORIZED
+    );
+    let oauth_a = request_json_with_bearer(
+        &app,
+        Method::POST,
+        "/runner/server/_apis/v1/oauth2/token",
+        oauth_body,
+        DEFAULT_PRELOOP_SYSTEM_TOKEN,
+    )
+    .await;
+    let token_a = oauth_a["access_token"].as_str().unwrap().to_owned();
+
+    assert_eq!(
+        request_status_with_bearer(
+            &app,
+            Method::POST,
+            "/_apis/v1/Agent/1/0",
+            json!({"name": "listen-token-registration", "labels": []}),
+            &token_a,
+        )
+        .await,
+        StatusCode::UNAUTHORIZED,
+        "a RunnerListen token must not authorize a new registration"
+    );
+    assert_eq!(
+        request_status_with_bearer(
+            &app,
+            Method::POST,
+            "/runner/server/_apis/distributedtask/pools/1/agents",
+            json!({"name": "listen-token-registration", "labels": []}),
+            &token_a,
+        )
+        .await,
+        StatusCode::UNAUTHORIZED,
+        "a RunnerListen token must not authorize distributedtask registration"
+    );
+    let oauth_b = request_json_with_bearer(
+        &app,
+        Method::POST,
+        "/_apis/v1/oauth2/token",
+        json!({
+            "grant_type": "client_credentials",
+            "client_id": registered[1].1.clone(),
+            "client_secret": "unused"
+        }),
+        DEFAULT_PRELOOP_SYSTEM_TOKEN,
+    )
+    .await;
+    let token_b = oauth_b["access_token"].as_str().unwrap().to_owned();
+
+    assert_eq!(
+        request_status_with_bearer(
+            &app,
+            Method::DELETE,
+            &format!(
+                "/runner/server/_apis/distributedtask/pools/1/agents/{}",
+                registered[0].0
+            ),
+            Value::Null,
+            &token_b,
+        )
+        .await,
+        StatusCode::FORBIDDEN,
+        "runner B must not delete runner A"
+    );
+
+    // Session creation binds the stored owner to the verified listen token,
+    // not to a caller-controlled agent.id field.
+    assert_eq!(
+        request_status_with_bearer(
+            &app,
+            Method::POST,
+            "/runner/server/_apis/v1/AgentSession/1/session-cross",
+            json!({"agent": {"id": registered[1].0, "name": "wrong"}}),
+            &token_a,
+        )
+        .await,
+        StatusCode::FORBIDDEN
+    );
+    let session_a = request_json_with_bearer(
+        &app,
+        Method::POST,
+        "/runner/server/_apis/v1/AgentSession/1/session-a",
+        json!({"agent": {"id": registered[0].0, "name": "runner-a"}}),
+        &token_a,
+    )
+    .await;
+    let session_a_id = session_a["sessionId"].as_str().unwrap().to_owned();
+    let _session_b = request_json_with_bearer(
+        &app,
+        Method::POST,
+        "/contoso/_apis/v1/AgentSession/1/session-b",
+        json!({"agent": {"id": registered[1].0, "name": "runner-b"}}),
+        &token_b,
+    )
+    .await;
+
+    // A valid runner credential still cannot poll another runner's session,
+    // including when that session already has an inflight message.
+    assert_eq!(
+        request_status_with_bearer(
+            &app,
+            Method::GET,
+            &format!("/_apis/v1/Message/1?sessionId={session_a_id}&waitSeconds=0"),
+            Value::Null,
+            &token_b,
+        )
+        .await,
+        StatusCode::FORBIDDEN
+    );
+    assert_eq!(
+        request_status_with_bearer(
+            &app,
+            Method::GET,
+            &format!("/runner/server/_apis/v1/Message/1?sessionId={session_a_id}&waitSeconds=0"),
+            Value::Null,
+            &token_a,
+        )
+        .await,
+        StatusCode::OK
+    );
+}
+
+#[tokio::test]
+async fn legacy_agent_requests_are_bound_to_runner_identity() {
+    let temp = tempfile::tempdir().unwrap();
+    let state = AppState::new(temp.path().to_path_buf()).await.unwrap();
+    let app = app(state.clone(), CancellationToken::new());
+
+    let (runner_a, token_a) =
+        register_runner_with_token(&app, "agent-request-a", &["self-hosted"], None).await;
+    let (runner_b, token_b) =
+        register_runner_with_token(&app, "agent-request-b", &["self-hosted"], None).await;
+    let (session_status, session) = create_disttask_session(&app, &token_a, runner_a).await;
+    assert_eq!(session_status, StatusCode::CREATED);
+    let session_id = session["sessionId"].as_str().unwrap().to_owned();
+
+    let _accepted = submit_simple_run(&app).await;
+    let message = poll_message(&app, &token_a, &session_id).await;
+    assert_eq!(
+        message["messageType"],
+        azdo::message_type::PIPELINE_AGENT_JOB_REQUEST
+    );
+    let request_id = {
+        let inner = state.inner.lock().await;
+        *inner.session_active_requests.get(&session_id).unwrap()
+    };
+
+    // Deleting a session can happen during listener recovery. The request
+    // owner must survive that lifecycle event so the original runner can
+    // still finish its in-flight job.
+    assert_eq!(
+        request_status_with_bearer(
+            &app,
+            Method::DELETE,
+            &format!("/runner/server/_apis/v1/AgentSession/1/{session_id}"),
+            Value::Null,
+            &token_a,
+        )
+        .await,
+        StatusCode::NO_CONTENT
+    );
+
+    for (method, body) in [
+        (Method::GET, Value::Null),
+        (Method::POST, Value::Null),
+        (Method::PATCH, json!({"result": "failed"})),
+    ] {
+        assert_eq!(
+            request_status_with_bearer(
+                &app,
+                method.clone(),
+                &format!("/runner/server/_apis/v1/AgentRequest/1/{request_id}"),
+                body,
+                &token_b,
+            )
+            .await,
+            StatusCode::FORBIDDEN,
+            "runner B must not address runner A's agent request with {method}"
+        );
+    }
+
+    assert_eq!(
+        request_status_with_bearer(
+            &app,
+            Method::PATCH,
+            &format!("/runner/server/_apis/v1/AgentRequest/1/{request_id}"),
+            json!({"result": "succeeded"}),
+            &token_a,
+        )
+        .await,
+        StatusCode::OK
+    );
+
+    // Completion does not make the request readable or writable by another
+    // registered runner; the owner is retained on the request record.
+    for (method, body) in [
+        (Method::GET, Value::Null),
+        (Method::PATCH, json!({"result": "failed"})),
+    ] {
+        assert_eq!(
+            request_status_with_bearer(
+                &app,
+                method.clone(),
+                &format!("/runner/server/_apis/v1/AgentRequest/1/{request_id}"),
+                body,
+                &token_b,
+            )
+            .await,
+            StatusCode::FORBIDDEN,
+            "runner B must not address completed runner A request with {method}"
+        );
+    }
+    let inner = state.inner.lock().await;
+    assert_eq!(
+        inner.job_requests.get(&request_id).unwrap().result,
+        Some(ExecutionStatus::Success)
+    );
+    let _ = runner_b;
+}
+
+#[tokio::test]
+async fn legacy_provision_token_is_consumed_atomically() {
+    let temp = tempfile::tempdir().unwrap();
+    let state = AppState::new(temp.path().to_path_buf()).await.unwrap();
+    let app = app(state.clone(), CancellationToken::new());
+    stage_provision_token(&state, "concurrent-provision");
+
+    let make_request = || {
+        Request::builder()
+            .method(Method::POST)
+            .uri("/_apis/v1/Agent/1/0")
+            .header("x-preloop-provision-token", "concurrent-provision")
+            .header(header::CONTENT_TYPE, "application/json")
+            .body(Body::from(
+                json!({"name": "concurrent", "labels": []}).to_string(),
+            ))
+            .unwrap()
+    };
+    let (first, second) = tokio::join!(
+        app.clone().oneshot(make_request()),
+        app.clone().oneshot(make_request())
+    );
+    let first = first.unwrap().status();
+    let second = second.unwrap().status();
+
+    assert!(
+        [first, second].contains(&StatusCode::OK),
+        "one concurrent registration must consume the token: {first}, {second}"
+    );
+    assert!(
+        [first, second].contains(&StatusCode::UNAUTHORIZED),
+        "the consumed token must reject the competing registration: {first}, {second}"
+    );
+    assert!(state
+        .pending_registrations
+        .read()
+        .map(|pending| pending.is_empty())
+        .unwrap_or(false));
+}
 #[tokio::test]
 async fn oidc_endpoint_mints_rs256_jwt_with_requested_audience() {
     let temp = tempfile::tempdir().unwrap();
@@ -8163,6 +8679,90 @@ async fn cancel_run_completes_github_checks_and_terminal_metadata() {
     assert_eq!(mine.len(), 1, "one cancel, one check-run completion");
     assert_eq!(mine[0]["status"], "completed");
     assert_eq!(mine[0]["conclusion"], "cancelled");
+}
+
+#[tokio::test]
+async fn completed_check_uploads_every_annotation_in_batches_of_fifty() {
+    const CHECK_RUN_ID: u64 = 7;
+    let patches = Arc::new(parking_lot::Mutex::new(Vec::<Value>::new()));
+    let mock_app = Router::new()
+        .route(
+            "/repos/owner/repo/check-runs",
+            post(|| async { Json(json!({"id": CHECK_RUN_ID})) }),
+        )
+        .route(
+            "/repos/owner/repo/check-runs/:id",
+            axum::routing::patch({
+                let patches = patches.clone();
+                move |Path(_id): Path<u64>, body: axum::extract::Json<Value>| {
+                    let patches = patches.clone();
+                    async move {
+                        patches.lock().push(body.0);
+                        Json(json!({"id": CHECK_RUN_ID}))
+                    }
+                }
+            }),
+        );
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let port = listener.local_addr().unwrap().port();
+    tokio::spawn(async move {
+        axum::serve(listener, mock_app).await.unwrap();
+    });
+
+    let _env = crate::state::GITHUB_ENV_LOCK.lock().await;
+    let _api_url =
+        crate::state::TestEnvVar::set("PRELOOP_GITHUB_API_URL", format!("http://127.0.0.1:{port}"));
+    let _token = crate::state::TestEnvVar::set("PRELOOP_GITHUB_TOKEN", "annotation-test-token");
+    let temp = tempfile::tempdir().unwrap();
+    let state = AppState::new(temp.path().to_path_buf()).await.unwrap();
+    let app = app(state.clone(), CancellationToken::new());
+    let accepted = submit_simple_run(&app).await;
+    let run_id: RunId = accepted["run_id"].as_str().unwrap().parse().unwrap();
+    let job_id = JobId("build".to_owned());
+    {
+        let mut inner = state.inner.lock().await;
+        inner
+            .runs
+            .get_mut(&run_id)
+            .unwrap()
+            .job_check_run_ids
+            .insert(job_id.clone(), CHECK_RUN_ID);
+        let events = inner.timeline_events.entry(run_id).or_default();
+        for line in 1..=120 {
+            events.push(NdjsonEvent::Annotation {
+                run_id,
+                job_id: job_id.clone(),
+                level: AnnotationLevel::Warning,
+                message: format!("warning {line}"),
+                file: Some("src/lib.rs".to_owned()),
+                line: Some(line),
+                end_line: None,
+                col: None,
+                end_column: None,
+                title: None,
+                step_id: None,
+            });
+        }
+    }
+
+    request_json(
+        &app,
+        Method::POST,
+        &format!("/api/v1/runs/{run_id}/cancel"),
+        Value::Null,
+    )
+    .await;
+
+    let patches = patches.lock();
+    assert_eq!(patches.len(), 3);
+    let batch_sizes: Vec<usize> = patches
+        .iter()
+        .map(|body| body["output"]["annotations"].as_array().unwrap().len())
+        .collect();
+    assert_eq!(batch_sizes, vec![50, 50, 20]);
+    assert!(patches[0].get("status").is_none());
+    assert_eq!(patches[2]["status"], "completed");
+    assert_eq!(patches[2]["conclusion"], "cancelled");
 }
 
 #[tokio::test]
@@ -10270,6 +10870,96 @@ async fn a_dispatch_refused_by_the_mint_policy_fails_its_run_without_the_reaper(
     assert!(!inner.inflight_requests.contains_key(&request_id));
 }
 
+/// A settled attempt must not be acquirable. The broker retains
+/// `owner_runner_id` after completion so late protocol reads stay bound to the
+/// runner that ran the job, which means ownership alone cannot gate
+/// `acquirejob`: a runner that retries the call after reporting would be
+/// handed the job payload (and a freshly minted installation token) and would
+/// execute the same job's side effects twice, then fail to report because
+/// `renewjob` 409s and `completejob` ignores duplicates.
+#[tokio::test]
+async fn a_settled_attempt_cannot_be_acquired_again() {
+    let temp = tempfile::tempdir().unwrap();
+    let state = AppState::new(temp.path().to_path_buf()).await.unwrap();
+    let app = app(state.clone(), CancellationToken::new());
+    let registered = request_json(
+        &app,
+        Method::POST,
+        "/runner/server/_apis/v1/Agent/1/0",
+        json!({"name": "acquire-guard-runner", "version": "2.336.0"}),
+    )
+    .await;
+    let runner_id = registered["id"].as_i64().unwrap();
+    let runner_token = state
+        .local_jwt(json!({
+            "sub": format!("preloop-runner-listen-{runner_id}"),
+            "scp": "ActionsRuntime.RunnerListen",
+        }))
+        .unwrap();
+
+    submit_simple_run(&app).await;
+    let session = request_json_with_bearer(
+        &app,
+        Method::POST,
+        "/runner/server/session",
+        json!({}),
+        &runner_token,
+    )
+    .await;
+    let session_id = session["sessionId"].as_str().unwrap();
+    let job_ref = request_json_with_bearer(
+        &app,
+        Method::GET,
+        &format!("/runner/server/message?sessionId={session_id}&status=Online&waitSeconds=0"),
+        Value::Null,
+        &runner_token,
+    )
+    .await;
+    let body: Value = serde_json::from_str(job_ref["body"].as_str().unwrap()).unwrap();
+    let job_message_id = body["runner_request_id"].as_str().unwrap().to_owned();
+    let request_id = {
+        let inner = state.inner.lock().await;
+        *inner.job_requests.keys().next().unwrap()
+    };
+    let acquire =
+        json!({"jobMessageId": job_message_id, "billingOwnerId": "local", "runnerOS": "Linux"});
+
+    // A live claim acquires normally: the guard must not break dispatch.
+    assert_eq!(
+        status_with_bearer(
+            &app,
+            &runner_token,
+            Method::POST,
+            &format!("/broker/{runner_id}/acquirejob"),
+            acquire.clone(),
+        )
+        .await,
+        StatusCode::OK
+    );
+
+    request_json_with_bearer(
+        &app,
+        Method::PATCH,
+        &format!("/_apis/v1/AgentRequest/1/{request_id}"),
+        json!({"result": "Succeeded"}),
+        &runner_token,
+    )
+    .await;
+
+    assert_eq!(
+        status_with_bearer(
+            &app,
+            &runner_token,
+            Method::POST,
+            &format!("/broker/{runner_id}/acquirejob"),
+            acquire,
+        )
+        .await,
+        StatusCode::CONFLICT,
+        "a reported attempt must never be handed back to a runner"
+    );
+}
+
 #[tokio::test]
 async fn app_only_server_fetches_webhook_workflows_with_installation_token() {
     use crate::github_app::{GitHubAppCredentials, MintFailurePolicy};
@@ -10759,17 +11449,17 @@ async fn liveness_sweep_requeues_job_of_deaf_runner() {
     let job_id = JobId("build".to_owned());
     let message = poll_message(&app, &token, &session_id).await;
     assert!(!message.is_null(), "poll must claim the queued job");
-    {
+    let request_id = {
         let inner = state.inner.lock().await;
         assert!(
             inner.claimed_jobs.contains_key(&(run_id, job_id.clone())),
             "poll must record the claim in claimed_jobs"
         );
-        assert!(
-            inner.session_active_requests.contains_key(&session_id),
-            "poll must pin the claim to the session"
-        );
-    }
+        *inner
+            .session_active_requests
+            .get(&session_id)
+            .expect("poll must pin the claim to the session")
+    };
 
     // The runner goes deaf: backdate its last poll and shrink the timeout.
     {
@@ -10800,6 +11490,30 @@ async fn liveness_sweep_requeues_job_of_deaf_runner() {
             !inner.claimed_jobs.contains_key(&(run_id, job_id.clone())),
             "deaf claim must leave claimed_jobs"
         );
+        let request = &inner.job_requests[&request_id];
+        assert_eq!(
+            request.result, None,
+            "the requeued request must remain completable"
+        );
+        assert_eq!(
+            request.owner_runner_id, None,
+            "the purged runner must lose request ownership"
+        );
+        assert_eq!(request.started_at, None);
+        assert_eq!(request.last_renewed_at, None);
+        assert!(
+            inner.inflight_requests.contains_key(&request_id),
+            "the request must remain inflight for its replacement"
+        );
+        assert!(
+            crate::runtime_scheduling::live_runner_assignments(
+                &inner.job_requests,
+                &inner.session_active_requests,
+                SystemTime::now(),
+            )
+            .is_empty(),
+            "status must not report the purged runner as executing"
+        );
         assert!(
             inner
                 .queue
@@ -10808,6 +11522,40 @@ async fn liveness_sweep_requeues_job_of_deaf_runner() {
             "unfinished job must be requeued for a fresh machine"
         );
     }
+
+    // A replacement claims the same correlation, renews it, and completes the
+    // logical job. Settling the request before requeue would let the delivery
+    // happen but make both PATCHes no-ops.
+    let (replacement_id, replacement_token) =
+        register_runner_with_token(&app, "replacement-runner", &["self-hosted"], None).await;
+    let (_, replacement_session) =
+        create_disttask_session(&app, &replacement_token, replacement_id).await;
+    let replacement_session_id = replacement_session["sessionId"].as_str().unwrap();
+    let delivered = poll_message(&app, &replacement_token, replacement_session_id).await;
+    assert!(!delivered.is_null(), "replacement must receive the retry");
+    request_json_with_bearer(
+        &app,
+        Method::PATCH,
+        &format!("/_apis/v1/AgentRequest/1/{request_id}"),
+        json!({}),
+        &replacement_token,
+    )
+    .await;
+    request_json_with_bearer(
+        &app,
+        Method::PATCH,
+        &format!("/_apis/v1/AgentRequest/1/{request_id}"),
+        json!({"result": "Succeeded"}),
+        &replacement_token,
+    )
+    .await;
+    let inner = state.inner.lock().await;
+    assert_eq!(
+        inner.runs[&run_id].jobs[&job_id],
+        ExecutionStatus::Success,
+        "the replacement must be able to finish the retried job"
+    );
+    assert!(!inner.inflight_requests.contains_key(&request_id));
 }
 
 #[tokio::test]
@@ -10924,6 +11672,54 @@ async fn queued_job_survives_the_grace_window_while_the_pool_is_preparing() {
 }
 
 #[tokio::test]
+async fn restored_old_job_survives_the_restarted_pools_warm_window() {
+    let temp = tempfile::tempdir().unwrap();
+    let run_id = {
+        let state = AppState::new(temp.path().to_path_buf()).await.unwrap();
+        let app = app(state.clone(), CancellationToken::new());
+        let accepted = submit_simple_run(&app).await;
+        let run_id: RunId = accepted["run_id"].as_str().unwrap().parse().unwrap();
+        {
+            let mut inner = state.inner.lock().await;
+            let cutoff = (SystemTime::now() - Duration::from_secs(700))
+                .duration_since(SystemTime::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos() as i64;
+            inner
+                .queue
+                .iter_mut()
+                .find(|job| job.run_id == run_id)
+                .unwrap()
+                .enqueued_at_unix_nanos = cutoff;
+            let snapshot = crate::store::StoreSnapshot::from_inner(&inner);
+            state.store.store_inner(&snapshot).await.unwrap();
+        }
+        run_id
+    };
+
+    let mut restored = AppState::new(temp.path().to_path_buf()).await.unwrap();
+    restored.pool_preparing = Some(std::sync::Arc::new(std::sync::atomic::AtomicBool::new(
+        true,
+    )));
+    let shared = Arc::new(SharedState {
+        state: restored.clone(),
+        shutdown: CancellationToken::new(),
+    });
+    reap_once(&shared).await;
+
+    let inner = restored.inner.lock().await;
+    assert_eq!(
+        inner.queue.len(),
+        1,
+        "durable queue age must not defeat the fresh process-local pool warm"
+    );
+    assert_eq!(
+        inner.runs[&run_id].jobs[&JobId("build".to_owned())],
+        ExecutionStatus::Queued
+    );
+}
+
+#[tokio::test]
 async fn queued_job_starves_past_the_ceiling_even_while_the_pool_is_preparing() {
     let temp = tempfile::tempdir().unwrap();
     let mut state = AppState::new(temp.path().to_path_buf()).await.unwrap();
@@ -10938,6 +11734,7 @@ async fn queued_job_starves_past_the_ceiling_even_while_the_pool_is_preparing() 
     state.pool_preparing = Some(std::sync::Arc::new(std::sync::atomic::AtomicBool::new(
         true,
     )));
+    state.started_at = std::time::Instant::now() - Duration::from_secs(700);
     let shared = Arc::new(SharedState {
         state: state.clone(),
         shutdown,
@@ -11256,6 +12053,22 @@ async fn request_status_with_bearer(
         .method(method)
         .uri(uri)
         .header(header::AUTHORIZATION, format!("Bearer {bearer}"));
+    let request = if body.is_null() {
+        builder.body(Body::empty()).unwrap()
+    } else {
+        builder = builder.header(header::CONTENT_TYPE, "application/json");
+        builder.body(Body::from(body.to_string())).unwrap()
+    };
+    app.clone().oneshot(request).await.unwrap().status()
+}
+
+async fn request_status_without_bearer(
+    app: &Router,
+    method: Method,
+    uri: &str,
+    body: Value,
+) -> StatusCode {
+    let mut builder = Request::builder().method(method).uri(uri);
     let request = if body.is_null() {
         builder.body(Body::empty()).unwrap()
     } else {
@@ -18359,6 +19172,7 @@ async fn snapshot_drops_unresolvable_gitlinks_but_keeps_registered_submodules() 
     fs::create_dir_all(&nested).unwrap();
     git_fixture_command(&nested, &["init", "-q", "-b", "main"]);
     git_fixture_command(&nested, &["config", "user.email", "nested@example.test"]);
+    git_fixture_command(&nested, &["config", "user.name", "Nested Test"]);
     fs::write(nested.join("payload.txt"), "nested\n").unwrap();
     git_fixture_command(&nested, &["add", "payload.txt"]);
     git_fixture_command(&nested, &["commit", "-qm", "nested"]);
@@ -18467,6 +19281,7 @@ async fn snapshot_gitlink_resolution_matches_git() {
         fs::create_dir_all(&nested).unwrap();
         git_fixture_command(&nested, &["init", "-q", "-b", "main"]);
         git_fixture_command(&nested, &["config", "user.email", "nested@example.test"]);
+        git_fixture_command(&nested, &["config", "user.name", "Nested Test"]);
         fs::write(nested.join("payload.txt"), format!("{path}\n")).unwrap();
         git_fixture_command(&nested, &["add", "payload.txt"]);
         git_fixture_command(&nested, &["commit", "-qm", path]);
@@ -19300,12 +20115,8 @@ jobs:
     let runner_request_id = broker_body["runner_request_id"]
         .as_str()
         .expect("broker message should identify the queued request");
-    let runner_token = state
-        .local_jwt(json!({
-            "sub": "preloop-runner-listen-1",
-            "scp": "ActionsRuntime.RunnerListen",
-        }))
-        .unwrap();
+    let (_runner_id, runner_token) =
+        register_runner_with_token(&app, "remint-runner", &["self-hosted"], None).await;
 
     let acquired = request_json_with_bearer(
         &app,
@@ -19569,12 +20380,8 @@ jobs:
     let runner_request_id = broker_body["runner_request_id"]
         .as_str()
         .expect("broker message should identify the queued request");
-    let runner_token = state
-        .local_jwt(json!({
-            "sub": "preloop-runner-listen-1",
-            "scp": "ActionsRuntime.RunnerListen",
-        }))
-        .unwrap();
+    let (_runner_id, runner_token) =
+        register_runner_with_token(&app, "snapshot-runner", &["self-hosted"], None).await;
     let acquired = request_json_with_bearer(
         &app,
         Method::POST,
@@ -22052,14 +22859,13 @@ async fn listen_tokens_are_revoked_when_the_runner_identity_is_purged() {
     // The same token is now refused at the auth layer.
     assert_eq!(poll(&app).await.status(), StatusCode::UNAUTHORIZED);
 
-    // And the identity resolver no longer treats the bearer as a runner: the
-    // token cannot force a *verified* binding after teardown, so the session
-    // body's own claim wins (legacy unverified session).
+    // The protected session route also rejects the revoked token; a stale
+    // bearer must not fall back to an unverified body-controlled identity.
     let after_session = create_session(&app).await;
     assert_eq!(
         after_session.status(),
-        StatusCode::CREATED,
-        "after purge the token is unverified and cannot force a binding"
+        StatusCode::UNAUTHORIZED,
+        "purged listen token cannot create a session"
     );
 }
 
@@ -22170,6 +22976,53 @@ async fn purge_requeues_claimed_unfinished_job_to_another_runner() {
         delivered["messageType"].as_str().is_some(),
         "machine B receives the requeued job: {delivered}"
     );
+}
+#[tokio::test]
+async fn startup_purge_removes_only_restored_ephemeral_runners() {
+    let temp = tempfile::tempdir().unwrap();
+    let state = pool_managed_state(&temp).await;
+    let app = app(state.clone(), CancellationToken::new());
+
+    let ephemeral = request_json(
+        &app,
+        Method::POST,
+        "/api/v1/runners",
+        json!({
+            "name": "pool-machine",
+            "labels": ["self-hosted"],
+            "ephemeral": true
+        }),
+    )
+    .await;
+    let ephemeral_id = ephemeral["id"].as_i64().unwrap();
+    let (external_id, _) =
+        register_runner_with_token(&app, "external-machine", &["self-hosted"], None).await;
+    {
+        let inner = state.inner.lock().await;
+        assert!(inner.runners[&ephemeral_id].ephemeral);
+        assert!(!inner.runners[&external_id].ephemeral);
+    }
+    drop(app);
+    drop(state);
+
+    let restored_state = AppState::new(temp.path().to_path_buf()).await.unwrap();
+    {
+        let inner = restored_state.inner.lock().await;
+        assert!(inner.runners[&ephemeral_id].ephemeral);
+        assert!(inner.runners.contains_key(&external_id));
+    }
+    let restored_shared = Arc::new(SharedState {
+        state: restored_state.clone(),
+        shutdown: CancellationToken::new(),
+    });
+    crate::runner_lifecycle::purge_restored_ephemeral_runners(&restored_shared).await;
+    drop(restored_shared);
+    drop(restored_state);
+
+    let final_state = AppState::new(temp.path().to_path_buf()).await.unwrap();
+    let inner = final_state.inner.lock().await;
+    assert!(!inner.runners.contains_key(&ephemeral_id));
+    assert!(inner.runners.contains_key(&external_id));
 }
 
 #[tokio::test]
@@ -23956,6 +24809,101 @@ async fn startup_fails_claims_orphaned_by_a_restart() {
     );
 }
 
+/// Versions before the runner-purge fix put the logical job back on the queue
+/// but left its request owned by a dead runner and detached from every session.
+/// Startup must release that persisted correlation for a replacement runner.
+#[tokio::test]
+async fn startup_releases_an_orphaned_request_whose_job_was_requeued() {
+    let temp = tempfile::tempdir().unwrap();
+    let state = AppState::new(temp.path().to_path_buf()).await.unwrap();
+    let app = app(state.clone(), CancellationToken::new());
+    let accepted = submit_simple_run(&app).await;
+    let run_id: RunId = accepted["run_id"].as_str().unwrap().parse().unwrap();
+    let job_id = JobId("build".to_owned());
+
+    let request_id = {
+        let mut inner = state.inner.lock().await;
+        let request_id = inner
+            .job_requests
+            .values()
+            .find(|record| record.run_id == run_id && record.job_id == job_id)
+            .map(|record| record.request_id)
+            .expect("queued job request");
+        let record = inner.job_requests.get_mut(&request_id).unwrap();
+        record.owner_runner_id = Some(99);
+        record.started_at = Some(SystemTime::now() - Duration::from_secs(300));
+        request_id
+    };
+
+    let shared = Arc::new(SharedState {
+        state: state.clone(),
+        shutdown: CancellationToken::new(),
+    });
+    let settled = crate::broker::reconcile_orphaned_claims(&shared).await;
+    assert_eq!(settled, 1);
+
+    {
+        let inner = state.inner.lock().await;
+        let request = &inner.job_requests[&request_id];
+        assert_eq!(
+            request.result, None,
+            "the queued request must remain completable"
+        );
+        assert_eq!(
+            request.owner_runner_id, None,
+            "startup must release the dead runner owner"
+        );
+        assert_eq!(request.started_at, None);
+        assert_eq!(request.last_renewed_at, None);
+        assert!(
+            inner.inflight_requests.contains_key(&request_id),
+            "the request correlation must remain inflight"
+        );
+        assert!(
+            inner
+                .queue
+                .iter()
+                .any(|job| job.run_id == run_id && job.job_id == job_id),
+            "the replacement attempt remains queued"
+        );
+        assert_eq!(
+            inner.runs[&run_id].jobs[&job_id],
+            ExecutionStatus::Queued,
+            "releasing the old owner must not conclude its logical job"
+        );
+        assert!(crate::runtime_scheduling::live_runner_assignments(
+            &inner.job_requests,
+            &inner.session_active_requests,
+            SystemTime::now(),
+        )
+        .is_empty());
+    }
+
+    let (runner_id, token) =
+        register_runner_with_token(&app, "startup-replacement", &["self-hosted"], None).await;
+    let (_, session) = create_disttask_session(&app, &token, runner_id).await;
+    let session_id = session["sessionId"].as_str().unwrap();
+    let delivered = poll_message(&app, &token, session_id).await;
+    assert!(
+        !delivered.is_null(),
+        "replacement must receive restored retry"
+    );
+    request_json_with_bearer(
+        &app,
+        Method::PATCH,
+        &format!("/_apis/v1/AgentRequest/1/{request_id}"),
+        json!({"result": "Succeeded"}),
+        &token,
+    )
+    .await;
+    let inner = state.inner.lock().await;
+    assert_eq!(
+        inner.runs[&run_id].jobs[&job_id],
+        ExecutionStatus::Success,
+        "restored retry must complete through the retained correlation"
+    );
+}
+
 // ---------------------------------------------------------------------------
 // Submit-driven CI push-back (`--push`): the server verifies the tested tree,
 // creates the draft PR, and stays idempotent across replays.
@@ -24435,4 +25383,219 @@ async fn dirty_push_sync_verifies_the_branch_head_and_reports_checks_on_the_mate
 
     std::env::remove_var("PRELOOP_GITHUB_TOKEN");
     std::env::remove_var("PRELOOP_GITHUB_API_URL");
+}
+#[tokio::test]
+async fn broker_hybrid_poll_rejects_a_foreign_live_runner() {
+    let temp = tempfile::tempdir().unwrap();
+    let state = AppState::new(temp.path().to_path_buf()).await.unwrap();
+    let app = app(state.clone(), CancellationToken::new());
+
+    let runner_a = request_json(
+        &app,
+        Method::POST,
+        "/runner/server/_apis/v1/Agent/1/0",
+        json!({"name": "runner-a", "version": "2.335.1"}),
+    )
+    .await;
+    let runner_b = request_json(
+        &app,
+        Method::POST,
+        "/runner/server/_apis/v1/Agent/1/0",
+        json!({"name": "runner-b", "version": "2.335.1"}),
+    )
+    .await;
+    let runner_a_id = runner_a["id"].as_i64().unwrap();
+    let runner_b_id = runner_b["id"].as_i64().unwrap();
+    let token_a = state
+        .local_jwt(json!({
+            "sub": format!("preloop-runner-listen-{runner_a_id}"),
+            "scp": "ActionsRuntime.RunnerListen",
+        }))
+        .unwrap();
+    let token_b = state
+        .local_jwt(json!({
+            "sub": format!("preloop-runner-listen-{runner_b_id}"),
+            "scp": "ActionsRuntime.RunnerListen",
+        }))
+        .unwrap();
+    request_json(
+        &app,
+        Method::POST,
+        "/api/v1/runs",
+        json!({
+            "workflow_yaml": "on: push\njobs:\n  build:\n    runs-on: ubuntu-latest\n    steps:\n      - run: echo hi\n",
+            "event": "push",
+            "repository": "owner/repo",
+        }),
+    )
+    .await;
+    let session = request_json_with_bearer(
+        &app,
+        Method::POST,
+        "/runner/server/_apis/distributedtask/pools/1/sessions",
+        json!({
+            "agent": {"id": runner_a_id, "name": "runner-a"},
+            "ownerName": "runner-a",
+            "useFipsEncryption": false,
+        }),
+        &token_a,
+    )
+    .await;
+    let session_id = session["sessionId"].as_str().unwrap();
+    let before = {
+        let inner = state.inner.lock().await;
+        (inner.queue.len(), inner.session_active_requests.clone())
+    };
+    let response = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method(Method::GET)
+                .uri(format!(
+                    "/runner/server/_apis/distributedtask/pools/1/messages?sessionId={session_id}&waitSeconds=0"
+                ))
+                .header(header::AUTHORIZATION, format!("Bearer {token_b}"))
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::FORBIDDEN);
+    let after = {
+        let inner = state.inner.lock().await;
+        (inner.queue.len(), inner.session_active_requests.clone())
+    };
+    assert_eq!(
+        after, before,
+        "a foreign poll must not consume queue work or bind an active request"
+    );
+}
+
+#[tokio::test]
+async fn purged_runner_listen_token_cannot_open_a_broker_session() {
+    let temp = tempfile::tempdir().unwrap();
+    let state = AppState::new(temp.path().to_path_buf()).await.unwrap();
+    let app = app(state.clone(), CancellationToken::new());
+    let runner = request_json(
+        &app,
+        Method::POST,
+        "/runner/server/_apis/v1/Agent/1/0",
+        json!({"name": "runner-revocation", "version": "2.335.1"}),
+    )
+    .await;
+    let runner_id = runner["id"].as_i64().unwrap();
+    let token = state
+        .local_jwt(json!({
+            "sub": format!("preloop-runner-listen-{runner_id}"),
+            "scp": "ActionsRuntime.RunnerListen",
+        }))
+        .unwrap();
+    request_json(
+        &app,
+        Method::DELETE,
+        &format!("/runner/server/_apis/distributedtask/pools/1/agents/{runner_id}"),
+        Value::Null,
+    )
+    .await;
+
+    let response = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method(Method::POST)
+                .uri("/runner/server/session")
+                .header(header::AUTHORIZATION, format!("Bearer {token}"))
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
+}
+
+#[tokio::test]
+async fn reporting_rejects_a_runtime_token_for_a_different_job() {
+    let temp = tempfile::tempdir().unwrap();
+    let state = AppState::new(temp.path().to_path_buf()).await.unwrap();
+    let app = app(state.clone(), CancellationToken::new());
+    let workflow = "on: push\njobs:\n  build:\n    runs-on: ubuntu-latest\n    steps:\n      - run: echo report\n";
+    for _ in 0..2 {
+        request_json(
+            &app,
+            Method::POST,
+            "/api/v1/runs",
+            json!({
+                "workflow_yaml": workflow,
+                "event": "push",
+                "repository": "owner/repo",
+            }),
+        )
+        .await;
+    }
+    let mut requests: Vec<_> = state
+        .inner
+        .lock()
+        .await
+        .job_requests
+        .values()
+        .cloned()
+        .collect();
+    requests.sort_by_key(|request| request.request_id);
+    assert!(requests.len() >= 2);
+    let target = &requests[1];
+    let foreign_token = state.mint_runtime_token(&requests[0].plan_id, &requests[0].agent_job_id);
+    let response = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method(Method::PATCH)
+                .uri(format!(
+                    "/runner/server/_apis/v1/Timeline/scope/hub/{}/{}",
+                    target.plan_id, target.timeline_id
+                ))
+                .header(header::AUTHORIZATION, format!("Bearer {foreign_token}"))
+                .header(header::CONTENT_TYPE, "application/json")
+                .body(Body::from(r#"{"count":0,"value":[]}"#))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::FORBIDDEN);
+}
+
+#[tokio::test]
+async fn flow_recording_redacts_credentials() {
+    let temp = tempfile::tempdir().unwrap();
+    let flow_path = temp.path().join("flows.ndjson");
+    let file = fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(&flow_path)
+        .unwrap();
+    let state = AppState::new(temp.path().to_path_buf()).await.unwrap();
+    let system_token = state.system_token.clone();
+    state.inner.lock().await.flows_file = Some(file);
+    let app = app(state, CancellationToken::new());
+    let response = app
+        .oneshot(
+            Request::builder()
+                .method(Method::GET)
+                .uri("/healthz")
+                .header(header::AUTHORIZATION, format!("Bearer {system_token}"))
+                .header("x-preloop-provision-token", "provision-secret")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert!(
+        response.status().is_success(),
+        "status: {}",
+        response.status()
+    );
+    let flow = fs::read_to_string(flow_path).unwrap();
+    assert!(!flow.contains(&system_token));
+    assert!(!flow.contains("system-secret"));
+    assert!(!flow.contains("provision-secret"));
+    assert!(flow.matches("[REDACTED]").count() >= 2);
 }
