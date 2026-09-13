@@ -2724,6 +2724,7 @@ pub(crate) fn release_request_for_retry(inner: &mut InnerState, request_id: i64)
             record.started_at = None;
             record.last_renewed_at = None;
             record.timeout_triggered = false;
+            record.debug_token_issued = false;
             record.locked_until = crate::distributed_task::agent_request_locked_until();
         }
     }

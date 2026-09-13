@@ -298,7 +298,14 @@ pub(crate) async fn reap_once(shared: &Arc<SharedState>) {
             // local warm window before applying the durable queue-age ceiling;
             // otherwise the first reaper tick fails every old queued job while
             // the golden and its runners are demonstrably still starting.
-            if shared.state.started_at.elapsed() < MAX_QUEUED_GRACE {
+            let enqueued = if job.enqueued_at_unix_nanos > 0 {
+                SystemTime::UNIX_EPOCH + Duration::from_nanos(job.enqueued_at_unix_nanos as u64)
+            } else {
+                now
+            };
+            if shared.state.started_at.elapsed() < MAX_QUEUED_GRACE
+                && now.duration_since(enqueued).unwrap_or_default() < MAX_QUEUED_GRACE
+            {
                 inner.queued_at.remove(&key);
                 continue;
             }
@@ -308,15 +315,6 @@ pub(crate) async fn reap_once(shared: &Arc<SharedState>) {
             // MAX_QUEUED_GRACE measured from ready-enqueue: once a job has
             // waited that long it starves even while the pool is still
             // preparing, so sustained provisioning cannot mask it forever.
-            let enqueued = if job.enqueued_at_unix_nanos > 0 {
-                SystemTime::UNIX_EPOCH + Duration::from_nanos(job.enqueued_at_unix_nanos as u64)
-            } else {
-                now
-            };
-            if now.duration_since(enqueued).unwrap_or_default() < MAX_QUEUED_GRACE {
-                inner.queued_at.remove(&key);
-                continue;
-            }
             MAX_QUEUED_GRACE
         } else {
             let first_seen = *inner.queued_at.entry(key.clone()).or_insert(now);

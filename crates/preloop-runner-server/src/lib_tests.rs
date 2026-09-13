@@ -11420,6 +11420,14 @@ async fn liveness_sweep_requeues_job_of_deaf_runner() {
             .get(&session_id)
             .expect("poll must pin the claim to the session")
     };
+    {
+        let mut inner = state.inner.lock().await;
+        inner
+            .job_requests
+            .get_mut(&request_id)
+            .unwrap()
+            .debug_token_issued = true;
+    }
 
     // The runner goes deaf: backdate its last poll and shrink the timeout.
     {
@@ -11461,6 +11469,10 @@ async fn liveness_sweep_requeues_job_of_deaf_runner() {
         );
         assert_eq!(request.started_at, None);
         assert_eq!(request.last_renewed_at, None);
+        assert!(
+            !request.debug_token_issued,
+            "a retried attempt must be allowed to mint a fresh debug token"
+        );
         assert!(
             inner.inflight_requests.contains_key(&request_id),
             "the request must remain inflight for its replacement"
@@ -11602,9 +11614,9 @@ async fn restored_old_job_survives_the_restarted_pools_warm_window() {
         let app = app(state.clone(), CancellationToken::new());
         let accepted = submit_simple_run(&app).await;
         let run_id: RunId = accepted["run_id"].as_str().unwrap().parse().unwrap();
-        {
+        let snapshot = {
             let mut inner = state.inner.lock().await;
-            let cutoff = (SystemTime::now() - Duration::from_secs(700))
+            let cutoff = (SystemTime::now() - Duration::from_secs(10))
                 .duration_since(SystemTime::UNIX_EPOCH)
                 .unwrap()
                 .as_nanos() as i64;
@@ -11614,9 +11626,9 @@ async fn restored_old_job_survives_the_restarted_pools_warm_window() {
                 .find(|job| job.run_id == run_id)
                 .unwrap()
                 .enqueued_at_unix_nanos = cutoff;
-            let snapshot = crate::store::StoreSnapshot::from_inner(&inner);
-            state.store.store_inner(&snapshot).await.unwrap();
-        }
+            crate::store::StoreSnapshot::from_inner(&inner)
+        };
+        state.store.store_inner(&snapshot).await.unwrap();
         run_id
     };
 
