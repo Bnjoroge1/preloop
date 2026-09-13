@@ -71,6 +71,9 @@ async fn register_runner_inner(
         inner.runner_rsa_public_keys.insert(runner_id, public_key);
     }
     inner.runners.insert(runner.id, runner.clone());
+    inner
+        .runner_registered_at
+        .insert(runner.id, std::time::Instant::now());
     Ok(runner)
 }
 
@@ -413,7 +416,9 @@ fn purge_runner_identity_locked(inner: &mut InnerState, runner_id: i64) -> bool 
     inner.runner_client_ids.retain(|_, id| *id != runner_id);
     inner.runner_public_keys.remove(&runner_id);
     inner.runner_rsa_public_keys.remove(&runner_id);
-
+    inner.pool_proven_runners.remove(&runner_id);
+    inner.runner_registered_at.remove(&runner_id);
+    // Sessions claiming this runner: drop them so subsequent polls stop.
     let doomed_sessions: Vec<String> = inner
         .broker_session_runners
         .iter()
@@ -493,7 +498,7 @@ fn purge_runner_identity_locked(inner: &mut InnerState, runner_id: i64) -> bool 
     let orphaned: Vec<(RunId, JobId)> = inner
         .job_assignments
         .iter()
-        .filter(|(_, record)| record.runner_id == runner_id)
+        .filter(|(_, record)| record.runner_id == Some(runner_id))
         .map(|(key, _)| key.clone())
         .collect();
     for key in orphaned {
@@ -509,12 +514,32 @@ fn purge_runner_identity_locked(inner: &mut InnerState, runner_id: i64) -> bool 
     true
 }
 
-/// Remove every trace of a runner identity: keys, client ids, sessions and
-/// assignments. Shared by agent deregistration and pool machine teardown.
-pub(crate) async fn purge_runner_identity(shared: &Arc<SharedState>, runner_id: i64) {
+/// Remove a runner identity, optionally requiring it to remain sessionless.
+async fn purge_runner_identity_with_phantom_check(
+    shared: &Arc<SharedState>,
+    runner_id: i64,
+    only_if_phantom: bool,
+) -> bool {
     let mut inner = shared.state.inner.lock().await;
+    if only_if_phantom {
+        let has_session = inner
+            .sessions
+            .values()
+            .any(|session| session.runner_id == runner_id)
+            || inner
+                .broker_session_runners
+                .values()
+                .any(|id| *id == runner_id);
+        if has_session {
+            tracing::info!(
+                runner_id,
+                "runner established session before phantom purge; skipping cleanup"
+            );
+            return false;
+        }
+    }
     if !purge_runner_identity_locked(&mut inner, runner_id) {
-        return;
+        return false;
     }
     shared
         .state
@@ -530,6 +555,15 @@ pub(crate) async fn purge_runner_identity(shared: &Arc<SharedState>, runner_id: 
         );
     }
     shared.state.message_notify.notify_waiters();
+    true
+}
+
+pub(crate) async fn purge_phantom_runner(shared: &Arc<SharedState>, runner_id: i64) -> bool {
+    purge_runner_identity_with_phantom_check(shared, runner_id, true).await
+}
+
+pub(crate) async fn purge_runner_identity(shared: &Arc<SharedState>, runner_id: i64) {
+    let _ = purge_runner_identity_with_phantom_check(shared, runner_id, false).await;
 }
 
 /// A server restart destroys every process-owned ephemeral VM. Their durable

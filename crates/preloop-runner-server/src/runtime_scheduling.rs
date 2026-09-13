@@ -84,6 +84,9 @@ pub(crate) fn try_enqueue_with_job_concurrency(
 ) -> Result<bool, ()> {
     match try_acquire_job_gate(inner, github, submission, &queued_job) {
         JobGateOutcome::Proceed => {
+            if queued_job.concurrency.is_some() {
+                stamp_concurrency_acquired(&mut queued_job);
+            }
             statuses.insert(queued_job.job_id.clone(), ExecutionStatus::Queued);
             stamp_ready_enqueue(&mut queued_job);
             on_job_enqueued(inner, &queued_job);
@@ -91,6 +94,7 @@ pub(crate) fn try_enqueue_with_job_concurrency(
             Ok(true)
         }
         JobGateOutcome::Parked => {
+            stamp_concurrency_wait_started(&mut queued_job);
             statuses.insert(queued_job.job_id.clone(), ExecutionStatus::Pending);
             inner.concurrency_blocked.push_back(queued_job);
             Ok(false)
@@ -664,6 +668,7 @@ pub(crate) fn promote_next_from_group(
                         };
                         match gate_outcome {
                             JobGateOutcome::Proceed => {
+                                stamp_concurrency_acquired(&mut job);
                                 if let Some(run) = inner.runs.get_mut(&run_id) {
                                     hydrate_needs_context(&mut job, run);
                                 }
@@ -676,6 +681,7 @@ pub(crate) fn promote_next_from_group(
                                     run.jobs
                                         .insert(job.job_id.clone(), ExecutionStatus::Pending);
                                 }
+                                stamp_concurrency_wait_started(&mut job);
                                 inner.concurrency_blocked.push_back(job);
                             }
                             JobGateOutcome::Failed(status) => {
@@ -730,6 +736,7 @@ pub(crate) fn promote_next_from_group(
                 run.jobs.insert(job.job_id.clone(), ExecutionStatus::Queued);
                 hydrate_needs_context(&mut job, run);
             }
+            stamp_concurrency_acquired(&mut job);
             stamp_ready_enqueue(&mut job);
             on_job_enqueued(inner, &job);
             inner.queue.push_back(job);
@@ -766,6 +773,7 @@ pub(crate) fn promote_next_from_group(
                 }
             });
             for mut job in to_queue {
+                stamp_concurrency_acquired(&mut job);
                 if job.reusable_call.is_some() {
                     // Caller nodes terminate through their subtree, never
                     // through dispatch.
@@ -1000,6 +1008,9 @@ pub(crate) fn promote_ready_jobs(inner: &mut InnerState) -> SchedulingOutcome {
                 .get(&job.run_id)
                 .map(|run| dependency_decision(run, &job))
                 .unwrap_or(DependencyDecision::Wait);
+            if decision == DependencyDecision::Run {
+                stamp_dependencies_ready(&mut job);
+            }
             match decision {
                 DependencyDecision::Run if job.reusable_call.is_some() => {
                     // Deferred reusable caller: the `if:` gate passed. Acquire
@@ -1013,10 +1024,12 @@ pub(crate) fn promote_ready_jobs(inner: &mut InnerState) -> SchedulingOutcome {
                         job_ids: BTreeSet::from([job.job_id.clone()]),
                     };
                     let ready = inner.jobset_ready.remove(&set_id);
+                    let mut concurrency_acquired = ready;
                     if !ready {
                         if inner.jobset_admissions.contains_key(&set_id) {
                             // Still waiting on a gate; park until a release
                             // event routes it back via jobset_ready.
+                            stamp_concurrency_wait_started(&mut job);
                             inner.concurrency_blocked.push_back(job);
                             continue;
                         }
@@ -1039,8 +1052,11 @@ pub(crate) fn promote_ready_jobs(inner: &mut InnerState) -> SchedulingOutcome {
                                     },
                                 );
                                 match advance_jobset_admission(inner, &set_id, None) {
-                                    Ok(JobSetAdmissionResult::Ready) => {}
+                                    Ok(JobSetAdmissionResult::Ready) => {
+                                        concurrency_acquired = true;
+                                    }
                                     Ok(JobSetAdmissionResult::Blocked) => {
+                                        stamp_concurrency_wait_started(&mut job);
                                         inner.concurrency_blocked.push_back(job);
                                         continue;
                                     }
@@ -1062,6 +1078,9 @@ pub(crate) fn promote_ready_jobs(inner: &mut InnerState) -> SchedulingOutcome {
                             }
                             Ok(None) => {}
                         }
+                    }
+                    if concurrency_acquired {
+                        stamp_concurrency_acquired(&mut job);
                     }
                     // Gates are held. Building the callee subtree is heavy,
                     // so hand it to `drain_expansions` rather than doing it
@@ -1104,12 +1123,16 @@ pub(crate) fn promote_ready_jobs(inner: &mut InnerState) -> SchedulingOutcome {
                     };
                     match gate_outcome {
                         JobGateOutcome::Proceed => {
+                            if job.concurrency.is_some() {
+                                stamp_concurrency_acquired(&mut job);
+                            }
                             *promoted_by_base
                                 .entry((job.run_id, job.base_id.clone()))
                                 .or_default() += 1;
                             promoted.push(job);
                         }
                         JobGateOutcome::Parked => {
+                            stamp_concurrency_wait_started(&mut job);
                             if let Some(run) = inner.runs.get_mut(&job.run_id) {
                                 run.jobs
                                     .insert(job.job_id.clone(), ExecutionStatus::Pending);
@@ -1459,7 +1482,9 @@ pub(crate) fn take_matching_job(
         inner
             .job_assignments
             .get(&(job.run_id, job.job_id.clone()))
-            .is_some_and(|record| record.runner_id == runner_id && binding_fresh(record.at, now))
+            .is_some_and(|record| {
+                record.runner_id == Some(runner_id) && binding_fresh(record.at, now)
+            })
     };
     let pos = inner
         .queue
@@ -1523,29 +1548,41 @@ fn binding_fresh(at: std::time::SystemTime, now: std::time::SystemTime) -> bool 
 fn claim_permitted(inner: &InnerState, job: &QueuedJob, verified_runner_id: Option<i64>) -> bool {
     let key = (job.run_id, job.job_id.clone());
     let now = std::time::SystemTime::now();
+
+    let enqueued_at =
+        std::time::UNIX_EPOCH + std::time::Duration::from_nanos(job.enqueued_at_unix_nanos as u64);
+    let enqueue_ceiling_expired = now
+        .duration_since(enqueued_at)
+        .map(|age| age >= CLAIM_BINDING_TTL)
+        .unwrap_or(true);
+
     if let Some(record) = inner.job_assignments.get(&key) {
-        if !binding_fresh(record.first_at, now) {
-            // The job has been bound to *some* machine since longer than the
-            // binding window without ever being claimed. A pool that keeps
-            // provisioning and losing machines re-stamps `at` on every
+        if !binding_fresh(record.first_at, now) || enqueue_ceiling_expired {
+            // The job has been bound/queued longer than the binding window without ever being claimed.
+            // A pool that keeps provisioning and losing machines re-stamps `at` on every
             // registration, so without this ceiling an established, capable
             // runner is starved for as long as the churn continues.
             return verified_runner_id.is_some();
         }
-        if !binding_fresh(record.at, now) {
-            // Stale pairing: the owner is presumed dead. Only a verified
-            // runner identity may take over — unverified sessions keep the
-            // old permissive-rules treatment below.
-            return verified_runner_id.is_some();
+        match record.runner_id {
+            // Nullable runner_id (Fix 1): ownerless / released binding allows any verified runner.
+            None => return verified_runner_id.is_some(),
+            Some(id) => {
+                // Liveness check (Fix 4): if the assigned runner vanished from inner.runners,
+                // release exclusivity immediately without waiting out the binding TTL.
+                if !inner.runners.contains_key(&id) || !binding_fresh(record.at, now) {
+                    return verified_runner_id.is_some();
+                }
+                return Some(id) == verified_runner_id;
+            }
         }
-        return Some(record.runner_id) == verified_runner_id;
     }
     if let Some(marked_at) = inner.pool_pending.get(&key) {
         // A machine is being provisioned for this job; nobody claims it
         // until that machine registers and the assignment is stamped. The
         // hold is bounded the same way: provisioning that never lands must
         // not starve a healthy runner past the binding window.
-        if binding_fresh(*marked_at, now) {
+        if binding_fresh(*marked_at, now) && !enqueue_ceiling_expired {
             return false;
         }
         return verified_runner_id.is_some();
@@ -1574,7 +1611,7 @@ pub(crate) fn on_job_enqueued(inner: &mut InnerState, job: &QueuedJob) {
     let mut busy: std::collections::BTreeSet<i64> = inner
         .job_assignments
         .values()
-        .map(|record| record.runner_id)
+        .filter_map(|record| record.runner_id)
         .collect();
     for session_id in inner.session_active_requests.keys() {
         if let Some(runner_id) = inner.runner_id_for_session(session_id) {
@@ -1608,7 +1645,7 @@ pub(crate) fn on_job_enqueued(inner: &mut InnerState, job: &QueuedJob) {
                 .insert(
                     key.clone(),
                     AssignmentRecord {
-                        runner_id,
+                        runner_id: Some(runner_id),
                         at: std::time::SystemTime::now(),
                         first_at: std::time::SystemTime::now(),
                     },
@@ -1623,6 +1660,28 @@ pub(crate) fn on_job_enqueued(inner: &mut InnerState, job: &QueuedJob) {
     }
 }
 
+/// Record the lifecycle transition where all `needs:` dependencies are
+/// satisfied. Jobs with no dependencies are stamped at construction time.
+pub(crate) fn stamp_dependencies_ready(job: &mut QueuedJob) {
+    if job.dependencies_ready_at_unix_nanos.is_none() {
+        job.dependencies_ready_at_unix_nanos = Some(crate::models::now_unix_nanos());
+    }
+}
+
+/// Record the first time a job waits behind a concurrency gate.
+pub(crate) fn stamp_concurrency_wait_started(job: &mut QueuedJob) {
+    if job.concurrency_wait_started_at_unix_nanos.is_none() {
+        job.concurrency_wait_started_at_unix_nanos = Some(crate::models::now_unix_nanos());
+    }
+}
+
+/// Record the first time an applicable concurrency gate admits this job.
+pub(crate) fn stamp_concurrency_acquired(job: &mut QueuedJob) {
+    if job.concurrency_acquired_at_unix_nanos.is_none() {
+        job.concurrency_acquired_at_unix_nanos = Some(crate::models::now_unix_nanos());
+    }
+}
+
 /// Stamp the instant a job actually enters the ready queue.
 ///
 /// `enqueued_at_unix_nanos` is deliberately not stamped at job construction:
@@ -1631,7 +1690,8 @@ pub(crate) fn on_job_enqueued(inner: &mut InnerState, job: &QueuedJob) {
 /// where the job is pushed into `inner.queue` — stamp it. Requeues (a claimed
 /// job bouncing off a purged runner) preserve the original stamp so total
 /// queue time is still measured.
-fn stamp_ready_enqueue(job: &mut QueuedJob) {
+pub(crate) fn stamp_ready_enqueue(job: &mut QueuedJob) {
+    stamp_dependencies_ready(job);
     job.enqueued_at_unix_nanos = crate::models::now_unix_nanos();
 }
 
@@ -1664,7 +1724,12 @@ pub(crate) fn pair_registered_runner(inner: &mut InnerState, runner_id: i64) {
     let dead: Vec<(RunId, JobId)> = inner
         .job_assignments
         .iter()
-        .filter(|(_, record)| !binding_fresh(record.at, now))
+        .filter(|(_, record)| {
+            !binding_fresh(record.at, now)
+                || record
+                    .runner_id
+                    .is_some_and(|id| !inner.runners.contains_key(&id))
+        })
         .map(|(key, _)| key.clone())
         .collect();
     for key in dead {
@@ -1677,22 +1742,21 @@ pub(crate) fn pair_registered_runner(inner: &mut InnerState, runner_id: i64) {
         if !inner.pool_assignments_enabled {
             continue;
         }
-        // Preserve the original first-bound stamp. Clearing the record would
-        // reset the bounded claim window on the replacement pairing, so
-        // repeated provisioning failures could again starve healthy runners
-        // for as long as the churn continues. Keep the record (re-stamped
-        // fresh so the claim gate behaves like the fresh waitlist mark) and
-        // re-mark the job at the back of the line; the pairing rebinds with
-        // the preserved first_at.
+        // Fix 1: set runner_id to None on release instead of re-stamping record.at,
+        // so exclusivity for a dead machine is immediately cleared while preserving
+        // record and first_at.
         if let Some(record) = inner.job_assignments.get_mut(&key) {
-            record.at = now;
+            if record.runner_id.is_some() {
+                record.runner_id = None;
+                info!(
+                    run_id = %key.0,
+                    job_id = %key.1.0,
+                    "stale binding released; job requeued at back of pool waitlist"
+                );
+                inner.pool_pending.insert(key, now);
+                inner.released_bindings_count = inner.released_bindings_count.saturating_add(1);
+            }
         }
-        info!(
-            run_id = %key.0,
-            job_id = %key.1.0,
-            "stale binding released; job requeued at back of pool waitlist"
-        );
-        inner.pool_pending.insert(key, now);
     }
 
     // Pair the earliest-waiting job this runner can serve. Every mark is
@@ -1732,14 +1796,80 @@ pub(crate) fn pair_registered_runner(inner: &mut InnerState, runner_id: i64) {
         inner.job_assignments.insert(
             key,
             AssignmentRecord {
-                runner_id,
+                runner_id: Some(runner_id),
                 at: std::time::SystemTime::now(),
                 first_at,
             },
         );
     }
 }
-
+/// Sweep stale job bindings on a timer so an idle/wedged pool heals even when
+/// no runner is actively polling.
+pub(crate) fn sweep_stale_bindings(inner: &mut InnerState, now: std::time::SystemTime) -> usize {
+    let mut swept = 0;
+    let queued_keys: std::collections::BTreeSet<(RunId, JobId)> = inner
+        .queue
+        .iter()
+        .map(|job| (job.run_id, job.job_id.clone()))
+        .collect();
+    if inner.pool_assignments_enabled {
+        // Pairing state only has meaning for ready jobs. Drop restored or
+        // cancelled entries before the stale-binding pass so that releasing
+        // a dead assignment cannot recreate an orphaned pending marker.
+        let initial_assignments = inner.job_assignments.len();
+        inner
+            .job_assignments
+            .retain(|key, _| queued_keys.contains(key));
+        swept += initial_assignments - inner.job_assignments.len();
+        let initial_pending = inner.pool_pending.len();
+        inner
+            .pool_pending
+            .retain(|key, _| queued_keys.contains(key));
+        swept += initial_pending - inner.pool_pending.len();
+    }
+    if !inner.require_job_assignments && !inner.pool_assignments_enabled {
+        let initial_assignments = inner.job_assignments.len();
+        let initial_pending = inner.pool_pending.len();
+        inner
+            .job_assignments
+            .retain(|_, record| assignment_fresh(record.at, now));
+        inner
+            .pool_pending
+            .retain(|_, at| assignment_fresh(*at, now));
+        swept += (initial_assignments - inner.job_assignments.len())
+            + (initial_pending - inner.pool_pending.len());
+    } else {
+        let dead: Vec<(RunId, JobId)> = inner
+            .job_assignments
+            .iter()
+            .filter(|(_, record)| {
+                !binding_fresh(record.at, now)
+                    || record
+                        .runner_id
+                        .is_some_and(|id| !inner.runners.contains_key(&id))
+            })
+            .map(|(key, _)| key.clone())
+            .collect();
+        for key in dead {
+            if let Some(record) = inner.job_assignments.get_mut(&key) {
+                if record.runner_id.is_some() {
+                    record.runner_id = None;
+                    info!(
+                        run_id = %key.0,
+                        job_id = %key.1.0,
+                        "stale binding released on timer; job requeued at back of pool waitlist"
+                    );
+                    if inner.pool_assignments_enabled && queued_keys.contains(&key) {
+                        inner.pool_pending.insert(key, now);
+                    }
+                    inner.released_bindings_count = inner.released_bindings_count.saturating_add(1);
+                    swept += 1;
+                }
+            }
+        }
+    }
+    swept
+}
 /// Drop the assignment for one job (requeue paths, deregistration purge).
 /// Returns whether the job is still queued so callers can re-mark it
 /// pool-pending when a replacement runner must be provisioned.
@@ -2532,11 +2662,18 @@ fn register_expanded_jobs(
                 run.caller_plans.insert(plan.id.clone(), plan.clone());
             }
         }
-
+        let created_at_unix_nanos = crate::models::now_unix_nanos();
         queued.push(QueuedJob {
             run_id,
             job_id: plan.id.clone(),
             base_id: plan.base_id.clone(),
+            created_at_unix_nanos,
+            dependencies_ready_at_unix_nanos: plan
+                .needs
+                .is_empty()
+                .then_some(created_at_unix_nanos),
+            concurrency_wait_started_at_unix_nanos: None,
+            concurrency_acquired_at_unix_nanos: None,
             // Stamped by the promotion sites when the job enters the ready
             // queue, never here: a job delayed by needs, concurrency, or
             // max-parallel must not count dependency time as queue wait.
@@ -3123,6 +3260,7 @@ mod assignment_tests {
                 timeline_id: uuid::Uuid::nil(),
                 result,
                 locked_until: String::new(),
+                claimed_at: None,
                 owner_runner_id: owner,
                 started_at: std::time::SystemTime::now()
                     .checked_sub(std::time::Duration::from_secs(started_ago_secs)),
@@ -3180,10 +3318,15 @@ mod assignment_tests {
     }
 
     fn test_queued_job(job_id: &str) -> QueuedJob {
+        let created_at_unix_nanos = crate::models::now_unix_nanos();
         QueuedJob {
             run_id: RunId::new(),
             job_id: JobId(job_id.to_owned()),
             base_id: job_id.to_owned(),
+            created_at_unix_nanos,
+            dependencies_ready_at_unix_nanos: Some(created_at_unix_nanos),
+            concurrency_wait_started_at_unix_nanos: None,
+            concurrency_acquired_at_unix_nanos: None,
             enqueued_at_unix_nanos: 0,
             needs: Vec::new(),
             if_condition: None,
@@ -3211,6 +3354,46 @@ mod assignment_tests {
         }
     }
 
+    #[test]
+    fn lifecycle_timestamps_record_and_round_trip() {
+        let mut job = test_queued_job("build");
+        assert!(job.created_at_unix_nanos > 0);
+        assert!(job.dependencies_ready_at_unix_nanos.is_some());
+        assert_eq!(job.concurrency_wait_started_at_unix_nanos, None);
+        assert_eq!(job.concurrency_acquired_at_unix_nanos, None);
+        assert_eq!(job.enqueued_at_unix_nanos, 0);
+
+        stamp_concurrency_wait_started(&mut job);
+        let wait_started = job.concurrency_wait_started_at_unix_nanos;
+        assert!(wait_started.is_some());
+
+        stamp_concurrency_acquired(&mut job);
+        let acquired = job.concurrency_acquired_at_unix_nanos;
+        assert!(acquired.is_some());
+
+        stamp_ready_enqueue(&mut job);
+        assert!(job.enqueued_at_unix_nanos > 0);
+        assert_eq!(job.concurrency_wait_started_at_unix_nanos, wait_started);
+        assert_eq!(job.concurrency_acquired_at_unix_nanos, acquired);
+
+        let restored: QueuedJob =
+            serde_json::from_slice(&serde_json::to_vec(&job).unwrap()).unwrap();
+        assert_eq!(restored.created_at_unix_nanos, job.created_at_unix_nanos);
+        assert_eq!(
+            restored.dependencies_ready_at_unix_nanos,
+            job.dependencies_ready_at_unix_nanos
+        );
+        assert_eq!(
+            restored.concurrency_wait_started_at_unix_nanos,
+            job.concurrency_wait_started_at_unix_nanos
+        );
+        assert_eq!(
+            restored.concurrency_acquired_at_unix_nanos,
+            job.concurrency_acquired_at_unix_nanos
+        );
+        assert_eq!(restored.enqueued_at_unix_nanos, job.enqueued_at_unix_nanos);
+    }
+
     /// A restored concurrency group whose holder's run is terminal (or
     /// missing) must not park later submissions forever.
     #[test]
@@ -3225,6 +3408,7 @@ mod assignment_tests {
             live,
             RunRecord {
                 run_id: live,
+                webhook_delivery_id: None,
                 run_name: None,
                 submission: Arc::new(preloop_gha_protocol::WorkflowSubmission::default()),
                 jobs: BTreeMap::from([(JobId("build".to_owned()), ExecutionStatus::Queued)]),
@@ -3335,7 +3519,7 @@ mod assignment_tests {
         inner.job_assignments.insert(
             key,
             AssignmentRecord {
-                runner_id: 1,
+                runner_id: Some(1),
                 at: stale,
                 first_at: stale,
             },
@@ -3366,7 +3550,7 @@ mod assignment_tests {
         inner.job_assignments.insert(
             stale_key.clone(),
             AssignmentRecord {
-                runner_id: 40,
+                runner_id: Some(40),
                 at: now,
                 first_at: now - CLAIM_BINDING_TTL - std::time::Duration::from_secs(1),
             },
@@ -3375,7 +3559,7 @@ mod assignment_tests {
         inner.job_assignments.insert(
             assigned_key,
             AssignmentRecord {
-                runner_id: 41,
+                runner_id: Some(41),
                 at: now,
                 first_at: now,
             },
@@ -3495,10 +3679,261 @@ mod assignment_tests {
             inner
                 .job_assignments
                 .get(&key)
-                .map(|record| record.runner_id),
+                .and_then(|record| record.runner_id),
             Some(1),
             "token-proven idle runner must receive the queue-time binding"
         );
         assert!(inner.pool_pending.is_empty());
+    }
+    #[test]
+    fn continuous_runner_churn_cannot_starve_idle_verified_runners() {
+        // Production incident reproduction:
+        // N claimable jobs, M idle verified runners.
+        // Repeated registrations keep re-stamping pool_pending marks for the jobs
+        // to `now`, refreshing the 120s window constantly.
+        // Once the job's enqueue ceiling (CLAIM_BINDING_TTL) passes, verified idle
+        // runners must be permitted to claim the jobs rather than being locked out indefinitely.
+        let mut inner = InnerState {
+            pool_assignments_enabled: true,
+            require_job_assignments: true,
+            ..Default::default()
+        };
+
+        // Enqueue 4 jobs 150s in the past (past CLAIM_BINDING_TTL = 120s)
+        let enqueued_time =
+            std::time::SystemTime::now() - CLAIM_BINDING_TTL - std::time::Duration::from_secs(30);
+        let enqueued_nanos = enqueued_time
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos() as i64;
+
+        for i in 1..=4 {
+            let mut job = test_queued_job(&format!("job-{i}"));
+            job.enqueued_at_unix_nanos = enqueued_nanos;
+            let key = (job.run_id, job.job_id.clone());
+            inner.queue.push_back(job);
+            // Simulate that runner churn just re-stamped pool_pending to `now` (0s ago)
+            inner.pool_pending.insert(key, std::time::SystemTime::now());
+        }
+
+        // Register 2 verified idle runners (e.g. runner IDs 101, 102)
+        inner.pool_proven_runners.insert(101);
+        inner.pool_proven_runners.insert(102);
+        inner.runners.insert(
+            101,
+            RegisteredRunner {
+                id: 101,
+                name: "idle-runner-1".to_owned(),
+                labels: vec!["self-hosted".to_owned()],
+                ephemeral: true,
+                public_key: None,
+                runner_group_id: None,
+                runner_group_name: None,
+            },
+        );
+        inner.runners.insert(
+            102,
+            RegisteredRunner {
+                id: 102,
+                name: "idle-runner-2".to_owned(),
+                labels: vec!["self-hosted".to_owned()],
+                ephemeral: true,
+                public_key: None,
+                runner_group_id: None,
+                runner_group_name: None,
+            },
+        );
+
+        // Idle verified runner 101 polls: must be able to claim a job!
+        let claimed_1 = take_matching_job(&mut inner, &self_hosted_caps(), Some(101));
+        assert!(
+            claimed_1.is_some(),
+            "idle verified runner must not be starved by continuously refreshed pool_pending mark"
+        );
+
+        // Idle verified runner 102 polls: must be able to claim a job!
+        let claimed_2 = take_matching_job(&mut inner, &self_hosted_caps(), Some(102));
+        assert!(
+            claimed_2.is_some(),
+            "second idle verified runner must also claim work"
+        );
+
+        assert_eq!(inner.queue.len(), 2);
+    }
+
+    #[test]
+    fn restored_ready_job_without_enqueue_timestamp_is_not_held_by_fresh_pool_mark() {
+        let mut inner = InnerState {
+            pool_assignments_enabled: true,
+            require_job_assignments: true,
+            ..Default::default()
+        };
+        let job = test_queued_job("restored");
+        let key = (job.run_id, job.job_id.clone());
+        inner.queue.push_back(job);
+        inner.pool_pending.insert(key, std::time::SystemTime::now());
+
+        let claimed = take_matching_job(&mut inner, &self_hosted_caps(), Some(42));
+        assert!(
+            claimed.is_some(),
+            "a restored job without a ready timestamp must not receive a new pool grace window"
+        );
+    }
+
+    #[test]
+    fn stale_pool_pending_entries_for_removed_jobs_are_pruned() {
+        let mut inner = InnerState {
+            pool_assignments_enabled: true,
+            require_job_assignments: true,
+            ..Default::default()
+        };
+        let queued = test_queued_job("queued");
+        let queued_key = (queued.run_id, queued.job_id.clone());
+        let orphan = test_queued_job("orphan");
+        let orphan_key = (orphan.run_id, orphan.job_id.clone());
+        inner.queue.push_back(queued);
+        inner
+            .pool_pending
+            .insert(queued_key.clone(), std::time::SystemTime::now());
+        inner
+            .pool_pending
+            .insert(orphan_key.clone(), std::time::SystemTime::now());
+        let stale = std::time::SystemTime::UNIX_EPOCH;
+        inner.job_assignments.insert(
+            orphan_key.clone(),
+            AssignmentRecord {
+                runner_id: Some(5),
+                at: stale,
+                first_at: stale,
+            },
+        );
+
+        let swept = sweep_stale_bindings(&mut inner, std::time::SystemTime::now());
+        assert_eq!(
+            swept, 2,
+            "orphaned assignment and pending entries should both be swept"
+        );
+        assert!(inner.pool_pending.contains_key(&queued_key));
+        assert!(!inner.pool_pending.contains_key(&orphan_key));
+        assert!(!inner.job_assignments.contains_key(&orphan_key));
+    }
+
+    #[test]
+    fn sweep_stale_bindings_heals_pool_without_runner_polls() {
+        let mut inner = InnerState {
+            pool_assignments_enabled: true,
+            require_job_assignments: true,
+            ..Default::default()
+        };
+
+        let job = test_queued_job("build");
+        let key = (job.run_id, job.job_id.clone());
+        inner.queue.push_back(job);
+
+        let stale =
+            std::time::SystemTime::now() - CLAIM_BINDING_TTL - std::time::Duration::from_secs(10);
+        inner.job_assignments.insert(
+            key.clone(),
+            AssignmentRecord {
+                runner_id: Some(5),
+                at: stale,
+                first_at: stale,
+            },
+        );
+
+        let now = std::time::SystemTime::now();
+        let swept = sweep_stale_bindings(&mut inner, now);
+        assert_eq!(swept, 1, "stale binding must be swept on timer");
+        assert_eq!(inner.released_bindings_count, 1);
+        assert!(inner.pool_pending.contains_key(&key));
+    }
+    #[test]
+    fn released_binding_is_immediately_claimable_by_different_verified_runner() {
+        // Fix 1 verification: when a binding is released (runner_id set to None),
+        // any verified runner must be able to claim the job immediately,
+        // without waiting for CLAIM_BINDING_TTL to elapse.
+        let mut inner = InnerState {
+            pool_assignments_enabled: true,
+            require_job_assignments: true,
+            ..Default::default()
+        };
+
+        let job = test_queued_job("build");
+        let key = (job.run_id, job.job_id.clone());
+        inner.queue.push_back(job);
+
+        // Released binding: runner_id is None, at is fresh (0s ago).
+        inner.job_assignments.insert(
+            key,
+            AssignmentRecord {
+                runner_id: None,
+                at: std::time::SystemTime::now(),
+                first_at: std::time::SystemTime::now(),
+            },
+        );
+
+        // Runner 42 (verified) polls: must be allowed to claim immediately!
+        let claimed = take_matching_job(&mut inner, &self_hosted_caps(), Some(42));
+        assert!(
+            claimed.is_some(),
+            "released ownerless binding must be immediately claimable by any verified runner"
+        );
+    }
+
+    #[test]
+    fn repeated_churn_and_pairing_assigns_all_jobs_in_bounded_iterations() {
+        // Production incident simulation:
+        // 4 claimable jobs, 4 idle verified runners.
+        // Churning registrations repeatedly call pair_registered_runner,
+        // which sweeps stale bindings and marks pool_pending.
+        // Under Fix 1 + Fix 2, idle verified runners claim all jobs within bounded iterations.
+        let mut inner = InnerState {
+            pool_assignments_enabled: true,
+            require_job_assignments: true,
+            ..Default::default()
+        };
+
+        // Enqueue 4 jobs with valid ready timestamps
+        let now = std::time::SystemTime::now();
+        for i in 1..=4 {
+            let mut job = test_queued_job(&format!("job-{i}"));
+            job.enqueued_at_unix_nanos = crate::models::now_unix_nanos();
+            let key = (job.run_id, job.job_id.clone());
+            inner.queue.push_back(job);
+            inner.pool_pending.insert(key, now);
+        }
+
+        // Register 4 pool runners (1..=4)
+        for id in 1..=4 {
+            inner.pool_proven_runners.insert(id);
+            inner.runners.insert(
+                id,
+                RegisteredRunner {
+                    id,
+                    name: format!("runner-{id}"),
+                    labels: vec!["self-hosted".to_owned()],
+                    ephemeral: true,
+                    public_key: None,
+                    runner_group_id: None,
+                    runner_group_name: None,
+                },
+            );
+            // Simulate churn registration
+            pair_registered_runner(&mut inner, id);
+        }
+
+        // Simulate 4 verified runners polling to claim their work
+        let mut assigned_count = 0;
+        for id in 1..=4 {
+            if take_matching_job(&mut inner, &self_hosted_caps(), Some(id)).is_some() {
+                assigned_count += 1;
+            }
+        }
+
+        assert_eq!(
+            assigned_count, 4,
+            "all 4 jobs must be claimed by the verified runners without starvation"
+        );
+        assert!(inner.queue.is_empty());
     }
 }

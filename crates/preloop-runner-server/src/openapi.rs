@@ -174,6 +174,9 @@ pub(crate) struct RunResponse {
         artifacts,
         artifact,
         github_webhook,
+        webhook_deliveries,
+        webhook_delivery_replay,
+        webhook_health,
         workflow_dispatch_trigger,
         repository_dispatch_trigger,
         list_dispatch_workflows,
@@ -757,6 +760,46 @@ fn list_dispatch_runs() {}
     )
 )]
 fn github_webhook() {}
+
+/// List retained webhook deliveries and queue statistics.
+#[utoipa::path(
+    get, path = "/api/v1/webhooks/deliveries", tag = "GitHub",
+    params(
+        ("state" = Option<String>, Query, description = "Filter by received, processing, done, or failed"),
+        ("limit" = Option<usize>, Query, description = "Maximum rows to return (1-500)")
+    ),
+    responses(
+        (status = 200, description = "Retained webhook deliveries", body = JsonValue),
+        (status = 400, description = "Unknown delivery state", body = ApiErrorResponse),
+        (status = 500, description = "Store unavailable", body = ApiErrorResponse)
+    ),
+    security(("native_bearer" = []))
+)]
+fn webhook_deliveries() {}
+
+/// Replay a retained webhook payload.
+#[utoipa::path(
+    post, path = "/api/v1/webhooks/deliveries/{delivery_id}/replay", tag = "GitHub",
+    params(("delivery_id" = String, Path, description = "GitHub delivery identifier")),
+    responses(
+        (status = 200, description = "Delivery requeued", body = JsonValue),
+        (status = 404, description = "No retained payload", body = ApiErrorResponse),
+        (status = 409, description = "Delivery is already queued or processing", body = ApiErrorResponse),
+        (status = 500, description = "Store unavailable", body = ApiErrorResponse)
+    ),
+    security(("native_bearer" = []))
+)]
+fn webhook_delivery_replay() {}
+
+/// Report webhook queue, watchdog, breaker, and App configuration health.
+#[utoipa::path(
+    get, path = "/api/v1/webhooks/health", tag = "GitHub",
+    responses(
+        (status = 200, description = "Webhook resilience health", body = JsonValue)
+    ),
+    security(("native_bearer" = []))
+)]
+fn webhook_health() {}
 
 /// GitHub App manifest registration page (browser-facing).
 #[utoipa::path(

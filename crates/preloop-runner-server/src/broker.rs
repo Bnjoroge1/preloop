@@ -344,6 +344,7 @@ pub(crate) async fn next_message_broker_ref(
             continue;
         };
 
+        let claimed_at = std::time::SystemTime::now();
         if let Some(run) = inner.runs.get_mut(&queued.run_id) {
             run.status = ExecutionStatus::InProgress;
             run.started_at.get_or_insert_with(chrono::Utc::now);
@@ -357,8 +358,9 @@ pub(crate) async fn next_message_broker_ref(
             .insert(session_id.clone(), request_id);
         if let Some(request) = inner.job_requests.get_mut(&request_id) {
             request.owner_runner_id = Some(runner_id);
-            request.started_at = Some(std::time::SystemTime::now());
-            request.last_renewed_at = Some(std::time::SystemTime::now());
+            request.claimed_at = Some(claimed_at);
+            request.started_at = Some(claimed_at);
+            request.last_renewed_at = Some(claimed_at);
         }
         inner
             .broker_messages
@@ -430,6 +432,14 @@ pub(crate) async fn broker_session_root(
     let session_id = uuid::Uuid::new_v4().to_string();
     {
         let mut inner = shared.state.inner.lock().await;
+        // Authentication and insertion must share a final registration check:
+        // the liveness sweep may have purged this runner after token
+        // validation but before this lock was acquired.
+        if !inner.runners.contains_key(&runner_id) {
+            return Err(ApiError::unauthorized(
+                "runner registration is no longer active",
+            ));
+        }
         inner
             .session_keys
             .insert(session_id.clone(), SessionEncryption::generate());
@@ -762,6 +772,7 @@ pub(crate) async fn next_message_broker_ref_root(
                 runtime_scheduling::sync_next_job_labels(&inner, &shared.state.next_job_runs_on);
                 record_claim_queue_wait(&shared, &claimed);
                 if let Some(queued) = claimed {
+                    let claimed_at = std::time::SystemTime::now();
                     if let Some(run) = inner.runs.get_mut(&queued.run_id) {
                         run.status = ExecutionStatus::InProgress;
                         run.started_at.get_or_insert_with(chrono::Utc::now);
@@ -771,8 +782,9 @@ pub(crate) async fn next_message_broker_ref_root(
                     let request_id = queued.message.request_id;
                     if let Some(request) = inner.job_requests.get_mut(&request_id) {
                         request.owner_runner_id = Some(runner_id);
-                        request.started_at = Some(std::time::SystemTime::now());
-                        request.last_renewed_at = Some(std::time::SystemTime::now());
+                        request.claimed_at = Some(claimed_at);
+                        request.started_at = Some(claimed_at);
+                        request.last_renewed_at = Some(claimed_at);
                     }
                     // Job messageId = request_id (low range). Cancels use 1_000_000+.
                     inner

@@ -275,6 +275,11 @@ pub(crate) struct LogMetadata {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub(crate) struct RunRecord {
     pub(crate) run_id: RunId,
+    /// GitHub delivery ID that created this run, when the run came from the
+    /// durable webhook queue. Persisted for at-least-once processing
+    /// idempotency, but omitted from run API responses.
+    #[serde(default, skip_serializing)]
+    pub(crate) webhook_delivery_id: Option<String>,
     pub(crate) run_name: Option<String>,
     pub(crate) submission: Arc<WorkflowSubmission>,
     pub(crate) jobs: BTreeMap<JobId, ExecutionStatus>,
@@ -344,9 +349,12 @@ pub(crate) struct TaskAgentJobRequestRecord {
     pub(crate) timeline_id: uuid::Uuid,
     pub(crate) result: Option<ExecutionStatus>,
     pub(crate) locked_until: String,
+    /// When a runner removed this job from the ready queue.
+    pub(crate) claimed_at: Option<std::time::SystemTime>,
     /// Runner identity that claimed this request. Kept after completion so
     /// late AgentRequest reads and retries remain bound to the original owner.
     pub(crate) owner_runner_id: Option<i64>,
+    /// When the runner request was handed to the session.
     pub(crate) started_at: Option<std::time::SystemTime>,
     pub(crate) last_renewed_at: Option<std::time::SystemTime>,
     pub(crate) timeout_triggered: bool,
@@ -368,9 +376,9 @@ pub(crate) struct TaskAgentJobRequestRecord {
 /// `runner_id` may claim the job — this is what keeps a compromised runner
 /// (or any other code running inside a pool machine) from pulling a job that
 /// belongs to a different machine or tenant.
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub(crate) struct AssignmentRecord {
-    pub(crate) runner_id: i64,
+    pub(crate) runner_id: Option<i64>,
     pub(crate) at: std::time::SystemTime,
     /// When this job was *first* bound to any machine. Rebinding to a
     /// replacement machine refreshes `at` but never this, so a pool that
@@ -384,10 +392,22 @@ pub(crate) struct QueuedJob {
     pub(crate) run_id: RunId,
     pub(crate) job_id: JobId,
     pub(crate) base_id: String,
-    /// Unix nanoseconds when the job entered the ready queue, used to
-    /// measure true queue latency at claim time. `0` means unknown (a
-    /// snapshot persisted before this field existed); such jobs are not
-    /// recorded, so a restart never fabricates a latency.
+    /// Unix nanoseconds when this job was created.
+    #[serde(default)]
+    pub(crate) created_at_unix_nanos: i64,
+    /// Unix nanoseconds when all `needs:` dependencies became satisfied.
+    #[serde(default)]
+    pub(crate) dependencies_ready_at_unix_nanos: Option<i64>,
+    /// Unix nanoseconds when this job first waited on a concurrency gate.
+    #[serde(default)]
+    pub(crate) concurrency_wait_started_at_unix_nanos: Option<i64>,
+    /// Unix nanoseconds when the first applicable concurrency gate admitted
+    /// this job.
+    #[serde(default)]
+    pub(crate) concurrency_acquired_at_unix_nanos: Option<i64>,
+    /// Unix nanoseconds when the job entered the ready queue. This is the
+    /// runner-wait clock, not the workflow or dependency creation time.
+    /// `0` is used only before the job first becomes ready.
     #[serde(default)]
     pub(crate) enqueued_at_unix_nanos: i64,
     pub(crate) needs: Vec<JobId>,
@@ -462,18 +482,161 @@ pub(crate) struct QueuedCancellation {
     pub(crate) agent_job_id: uuid::Uuid,
 }
 
-/// Lifecycle of a GitHub webhook delivery ID used for dedup.
-#[derive(Debug, Clone, Copy)]
-pub(crate) enum WebhookDeliveryState {
-    /// The handler is still processing this delivery; a concurrent copy of the
-    /// same delivery must be skipped so one delivery yields one run.
-    InFlight,
-    /// Processing finished successfully at this instant; redeliveries inside
-    /// the dedup window are skipped. Failed deliveries are not recorded at all
-    /// so GitHub's retry is accepted.
-    Completed(std::time::Instant),
+/// Lifecycle status of a durable GitHub webhook delivery.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub(crate) enum WebhookDeliveryStatus {
+    Received,
+    Processing,
+    Done,
+    Failed,
 }
 
+impl WebhookDeliveryStatus {
+    pub(crate) fn as_str(&self) -> &'static str {
+        match self {
+            Self::Received => "received",
+            Self::Processing => "processing",
+            Self::Done => "done",
+            Self::Failed => "failed",
+        }
+    }
+
+    pub(crate) fn parse(s: &str) -> Option<Self> {
+        match s {
+            "received" => Some(Self::Received),
+            "processing" => Some(Self::Processing),
+            "done" => Some(Self::Done),
+            "failed" => Some(Self::Failed),
+            _ => None,
+        }
+    }
+}
+
+/// A durably queued webhook delivery record.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub(crate) struct WebhookDeliveryRecord {
+    pub(crate) delivery_id: String,
+    pub(crate) event: String,
+    pub(crate) payload: Vec<u8>,
+    pub(crate) received_at_us: i64,
+    pub(crate) state: WebhookDeliveryStatus,
+    pub(crate) attempts: u32,
+    pub(crate) lease_until_us: Option<i64>,
+    /// Fencing token for the current processing lease. A stale worker cannot
+    /// renew or finalize a lease that another worker has reclaimed.
+    #[serde(default)]
+    pub(crate) lease_token: Option<String>,
+    pub(crate) last_error: Option<String>,
+}
+
+/// A webhook delivery row without its payload — the operator listing surface.
+///
+/// The payload is the one field that can reach 25 MiB, and no listing needs
+/// it; keeping it out of this type means a list endpoint cannot accidentally
+/// stream the whole queue's bodies (or their decrypted secrets) to a client.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub(crate) struct WebhookDeliverySummary {
+    pub(crate) delivery_id: String,
+    pub(crate) event: String,
+    pub(crate) received_at_us: i64,
+    pub(crate) state: WebhookDeliveryStatus,
+    pub(crate) attempts: u32,
+    pub(crate) lease_until_us: Option<i64>,
+    pub(crate) last_error: Option<String>,
+}
+
+/// Aggregate queue health, read by the status snapshot and the health API.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub(crate) struct WebhookQueueStats {
+    pub(crate) received: u64,
+    pub(crate) processing: u64,
+    pub(crate) done: u64,
+    pub(crate) failed: u64,
+    /// Receipt time of the oldest row still awaiting a terminal state. A
+    /// growing age here is the only signal that separates "queue is quiet"
+    /// from "queue is stuck".
+    pub(crate) oldest_pending_received_at_us: Option<i64>,
+}
+
+/// Persisted high-water mark for one GitHub App's delivery-history poll.
+///
+/// GitHub keeps delivery history for three days and never resends on its
+/// own, so the watchdog's cursor is the difference between repairing a lost
+/// delivery and never learning it existed. It is persisted per App id: a
+/// restart must not rewind (duplicate work) or skip forward (silent gap).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub(crate) struct WebhookWatchdogCursor {
+    /// GitHub App id the cursor belongs to.
+    pub(crate) scope: String,
+    /// Newest `(delivered_at, guid)` the watchdog has fully examined. Never
+    /// advanced past the grace window, and never advanced on a failed poll.
+    #[serde(default)]
+    pub(crate) cursor_delivered_at_us: Option<i64>,
+    /// GUID tie-breaker for deliveries sharing the same timestamp.
+    #[serde(default)]
+    pub(crate) cursor_delivered_at_guid: Option<String>,
+    /// Opaque GitHub pagination cursor to resume when a bounded pass did not
+    /// reach the watermark.
+    #[serde(default)]
+    pub(crate) scan_cursor: Option<String>,
+    /// When a poll was last attempted, successful or not.
+    pub(crate) last_poll_at_us: Option<i64>,
+    /// When a poll last completed without error. Staleness here is an alert:
+    /// a blind watchdog looks exactly like a quiet one.
+    pub(crate) last_success_at_us: Option<i64>,
+}
+
+/// Why the watchdog wants a delivery replayed.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub(crate) enum WebhookRepairReason {
+    /// GitHub recorded a non-2xx (or no) response: the delivery never landed.
+    RemoteFailure,
+    /// GitHub recorded success but no local row exists — the phantom ack.
+    PhantomAck,
+}
+
+impl WebhookRepairReason {
+    pub(crate) fn as_str(self) -> &'static str {
+        match self {
+            Self::RemoteFailure => "remote_failure",
+            Self::PhantomAck => "phantom_ack",
+        }
+    }
+
+    pub(crate) fn parse(value: &str) -> Option<Self> {
+        match value {
+            "remote_failure" => Some(Self::RemoteFailure),
+            "phantom_ack" => Some(Self::PhantomAck),
+            _ => None,
+        }
+    }
+}
+
+/// One remote delivery the watchdog is repairing, and how hard it has tried.
+///
+/// Keyed by the GitHub delivery GUID — the same key the ingress deduplicates
+/// on — so a redelivery that finally lands is recognised as the repair of
+/// this row rather than as new work.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub(crate) struct WebhookRedeliveryRecord {
+    pub(crate) delivery_guid: String,
+    /// Numeric delivery id: `POST /app/hook/deliveries/{id}/attempts` takes
+    /// this, not the GUID.
+    pub(crate) github_delivery_id: i64,
+    /// App id that owns the delivery, so a multi-App deployment redelivers
+    /// with the right JWT.
+    pub(crate) app_id: String,
+    pub(crate) reason: WebhookRepairReason,
+    pub(crate) attempts: u32,
+    pub(crate) first_seen_at_us: i64,
+    pub(crate) last_attempt_at_us: Option<i64>,
+    /// Set once the delivery is present locally; a resolved row is history,
+    /// not backlog.
+    pub(crate) resolved_at_us: Option<i64>,
+    pub(crate) last_error: Option<String>,
+}
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub(crate) struct PendingCache {
     pub(crate) key: String,
