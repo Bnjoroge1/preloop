@@ -2710,23 +2710,61 @@ pub(crate) fn settle_request(inner: &mut InnerState, request_id: i64, status: Ex
 }
 /// Release an interrupted claim so the same request can be delivered again.
 ///
-/// The queued job retains this request id and agent-job correlation. Keep its
-/// inflight and token records, but remove the dead owner before requeueing:
-/// the old runner is then rejected until a replacement session claims it, and
-/// that replacement can renew and complete the original request normally.
+/// The queued job retains this request id, while the retry gets a fresh
+/// agent-job identity and runtime-token scope. Keep its inflight and token
+/// records, but remove the dead owner before requeueing: the old runner is
+/// then rejected until a replacement session claims the request, and that
+/// replacement can renew and complete it normally.
 pub(crate) fn release_request_for_retry(inner: &mut InnerState, request_id: i64) {
     inner
         .session_active_requests
         .retain(|_, &mut rid| rid != request_id);
-    if let Some(record) = inner.job_requests.get_mut(&request_id) {
-        if record.result.is_none() {
-            record.owner_runner_id = None;
-            record.started_at = None;
-            record.last_renewed_at = None;
-            record.timeout_triggered = false;
-            record.debug_token_issued = false;
-            record.locked_until = crate::distributed_task::agent_request_locked_until();
+    let Some(old_agent_job_id) = inner
+        .job_requests
+        .get(&request_id)
+        .filter(|record| record.result.is_none())
+        .map(|record| record.agent_job_id)
+    else {
+        return;
+    };
+    let new_agent_job_id = uuid::Uuid::new_v4();
+    let mut retry_steps = None;
+    let mut rotate_job = |job: &mut QueuedJob| {
+        if job.message.request_id == request_id {
+            job.message.job_id = new_agent_job_id;
+            if retry_steps.is_none() {
+                retry_steps = Some(crate::models::StepRecord::manifest(&job.message.steps));
+            }
         }
+    };
+    inner.queue.iter_mut().for_each(&mut rotate_job);
+    inner.pending_jobs.iter_mut().for_each(&mut rotate_job);
+    inner.claimed_jobs.values_mut().for_each(&mut rotate_job);
+    for jobs in inner.held_runs.values_mut() {
+        jobs.iter_mut().for_each(&mut rotate_job);
+    }
+
+    if inner.agent_job_requests.get(&old_agent_job_id) == Some(&request_id) {
+        inner.agent_job_requests.remove(&old_agent_job_id);
+    }
+    inner
+        .agent_job_requests
+        .insert(new_agent_job_id, request_id);
+    inner.job_steps.remove(&old_agent_job_id);
+    inner.job_steps_revision.remove(&old_agent_job_id);
+    if let Some(steps) = retry_steps {
+        inner.job_steps.insert(new_agent_job_id, steps);
+        inner.job_steps_revision.insert(new_agent_job_id, 0);
+    }
+
+    if let Some(record) = inner.job_requests.get_mut(&request_id) {
+        record.agent_job_id = new_agent_job_id;
+        record.owner_runner_id = None;
+        record.started_at = None;
+        record.last_renewed_at = None;
+        record.timeout_triggered = false;
+        record.debug_token_issued = false;
+        record.locked_until = crate::distributed_task::agent_request_locked_until();
     }
 }
 

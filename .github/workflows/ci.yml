@@ -155,22 +155,20 @@ jobs:
 
       - name: Verify property filters match tests
         run: |
-          # One `--list` pass per crate. This used to run twice against
-          # preloop-runner-server, paying for the test-binary build in both.
+          # One `--list` pass per crate. Keep each server filter separate so
+          # removing a property module cannot hide behind a broad match.
           server_list=$(PROPTEST_CASES=1 cargo test -p preloop-runner-server -- --list 2>/dev/null)
-          properties=$(printf '%s\n' "$server_list" | grep -c 'concurrency_properties' || true)
-          server=$(printf '%s\n' "$server_list" | grep -Ec 'concurrency::properties|concurrency_properties|concurrency_http_properties' || true)
+          legacy=$(printf '%s\n' "$server_list" | grep -Ec '^concurrency::properties(:|$)' || true)
+          pure=$(printf '%s\n' "$server_list" | grep -Ec '^concurrency_properties::pure(:|$)' || true)
+          scheduler=$(printf '%s\n' "$server_list" | grep -Ec '^concurrency_properties::state_machine(:|$)' || true)
+          http=$(printf '%s\n' "$server_list" | grep -Ec '^concurrency_http_properties(:|$)' || true)
           runner=$(cargo test -p preloop-runner -- --list 2>/dev/null | grep -c 'timespan_tests' || true)
           parser=$(cargo test -p preloop-gha-parser -- --list 2>/dev/null | grep -c 'concurrency_' || true)
-          if [ "$properties" -eq 0 ]; then
-            echo "ERROR: filter 'concurrency_properties' matched zero tests in preloop-runner-server" >&2
+          if [ "$legacy" -eq 0 ] || [ "$pure" -eq 0 ] || [ "$scheduler" -eq 0 ] || [ "$http" -eq 0 ] || [ "$runner" -eq 0 ] || [ "$parser" -eq 0 ]; then
+            echo "ERROR: zero matching tests (legacy=$legacy pure=$pure scheduler=$scheduler http=$http runner=$runner parser=$parser)" >&2
             exit 1
           fi
-          if [ "$server" -eq 0 ] || [ "$runner" -eq 0 ] || [ "$parser" -eq 0 ]; then
-            echo "ERROR: zero matching tests (server=$server runner=$runner parser=$parser)" >&2
-            exit 1
-          fi
-          echo "concurrency_properties: $properties test(s); server=$server runner=$runner parser=$parser"
+          echo "server filters: legacy=$legacy pure=$pure scheduler=$scheduler http=$http; runner=$runner parser=$parser"
       - name: Check no sleep() in property test files
         run: |
           files="crates/preloop-runner-server/src/concurrency_properties.rs crates/preloop-runner-server/src/concurrency_http_properties.rs"
@@ -258,18 +256,16 @@ jobs:
       - name: Verify property filters match tests
         run: |
           server_list=$(PROPTEST_CASES=1 cargo test -p preloop-runner-server -- --list 2>/dev/null)
-          properties=$(printf '%s\n' "$server_list" | grep -c 'concurrency_properties' || true)
-          server=$(printf '%s\n' "$server_list" | grep -Ec 'concurrency::properties|concurrency_properties|concurrency_http_properties' || true)
+          legacy=$(printf '%s\n' "$server_list" | grep -Ec '^concurrency::properties(:|$)' || true)
+          properties=$(printf '%s\n' "$server_list" | grep -Ec '^concurrency_properties(:|$)' || true)
+          http=$(printf '%s\n' "$server_list" | grep -Ec '^concurrency_http_properties(:|$)' || true)
           runner=$(cargo test -p preloop-runner -- --list 2>/dev/null | grep -c 'timespan_tests' || true)
           parser=$(cargo test -p preloop-gha-parser -- --list 2>/dev/null | grep -c 'concurrency_' || true)
-          if [ "$properties" -eq 0 ]; then
-            echo "ERROR: filter 'concurrency_properties' matched zero tests" >&2
+          if [ "$legacy" -eq 0 ] || [ "$properties" -eq 0 ] || [ "$http" -eq 0 ] || [ "$runner" -eq 0 ] || [ "$parser" -eq 0 ]; then
+            echo "ERROR: zero matching tests (legacy=$legacy properties=$properties http=$http runner=$runner parser=$parser)" >&2
             exit 1
           fi
-          if [ "$server" -eq 0 ] || [ "$runner" -eq 0 ] || [ "$parser" -eq 0 ]; then
-            echo "ERROR: zero matching tests (server=$server runner=$runner parser=$parser)" >&2
-            exit 1
-          fi
+          echo "server filters: legacy=$legacy properties=$properties http=$http; runner=$runner parser=$parser"
       - name: Check no sleep() in property test files
         run: |
           bad=0
