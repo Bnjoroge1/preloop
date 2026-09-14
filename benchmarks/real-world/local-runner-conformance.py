@@ -224,13 +224,22 @@ def official_workflows(path: Path) -> set[str]:
 
 
 def scenario_names(root: Path, official: Path) -> list[str]:
+    import tomllib
+
     names = official_workflows(official)
-    # Main carries reconstructed v2.337.0 manifests (201–227). They are not
-    # present in the older PR branch checkout, but appear in the merge ref.
-    names.update(
-        path.parent.name
-        for path in root.glob("2??-*/scenario.toml")
-    )
+    # Include every checked-in scenario that has exactly one runnable
+    # submit_workflow step. Other manifests are setup-only fixtures and cannot
+    # be submitted by this harness.
+    for manifest in root.glob("*/scenario.toml"):
+        metadata = tomllib.loads(manifest.read_text())
+        steps = metadata.get("steps", [])
+        submit_steps = [
+            step
+            for step in steps
+            if isinstance(step, dict) and step.get("kind") == "submit_workflow"
+        ]
+        if len(submit_steps) == 1:
+            names.add(manifest.parent.name)
     return sorted(names)
 
 def main() -> int:
@@ -337,7 +346,9 @@ def main() -> int:
             args.output.write_text("\n".join(json.dumps(record) for record in records) + "\n")
         except Exception:
             print(f"runner-light: failure artifacts at {temp_root}", file=sys.stderr)
-            print(runner_log.read_text(errors="replace"), file=sys.stderr)
+            for log in (server_log, runner_log):
+                if log.exists():
+                    print(log.read_text(errors="replace"), file=sys.stderr)
             raise
         finally:
             stop_process(runner)

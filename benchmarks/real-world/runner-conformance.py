@@ -221,8 +221,25 @@ def validate_local(records: dict[str, dict[str, Any]]) -> list[str]:
                     f"conclusion={job_conclusion or '(empty)'}"
                 )
             steps = job.get("steps")
-            if not isinstance(steps, list):
-                issues.append(f"{number}: local job {job.get('name')!r} has no steps list")
+            if not isinstance(steps, list) or not steps:
+                issues.append(f"{number}: local job {job.get('name')!r} has no steps")
+                continue
+            for step_index, step in enumerate(steps):
+                if not isinstance(step, dict):
+                    issues.append(
+                        f"{number}: local job {job.get('name')!r} step {step_index} is not an object"
+                    )
+                    continue
+                if not step.get("name"):
+                    issues.append(
+                        f"{number}: local job {job.get('name')!r} step {step_index} has no name"
+                    )
+                step_conclusion = str(step.get("conclusion") or "")
+                if step_conclusion not in terminal:
+                    issues.append(
+                        f"{number}: local job {job.get('name')!r} step {step_index} "
+                        f"conclusion={step_conclusion or '(empty)'}"
+                    )
     return issues
 
 
@@ -249,7 +266,6 @@ def write_report(
         "",
         description,
         "",
-        f"- Expected workflows: {len(EXPECTED)}",
         f"- Official records: {len(official)}",
         f"- Preloop records: {len(preloop)}",
         f"- Expected workflows: {len(preloop) if mode == 'local' else len(EXPECTED)}",
