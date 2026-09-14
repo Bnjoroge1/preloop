@@ -7555,7 +7555,7 @@ async fn disttask_message_delete_stays_reachable_for_protocol_tokens() {
     );
 }
 #[tokio::test]
-async fn listener_token_probe_gates_only_job_lifecycle_calls() {
+async fn listener_token_lifecycle_calls_require_runtime_token() {
     use std::sync::atomic::Ordering::Relaxed;
 
     let temp = tempfile::tempdir().unwrap();
@@ -7612,6 +7612,18 @@ async fn listener_token_probe_gates_only_job_lifecycle_calls() {
         "billingOwnerId": "local",
         "runnerOS": "macOS",
     });
+    assert_eq!(
+        status_with_bearer(
+            &app,
+            &runtime_token,
+            Method::POST,
+            &format!("/broker/{runner_id}/acquirejob"),
+            acquire.clone(),
+        )
+        .await,
+        StatusCode::FORBIDDEN,
+        "a job runtime token must not claim through acquirejob"
+    );
     let acquired = request_json_with_bearer(
         &app,
         Method::POST,
@@ -7645,22 +7657,23 @@ async fn listener_token_probe_gates_only_job_lifecycle_calls() {
     assert_eq!(
         state.listener_token_lifecycle_calls.load(Relaxed),
         0,
-        "a renew on the job runtime token is the assumed path, not a finding"
+        "a renew on the job runtime token is the official runner path"
     );
 
-    // The bare listen token on the same route is the finding.
-    let renewed = request_json_with_bearer(
+    // The bare listen token reaches the route but is fenced before any job
+    // state is read or mutated. Keep the probe counter so dogfood can expose
+    // a protocol regression without granting the credential lifecycle power.
+    let rejected_renew = status_with_bearer(
         &app,
+        &listen_token,
         Method::POST,
         &format!("/broker/{runner_id}/renewjob"),
-        renew,
-        &listen_token,
+        renew.clone(),
     )
     .await;
-    assert!(renewed["lockedUntil"].is_string());
-    assert_eq!(state.listener_token_lifecycle_calls.load(Relaxed), 1);
+    assert_eq!(rejected_renew, StatusCode::FORBIDDEN);
 
-    let completed = status_with_bearer(
+    let rejected_complete = status_with_bearer(
         &app,
         &listen_token,
         Method::POST,
@@ -7668,12 +7681,32 @@ async fn listener_token_probe_gates_only_job_lifecycle_calls() {
         json!({"jobId": agent_job_id.to_string(), "planId": plan_id, "conclusion": "succeeded"}),
     )
     .await;
-    assert_eq!(completed, StatusCode::NO_CONTENT);
+    assert_eq!(rejected_complete, StatusCode::FORBIDDEN);
     assert_eq!(state.listener_token_lifecycle_calls.load(Relaxed), 2);
+
+    // Both rejected calls leave the attempt usable with its job runtime token.
+    let renewed = request_json_with_bearer(
+        &app,
+        Method::POST,
+        &format!("/broker/{runner_id}/renewjob"),
+        renew,
+        &runtime_token,
+    )
+    .await;
+    assert!(renewed["lockedUntil"].is_string());
+    let completed = status_with_bearer(
+        &app,
+        &runtime_token,
+        Method::POST,
+        &format!("/broker/{runner_id}/completejob"),
+        json!({"jobId": agent_job_id.to_string(), "planId": plan_id, "conclusion": "succeeded"}),
+    )
+    .await;
+    assert_eq!(completed, StatusCode::NO_CONTENT);
     assert_eq!(
         state.listener_token_acquire_calls.load(Relaxed),
         1,
-        "the baseline counter must not absorb lifecycle findings"
+        "the lifecycle counter must count only rejected listener-token calls"
     );
 }
 
@@ -21548,13 +21581,14 @@ async fn delete_agent_purges_identity_and_requeues_assignment() {
     };
     let _ = (run_id, job_id);
 
-    request_json(
+    let (status, _) = try_req(
         &app,
         Method::DELETE,
         &format!("/runner/server/_apis/distributedtask/pools/1/agents/{runner_a}"),
         Value::Null,
     )
     .await;
+    assert_eq!(status, StatusCode::NO_CONTENT);
 
     let inner = state.inner.lock().await;
     assert!(!inner.runner_rsa_public_keys.contains_key(&runner_a));
@@ -21573,6 +21607,16 @@ async fn delete_agent_purges_identity_and_requeues_assignment() {
         1,
         "unclaimed job returns to pool-pending for re-provisioning"
     );
+    drop(inner);
+
+    // A restart must not resurrect the deleted identity from a stale snapshot.
+    let recovered = AppState::new(temp.path().to_path_buf()).await.unwrap();
+    let recovered_inner = recovered.inner.lock().await;
+    assert!(!recovered_inner.runners.contains_key(&runner_a));
+    assert!(recovered_inner
+        .runner_client_ids
+        .values()
+        .all(|id| *id != runner_a));
 }
 
 #[tokio::test]
@@ -21847,12 +21891,13 @@ async fn replay_blob_uploads_require_a_ticket_bound_to_the_exact_path() {
 
     // A tampered signature must not authorise anything.
     let forged_sig = base64::engine::general_purpose::URL_SAFE_NO_PAD.encode([0u8; 32]);
+    let forged_expires_at = crate::auth::replay_ticket_expiry();
     let forged = app
         .oneshot(
             Request::builder()
                 .method(Method::PUT)
                 .uri(format!(
-                    "{path}?sv=2021-08-06&se=2028-01-01T00%3A00%3A00Z&sr=c&sp=rw&sig={forged_sig}"
+                    "{path}?sv=2021-08-06&se={forged_expires_at}&sr=c&sp=rw&sig={forged_sig}"
                 ))
                 .body(Body::from("overwrite attempt"))
                 .unwrap(),

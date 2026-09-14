@@ -3152,6 +3152,7 @@ impl<P: VmProvider + 'static> RunnerPool<P> {
                 notify_runner_gone(&self.config, &name).await;
                 vm_telemetry_deregister(&self.config, &name);
                 if let Err(error) = self.provider.delete(&name).await {
+                    record_slot_failure(&self.config, "stale_cleanup");
                     warn!(machine = name.as_str(), %error, "failed to delete stale Preloop runner");
                 }
             }
@@ -3873,7 +3874,13 @@ async fn provision_slot<P: VmProvider + 'static>(
     keys: &Arc<KeyPool>,
     environment: RunnerEnvironment,
 ) -> Result<ReadyRunner, OrchestratorError> {
-    let name = MachineName::new(format!("{}-{slot}-{generation}", config.name_prefix))?;
+    let name = match MachineName::new(format!("{}-{slot}-{generation}", config.name_prefix)) {
+        Ok(name) => name,
+        Err(error) => {
+            record_slot_failure(config, "provision");
+            return Err(error.into());
+        }
+    };
     match provision_runner(provider, config, &name, golden, keys, &environment).await {
         Ok(run) => {
             // A provision that made it (fork or direct create, configure,
@@ -3890,6 +3897,7 @@ async fn provision_slot<P: VmProvider + 'static>(
             })
         }
         Err(error) => {
+            record_slot_failure(config, "provision");
             // A configure failure can happen after the guest has already
             // registered the runner. Purge by machine name before deleting
             // the VM so that registration cannot outlive its provisioned
@@ -4127,7 +4135,21 @@ async fn run_one_runner<P: VmProvider + 'static>(
         } => {
             let result = match pair.0 {
                 Ok(Ok(())) => Ok(()),
-                Ok(Err(error)) => Err(OrchestratorError::Pool(error.to_string())),
+                Ok(Err(error)) => {
+                    // `run_until_exit` turns a non-zero guest exit into this
+                    // exact command error. Provider launch/transport failures
+                    // and task panics are engine failures, not guest exits.
+                    if matches!(
+                        error,
+                        VmError::Command {
+                            operation: "run",
+                            ..
+                        }
+                    ) {
+                        record_slot_failure(config, "guest_exit");
+                    }
+                    Err(OrchestratorError::Pool(error.to_string()))
+                }
                 // The runner task panicked (sender dropped without a value).
                 Err(_) => Err(OrchestratorError::Pool(
                     "runner task ended without a result".into(),
@@ -4384,6 +4406,16 @@ fn vm_telemetry_register(
 fn vm_telemetry_deregister(config: &RunnerPoolConfig, name: &MachineName) {
     if let Some(observability) = &config.observability {
         observability.vm_registry().deregister(name.as_str());
+    }
+}
+
+/// Emit a runner-slot failure metric so guest crashes, provisioning errors,
+/// and un-recyclable fork bases are alertable — not just WARN log lines. A
+/// guest-internal OOM/`-1` exit has no host cgroup signal, so the WARN was the
+/// only trace; this makes `preloop.pool.slot_failures{reason}` the alert hook.
+fn record_slot_failure(config: &RunnerPoolConfig, reason: &str) {
+    if let Some(observability) = &config.observability {
+        observability.metrics().pool.record_slot_failure(reason);
     }
 }
 
@@ -6302,7 +6334,9 @@ chmod +x "$dest/bin/node"
                     .unwrap();
             }
             if self.fail_run && argv.iter().any(|arg| arg == "run") {
-                return Err(test_error("run-failure"));
+                // `exec_stream` returns the guest process exit code; transport
+                // failures are represented by `Err(VmError)` instead.
+                return Ok(1);
             }
             Ok(0)
         }
@@ -7056,7 +7090,9 @@ chmod +x "$dest/bin/node"
         )
         .await
         .expect_err("runner failure must propagate");
-        assert!(error.to_string().contains("run-failure"));
+        assert!(error
+            .to_string()
+            .contains("guest runner exited with code 1"));
         assert!(!error.to_string().contains("delete-failure"));
     }
 
