@@ -63,6 +63,29 @@ def load_latest(path: Path) -> tuple[dict[str, dict[str, Any]], list[str]]:
             records[number] = record
     return records, errors
 
+def load_all(path: Path) -> tuple[dict[str, dict[str, Any]], list[str]]:
+    """Load every workflow record, including reconstructed v2.337 fixtures."""
+    records: dict[str, dict[str, Any]] = {}
+    errors: list[str] = []
+    if not path.exists():
+        return records, [f"{path}: file does not exist"]
+
+    for line_number, line in enumerate(path.read_text().splitlines(), 1):
+        if not line.strip():
+            continue
+        try:
+            record = json.loads(line)
+        except json.JSONDecodeError as exc:
+            errors.append(f"{path}:{line_number}: invalid JSON: {exc}")
+            continue
+        if not isinstance(record, dict):
+            errors.append(f"{path}:{line_number}: record is not an object")
+            continue
+        workflow = record.get("workflow")
+        if workflow:
+            records[str(workflow)] = record
+    return records, errors
+
 
 def jobs(record: dict[str, Any]) -> list[dict[str, Any]]:
     result = record.get("result")
@@ -166,6 +189,59 @@ def compare(
 
     return issues
 
+def validate_local(records: dict[str, dict[str, Any]]) -> list[str]:
+    """Validate a local runner execution without pretending it is GitHub."""
+    issues: list[str] = []
+    if not records:
+        issues.append("local response has no workflow records")
+
+    terminal = {"success", "failure", "cancelled", "skipped"}
+    for number, record in sorted(records.items()):
+        result = record.get("result")
+        if not isinstance(result, dict):
+            issues.append(f"{number}: local response has no result object")
+            continue
+        conclusion = str(result.get("conclusion") or "")
+        if conclusion not in terminal:
+            issues.append(f"{number}: local workflow conclusion={conclusion or '(empty)'}")
+        raw_jobs = result.get("jobs")
+        if not isinstance(raw_jobs, list) or not raw_jobs:
+            issues.append(f"{number}: local response has no jobs")
+            continue
+        for index, job in enumerate(raw_jobs):
+            if not isinstance(job, dict):
+                issues.append(f"{number}: local job {index} is not an object")
+                continue
+            job_conclusion = str(job.get("conclusion") or "")
+            if not job.get("name"):
+                issues.append(f"{number}: local job {index} has no name")
+            if job_conclusion not in terminal:
+                issues.append(
+                    f"{number}: local job {job.get('name')!r} "
+                    f"conclusion={job_conclusion or '(empty)'}"
+                )
+            steps = job.get("steps")
+            if not isinstance(steps, list) or not steps:
+                issues.append(f"{number}: local job {job.get('name')!r} has no steps")
+                continue
+            for step_index, step in enumerate(steps):
+                if not isinstance(step, dict):
+                    issues.append(
+                        f"{number}: local job {job.get('name')!r} step {step_index} is not an object"
+                    )
+                    continue
+                if not step.get("name"):
+                    issues.append(
+                        f"{number}: local job {job.get('name')!r} step {step_index} has no name"
+                    )
+                step_conclusion = str(step.get("conclusion") or "")
+                if step_conclusion not in terminal:
+                    issues.append(
+                        f"{number}: local job {job.get('name')!r} step {step_index} "
+                        f"conclusion={step_conclusion or '(empty)'}"
+                    )
+    return issues
+
 
 def write_report(
     output: Path,
@@ -176,18 +252,23 @@ def write_report(
     loader_errors: list[str],
 ) -> None:
     output.parent.mkdir(parents=True, exist_ok=True)
+    description = (
+        "The current `preloop-runner` completed every checked-in local scenario; "
+        "server-vs-GitHub wire fidelity is covered by server-light."
+        if mode == "local"
+        else "The official runner and `preloop-runner` are compared against the same "
+        "GitHub workflow runs."
+    )
     lines = [
         "# Runner Compatibility Conformance",
         "",
         f"Profile: **{mode}**",
         "",
-        "The official runner and `preloop-runner` are compared against the same "
-        "GitHub workflow runs.",
+        description,
         "",
-        f"- Expected workflows: {len(EXPECTED)}",
         f"- Official records: {len(official)}",
         f"- Preloop records: {len(preloop)}",
-        f"- Verdict: **{'PASS' if not issues and not loader_errors else 'FAIL'}**",
+        f"- Expected workflows: {len(preloop) if mode == 'local' else len(EXPECTED)}",
         "",
     ]
     if loader_errors:
@@ -201,7 +282,7 @@ def write_report(
 
 def main() -> int:
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("--mode", choices=("light", "deep"), required=True)
+    parser.add_argument("--mode", choices=("local", "light", "deep"), required=True)
     parser.add_argument(
         "--official",
         type=Path,
@@ -219,10 +300,17 @@ def main() -> int:
     )
     args = parser.parse_args()
 
-    official, official_errors = load_latest(args.official)
-    preloop, preloop_errors = load_latest(args.preloop)
-    loader_errors = official_errors + preloop_errors
-    issues = compare(official, preloop, args.mode)
+    if args.mode == "local":
+        official = {}
+        official_errors: list[str] = []
+        preloop, preloop_errors = load_all(args.preloop)
+        loader_errors = preloop_errors
+        issues = validate_local(preloop)
+    else:
+        official, official_errors = load_latest(args.official)
+        preloop, preloop_errors = load_latest(args.preloop)
+        loader_errors = official_errors + preloop_errors
+        issues = compare(official, preloop, args.mode)
     write_report(args.output, args.mode, official, preloop, issues, loader_errors)
 
     print(

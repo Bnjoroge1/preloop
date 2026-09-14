@@ -11532,17 +11532,36 @@ async fn liveness_sweep_requeues_job_of_deaf_runner() {
     let job_id = JobId("build".to_owned());
     let message = poll_message(&app, &token, &session_id).await;
     assert!(!message.is_null(), "poll must claim the queued job");
-    let request_id = {
+    let (request_id, old_agent_job_id) = {
         let inner = state.inner.lock().await;
         assert!(
             inner.claimed_jobs.contains_key(&(run_id, job_id.clone())),
             "poll must record the claim in claimed_jobs"
         );
-        *inner
+        let request_id = *inner
             .session_active_requests
             .get(&session_id)
-            .expect("poll must pin the claim to the session")
+            .expect("poll must pin the claim to the session");
+        (request_id, inner.job_requests[&request_id].agent_job_id)
     };
+    {
+        let mut inner = state.inner.lock().await;
+        inner
+            .job_requests
+            .get_mut(&request_id)
+            .unwrap()
+            .debug_token_issued = true;
+    }
+    // Model a restart snapshot that retained the ready copy but not the
+    // process-local claimed_jobs stash.
+    {
+        let mut inner = state.inner.lock().await;
+        let restored_copy = inner
+            .claimed_jobs
+            .remove(&(run_id, job_id.clone()))
+            .expect("claimed job fixture must exist");
+        inner.queue.push_back(restored_copy);
+    }
 
     // The runner goes deaf: backdate its last poll and shrink the timeout.
     {
@@ -11574,6 +11593,29 @@ async fn liveness_sweep_requeues_job_of_deaf_runner() {
             "deaf claim must leave claimed_jobs"
         );
         let request = &inner.job_requests[&request_id];
+        assert_ne!(
+            request.agent_job_id, old_agent_job_id,
+            "a retry must rotate the runtime-token identity"
+        );
+        assert!(
+            !inner.agent_job_requests.contains_key(&old_agent_job_id),
+            "the abandoned runtime identity must be revoked"
+        );
+        assert_eq!(
+            inner.agent_job_requests.get(&request.agent_job_id),
+            Some(&request_id),
+            "the replacement runtime identity must resolve to the request"
+        );
+        assert_eq!(
+            inner
+                .queue
+                .front()
+                .expect("restored job must remain queued")
+                .message
+                .job_id,
+            request.agent_job_id,
+            "the queued message must use the replacement runtime identity"
+        );
         assert_eq!(
             request.result, None,
             "the requeued request must remain completable"
@@ -11584,6 +11626,10 @@ async fn liveness_sweep_requeues_job_of_deaf_runner() {
         );
         assert_eq!(request.started_at, None);
         assert_eq!(request.last_renewed_at, None);
+        assert!(
+            !request.debug_token_issued,
+            "a retried attempt must be allowed to mint a fresh debug token"
+        );
         assert!(
             inner.inflight_requests.contains_key(&request_id),
             "the request must remain inflight for its replacement"
@@ -11606,9 +11652,11 @@ async fn liveness_sweep_requeues_job_of_deaf_runner() {
         );
     }
 
-    // A replacement claims the same correlation, renews it, and completes the
-    // logical job. Settling the request before requeue would let the delivery
-    // happen but make both PATCHes no-ops.
+    // A replacement claims the same request with a fresh runtime identity
+    // and completes the logical job.
+
+    // Settling the request before requeue would let the delivery happen but
+    // make both PATCHes no-ops.
     let (replacement_id, replacement_token) =
         register_runner_with_token(&app, "replacement-runner", &["self-hosted"], None).await;
     let (_, replacement_session) =
@@ -11616,6 +11664,11 @@ async fn liveness_sweep_requeues_job_of_deaf_runner() {
     let replacement_session_id = replacement_session["sessionId"].as_str().unwrap();
     let delivered = poll_message(&app, &replacement_token, replacement_session_id).await;
     assert!(!delivered.is_null(), "replacement must receive the retry");
+    assert_ne!(
+        delivered["jobId"].as_str(),
+        Some(old_agent_job_id.to_string().as_str()),
+        "replacement must receive a fresh runtime-token identity"
+    );
     request_json_with_bearer(
         &app,
         Method::PATCH,
@@ -11642,6 +11695,61 @@ async fn liveness_sweep_requeues_job_of_deaf_runner() {
 }
 
 #[tokio::test]
+async fn liveness_sweep_fails_job_without_recovery_copy() {
+    let temp = tempfile::tempdir().unwrap();
+    let state = AppState::new(temp.path().to_path_buf()).await.unwrap();
+    let shutdown = CancellationToken::new();
+    let app = app(state.clone(), shutdown.clone());
+    let shared = Arc::new(SharedState {
+        state: state.clone(),
+        shutdown,
+    });
+
+    let (runner_id, token) =
+        register_runner_with_token(&app, "deaf-runner", &["self-hosted"], None).await;
+    let (_, session) = create_disttask_session(&app, &token, runner_id).await;
+    let session_id = session["sessionId"].as_str().unwrap().to_owned();
+    let accepted = submit_simple_run(&app).await;
+    let run_id: RunId = accepted["run_id"].as_str().unwrap().parse().unwrap();
+    let job_id = JobId("build".to_owned());
+    let message = poll_message(&app, &token, &session_id).await;
+    assert!(!message.is_null(), "poll must claim the queued job");
+    let request_id = {
+        let inner = state.inner.lock().await;
+        *inner
+            .session_active_requests
+            .get(&session_id)
+            .expect("poll must pin the claim to the session")
+    };
+
+    {
+        let mut inner = state.inner.lock().await;
+        inner.claimed_jobs.remove(&(run_id, job_id.clone()));
+        inner.runner_liveness_timeout = Duration::from_secs(600);
+        inner.session_last_seen.insert(
+            session_id,
+            std::time::Instant::now() - Duration::from_secs(3600),
+        );
+    }
+    reap_once(&shared).await;
+
+    let inner = state.inner.lock().await;
+    assert_eq!(inner.runs[&run_id].jobs[&job_id], ExecutionStatus::Failure);
+    assert!(
+        inner.runs[&run_id].completed_at.is_some(),
+        "normal completion must conclude the run"
+    );
+    assert_eq!(
+        inner.job_requests[&request_id].result,
+        Some(ExecutionStatus::Failure)
+    );
+    assert!(
+        !inner.inflight_requests.contains_key(&request_id),
+        "normal completion must release the orphaned request"
+    );
+}
+
+#[tokio::test]
 async fn broker_session_keeps_registered_runner_from_phantom_reaping() {
     let temp = tempfile::tempdir().unwrap();
     let state = AppState::new(temp.path().to_path_buf()).await.unwrap();
@@ -11651,6 +11759,7 @@ async fn broker_session_keeps_registered_runner_from_phantom_reaping() {
         state: state.clone(),
         shutdown,
     });
+
     let (runner_id, _token) =
         register_runner_with_token(&app, "broker-runner", &["self-hosted"], None).await;
 
@@ -11762,9 +11871,9 @@ async fn restored_old_job_survives_the_restarted_pools_warm_window() {
         let app = app(state.clone(), CancellationToken::new());
         let accepted = submit_simple_run(&app).await;
         let run_id: RunId = accepted["run_id"].as_str().unwrap().parse().unwrap();
-        {
+        let snapshot = {
             let mut inner = state.inner.lock().await;
-            let cutoff = (SystemTime::now() - Duration::from_secs(700))
+            let cutoff = (SystemTime::now() - Duration::from_secs(10))
                 .duration_since(SystemTime::UNIX_EPOCH)
                 .unwrap()
                 .as_nanos() as i64;
@@ -11774,9 +11883,9 @@ async fn restored_old_job_survives_the_restarted_pools_warm_window() {
                 .find(|job| job.run_id == run_id)
                 .unwrap()
                 .enqueued_at_unix_nanos = cutoff;
-            let snapshot = crate::store::StoreSnapshot::from_inner(&inner);
-            state.store.store_inner(&snapshot).await.unwrap();
-        }
+            crate::store::StoreSnapshot::from_inner(&inner)
+        };
+        state.store.store_inner(&snapshot).await.unwrap();
         run_id
     };
 

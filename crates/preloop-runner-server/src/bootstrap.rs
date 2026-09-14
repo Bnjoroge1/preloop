@@ -305,7 +305,14 @@ pub(crate) async fn reap_once(shared: &Arc<SharedState>) {
             // local warm window before applying the durable queue-age ceiling;
             // otherwise the first reaper tick fails every old queued job while
             // the golden and its runners are demonstrably still starting.
-            if shared.state.started_at.elapsed() < MAX_QUEUED_GRACE {
+            let enqueued = if job.enqueued_at_unix_nanos > 0 {
+                SystemTime::UNIX_EPOCH + Duration::from_nanos(job.enqueued_at_unix_nanos as u64)
+            } else {
+                now
+            };
+            if shared.state.started_at.elapsed() < MAX_QUEUED_GRACE
+                && now.duration_since(enqueued).unwrap_or_default() < MAX_QUEUED_GRACE
+            {
                 inner.queued_at.remove(&key);
                 continue;
             }
@@ -586,6 +593,12 @@ struct SnapshotInputs {
     runner_idle: u32,
     runner_busy: u32,
     runner_stale: u32,
+    /// Pool-managed runners currently executing a job. The pool section's
+    /// `busy` counter has no other source: the orchestrator only tracks warm
+    /// idle slots, so without this it always read zero while the pool ran
+    /// jobs. Restricted to `pool_proven_runners` so external runners do not
+    /// inflate the pool's own view.
+    pool_busy: u32,
     runner_assignments: Vec<preloop_observability::status::RunnerAssignment>,
     oldest_ready_seconds: Option<f64>,
     oldest_ready_run_id: Option<String>,
@@ -729,6 +742,7 @@ fn collect_snapshot_inputs(inner: &InnerState) -> SnapshotInputs {
     let mut runner_idle = 0u32;
     let mut runner_busy = 0u32;
     let mut runner_stale = 0u32;
+    let mut pool_busy = 0u32;
     for runner_id in inner.runners.keys() {
         let mut owned: std::collections::BTreeSet<&String> = inner
             .broker_session_runners
@@ -758,6 +772,9 @@ fn collect_snapshot_inputs(inner: &InnerState) -> SnapshotInputs {
             });
         if busy {
             runner_busy += 1;
+            if inner.pool_proven_runners.contains(runner_id) {
+                pool_busy += 1;
+            }
         }
         if stale {
             runner_stale += 1;
@@ -822,6 +839,7 @@ fn collect_snapshot_inputs(inner: &InnerState) -> SnapshotInputs {
         runner_idle,
         runner_busy,
         runner_stale,
+        pool_busy,
         runner_assignments: assignments,
         oldest_ready_seconds,
         oldest_ready_run_id: oldest_ready.map(|job| job.run_id.to_string()),
@@ -1107,6 +1125,7 @@ fn build_operational_snapshot_sync(
         });
     }
     pool_snapshot.released_bindings = inputs.released_bindings;
+    pool_snapshot.busy = inputs.pool_busy;
 
     OperationalSnapshot {
         schema_version: 2,
@@ -1789,6 +1808,55 @@ async fn shutdown_signal(shutdown: CancellationToken) {
 mod tests {
     use super::*;
     use tokio::io::AsyncWriteExt as _;
+
+    #[test]
+    fn pool_busy_counts_only_pool_proven_busy_runners() {
+        // Regression: `PoolSnapshot.busy` had no writer, so `preloop status`
+        // always showed `pool busy: 0` even while pool machines ran jobs. The
+        // server now derives it from pool-proven runners holding an active
+        // session request; external busy runners must not inflate it.
+        use preloop_gha_protocol::{RunnerSession, SessionId};
+
+        let mut inner = InnerState {
+            pool_assignments_enabled: true,
+            ..Default::default()
+        };
+        let add_busy_runner = |inner: &mut InnerState, id: i64, pool_proven: bool| {
+            inner.runners.insert(
+                id,
+                RegisteredRunner {
+                    id,
+                    name: format!("runner-{id}"),
+                    labels: vec!["self-hosted".to_owned()],
+                    ephemeral: true,
+                    public_key: None,
+                    runner_group_id: None,
+                    runner_group_name: None,
+                },
+            );
+            let session_id = format!("sess-{id}");
+            inner.sessions.insert(
+                session_id.clone(),
+                RunnerSession {
+                    session_id: SessionId::new(),
+                    runner_id: id,
+                },
+            );
+            inner.session_active_requests.insert(session_id, id);
+            if pool_proven {
+                inner.pool_proven_runners.insert(id);
+            }
+        };
+        add_busy_runner(&mut inner, 7, true);
+        add_busy_runner(&mut inner, 8, false);
+
+        let inputs = collect_snapshot_inputs(&inner);
+        assert_eq!(inputs.runner_busy, 2, "both runners hold an active request");
+        assert_eq!(
+            inputs.pool_busy, 1,
+            "only the pool-proven runner counts toward pool busy"
+        );
+    }
 
     #[tokio::test]
     async fn incomplete_unix_http_message_is_a_routine_disconnect() {

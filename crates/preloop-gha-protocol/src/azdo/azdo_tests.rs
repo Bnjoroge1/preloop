@@ -627,9 +627,20 @@ fn arb_literal_step() -> impl Strategy<Value = TaskStep> {
         prop::option::of(arb_text()),
         prop::option::of(arb_text()),
         prop::option::of(arb_text()),
+        prop::option::of(0u32..=1000),
     )
         .prop_map(
-            |(has_script, script, inputs, env, name, context_name, display_name, condition)| {
+            |(
+                has_script,
+                script,
+                inputs,
+                env,
+                name,
+                context_name,
+                display_name,
+                condition,
+                timeout_in_minutes,
+            )| {
                 let display_name_token = Some(json!({
                     "type": 1,
                     "lit": display_name.clone().unwrap_or_default()
@@ -648,7 +659,7 @@ fn arb_literal_step() -> impl Strategy<Value = TaskStep> {
                     continue_on_error: Some(false),
                     shell: None,
                     working_directory: None,
-                    timeout_in_minutes: None,
+                    timeout_in_minutes,
                 }
             },
         )

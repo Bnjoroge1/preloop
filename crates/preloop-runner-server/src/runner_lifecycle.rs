@@ -412,7 +412,7 @@ pub(crate) async fn purge_runner_identity_guarded(
     caller: crate::auth::AdminCaller,
     agent_id: i64,
 ) -> Result<(), ApiError> {
-    {
+    let (purged, abandoned_completions) = {
         let mut inner = shared.state.inner.lock().await;
         match caller {
             crate::auth::AdminCaller::System => {}
@@ -437,7 +437,21 @@ pub(crate) async fn purge_runner_identity_guarded(
                 }
             }
         }
-        purge_runner_identity_locked(&mut inner, &shared.state, agent_id);
+        purge_runner_identity_locked(&mut inner, &shared.state, agent_id)
+    };
+    if !purged {
+        return Ok(());
+    }
+    for completion in abandoned_completions {
+        if let Err(error) =
+            crate::distributed_task::complete_job_inner(shared.clone(), completion).await
+        {
+            tracing::warn!(
+                runner_id = agent_id,
+                ?error,
+                "failed to complete job abandoned by purged runner"
+            );
+        }
     }
     // Persist before waking pollers: a restart between notify and persist
     // would let the old snapshot restore the deleted runner. The shared
@@ -450,6 +464,7 @@ pub(crate) async fn purge_runner_identity_guarded(
     shared.state.message_notify.notify_waiters();
     Ok(())
 }
+
 /// Remove every trace of a runner identity: keys, client ids, sessions and
 /// assignments. Shared by agent deregistration and pool machine teardown.
 pub(crate) async fn purge_runner_identity(shared: &Arc<SharedState>, runner_id: i64) {
@@ -457,19 +472,25 @@ pub(crate) async fn purge_runner_identity(shared: &Arc<SharedState>, runner_id: 
         purge_runner_identity_guarded(shared, crate::auth::AdminCaller::System, runner_id).await;
 }
 
+/// Remove every trace of a runner identity from in-memory state.
+///
+/// The returned completions must be applied after releasing the state lock:
+/// normal completion owns dependency promotion, concurrency release, event
+/// publication, and request settlement.
 fn purge_runner_identity_locked(
     inner: &mut crate::state::InnerState,
     state: &AppState,
     runner_id: i64,
-) -> bool {
+) -> (bool, Vec<preloop_gha_protocol::JobCompletion>) {
     if inner.runners.remove(&runner_id).is_none()
         && inner.runner_client_ids.values().all(|id| *id != runner_id)
     {
-        return false;
+        return (false, Vec::new());
     }
     inner.runner_client_ids.retain(|_, id| *id != runner_id);
     inner.runner_public_keys.remove(&runner_id);
     inner.runner_rsa_public_keys.remove(&runner_id);
+    let mut abandoned_completions = Vec::new();
     inner.pool_proven_runners.remove(&runner_id);
     inner.runner_registered_at.remove(&runner_id);
     // Sessions claiming this runner: drop them so subsequent polls stop.
@@ -501,46 +522,61 @@ fn purge_runner_identity_locked(
                 .job_requests
                 .get(&request_id)
                 .filter(|request| request.result.is_none())
-                .map(|request| (request.run_id, request.job_id.clone()));
-            if let Some((run_id, job_id)) = pending {
+                .map(|request| (request.run_id, request.job_id.clone(), request.agent_job_id));
+            if let Some((run_id, job_id, agent_job_id)) = pending {
                 let key = (run_id, job_id.clone());
-                if let Some(job) = inner.claimed_jobs.remove(&key) {
-                    // The queued job retains this request/message correlation.
-                    // Release its dead owner before requeueing so a replacement
-                    // can renew and complete it, while the old runner can no
-                    // longer acquire or report against the request.
+                let queued_copy_exists = inner
+                    .queue
+                    .iter()
+                    .any(|job| job.run_id == run_id && job.job_id == job_id);
+                if inner.claimed_jobs.contains_key(&key) || queued_copy_exists {
+                    // Release the dead owner even when only the durable queued
+                    // copy survived a restart. The retry rotates its runtime
+                    // identity before a replacement can acquire it.
                     runtime_scheduling::release_request_for_retry(inner, request_id);
                     if let Some(run) = inner.runs.get_mut(&run_id) {
                         run.jobs.insert(job_id.clone(), ExecutionStatus::Queued);
                         run.status = runtime_scheduling::summarize_run(run.jobs.values().copied());
                     }
-                    info!(
-                        runner_id,
-                        %run_id,
-                        job_id = %job_id.0,
-                        "requeuing job of purged runner"
-                    );
-                    runtime_scheduling::on_job_enqueued(inner, &job);
-                    inner.queue.push_back(job);
+                    if let Some(job) = inner.claimed_jobs.remove(&key) {
+                        if !queued_copy_exists {
+                            info!(
+                                runner_id,
+                                %run_id,
+                                job_id = %job_id.0,
+                                "requeuing job of purged runner"
+                            );
+                            runtime_scheduling::on_job_enqueued(inner, &job);
+                            inner.queue.push_back(job);
+                        } else {
+                            info!(
+                                runner_id,
+                                %run_id,
+                                job_id = %job_id.0,
+                                "preserving restored queued job of purged runner"
+                            );
+                        }
+                    }
                 } else {
                     // A restarted process may restore the durable request
-                    // without restoring the in-memory claimed job. Do not
-                    // leave that request permanently InProgress: settle the
-                    // abandoned attempt and make the run terminal.
-                    runtime_scheduling::settle_request(
-                        inner,
-                        request_id,
-                        ExecutionStatus::Cancelled,
-                    );
-                    if let Some(run) = inner.runs.get_mut(&run_id) {
-                        run.jobs.insert(job_id.clone(), ExecutionStatus::Cancelled);
-                        run.status = runtime_scheduling::summarize_run(run.jobs.values().copied());
-                    }
+                    // without restoring either in-memory copy. Treat the lost
+                    // worker as a failure through the normal completion path;
+                    // it owns dependency promotion, concurrency release,
+                    // timestamps, events, and request settlement.
+                    abandoned_completions.push(preloop_gha_protocol::JobCompletion {
+                        run_id,
+                        job_id: job_id.clone(),
+                        agent_job_id: Some(agent_job_id),
+                        status: ExecutionStatus::Failure,
+                        outputs: Default::default(),
+                        annotations: Vec::new(),
+                        step_results: Vec::new(),
+                    });
                     warn!(
                         runner_id,
                         %run_id,
                         job_id = %job_id.0,
-                        "settled purged request with no restored claimed job"
+                        "failing purged request with no recoverable job copy"
                     );
                 }
             }
@@ -569,7 +605,7 @@ fn purge_runner_identity_locked(
         .queue_depth
         .store(inner.queue.len(), std::sync::atomic::Ordering::Release);
     runtime_scheduling::sync_next_job_labels(inner, &state.next_job_runs_on);
-    true
+    (true, abandoned_completions)
 }
 
 /// Remove a runner identity, optionally requiring it to remain sessionless.
@@ -578,7 +614,7 @@ async fn purge_runner_identity_with_phantom_check(
     runner_id: i64,
     only_if_phantom: bool,
 ) -> bool {
-    {
+    let (purged, abandoned_completions) = {
         let mut inner = shared.state.inner.lock().await;
         if only_if_phantom {
             let has_session = inner
@@ -597,8 +633,20 @@ async fn purge_runner_identity_with_phantom_check(
                 return false;
             }
         }
-        if !purge_runner_identity_locked(&mut inner, &shared.state, runner_id) {
-            return false;
+        purge_runner_identity_locked(&mut inner, &shared.state, runner_id)
+    };
+    if !purged {
+        return false;
+    }
+    for completion in abandoned_completions {
+        if let Err(error) =
+            crate::distributed_task::complete_job_inner(shared.clone(), completion).await
+        {
+            tracing::warn!(
+                runner_id,
+                ?error,
+                "failed to complete job abandoned by phantom runner"
+            );
         }
     }
     if let Err(error) = persist_full_state(shared).await {
@@ -633,21 +681,37 @@ pub(crate) async fn purge_restored_ephemeral_runners(shared: &Arc<SharedState>) 
         return;
     }
 
-    {
+    let (purged_count, abandoned_completions) = {
         let mut inner = shared.state.inner.lock().await;
+        let mut abandoned_completions = Vec::new();
+        let mut purged_count = 0;
         for runner_id in &runner_ids {
-            purge_runner_identity_locked(&mut inner, &shared.state, *runner_id);
+            let (purged, mut completions) =
+                purge_runner_identity_locked(&mut inner, &shared.state, *runner_id);
+            purged_count += usize::from(purged);
+            abandoned_completions.append(&mut completions);
+        }
+        (purged_count, abandoned_completions)
+    };
+    for completion in abandoned_completions {
+        if let Err(error) =
+            crate::distributed_task::complete_job_inner(shared.clone(), completion).await
+        {
+            tracing::warn!(
+                ?error,
+                "failed to complete job abandoned by restored ephemeral runner"
+            );
         }
     }
     if let Err(error) = persist_full_state(shared).await {
         tracing::warn!(
-            count = runner_ids.len(),
+            count = purged_count,
             ?error,
             "failed to persist purged restored ephemeral runners"
         );
     }
     info!(
-        count = runner_ids.len(),
+        count = purged_count,
         "purged restored ephemeral runner identities"
     );
     shared.state.message_notify.notify_waiters();

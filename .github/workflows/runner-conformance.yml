@@ -15,21 +15,39 @@ on:
 jobs:
   runner-light:
     name: Runner light conformance
-    runs-on: [self-hosted, preloop-cpane]
-    timeout-minutes: 10
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
     steps:
       - uses: actions/checkout@08c6903cd8c0fde910a37f88322edcfb5dd907a8 # v5.0.0
         with:
           persist-credentials: false
-          lfs: true
-      - name: Validate runner status responses
-        run: python3 benchmarks/real-world/runner-conformance.py --mode light
+          lfs: false
+      - uses: dtolnay/rust-toolchain@6bed0761d98439e5a578e2877258200ad565ba87 # stable
+      - name: Build local runner and server
+        run: cargo build --locked -p preloop-runner-server -p preloop-runner -p preloop-runner-client
+      - name: Run current runner against local Preloop
+        run: |
+          rm -f benchmarks/compatibility/runner/behavior/conformance-preloop.jsonl
+          python3 benchmarks/real-world/local-runner-conformance.py \
+            --server-binary target/debug/preloop-server \
+            --runner-binary target/debug/preloop-runner \
+            --client-binary target/debug/preloop-runner-client \
+            --official benchmarks/compatibility/runner/behavior/conformance-official.jsonl \
+            --output benchmarks/compatibility/runner/behavior/conformance-preloop.jsonl
+      - name: Validate local runner outcomes
+        run: |
+          python3 benchmarks/real-world/runner-conformance.py \
+            --mode local \
+            --preloop benchmarks/compatibility/runner/behavior/conformance-preloop.jsonl \
+            --output benchmarks/compatibility/runner/behavior/RUNNER-CONFORMANCE-REPORT.md
       - name: Upload light report
         if: always()
         uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
         with:
           name: runner-light-conformance
-          path: benchmarks/compatibility/runner/behavior/RUNNER-CONFORMANCE-REPORT.md
+          path: |
+            benchmarks/compatibility/runner/behavior/RUNNER-CONFORMANCE-REPORT.md
+            benchmarks/compatibility/runner/behavior/conformance-preloop.jsonl
           if-no-files-found: error
 
   runner-deep:
@@ -45,7 +63,9 @@ jobs:
       - uses: actions/checkout@08c6903cd8c0fde910a37f88322edcfb5dd907a8 # v5.0.0
         with:
           persist-credentials: false
-          lfs: true
+          # Same as the light job: the deep batch replays live runners, not the
+          # committed golden captures.
+          lfs: false
       - name: Build current PR runner for smolVM
         run: cargo zigbuild -p preloop-runner --release --target x86_64-unknown-linux-musl
       - name: Run deep runner conformance

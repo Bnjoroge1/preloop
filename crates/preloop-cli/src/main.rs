@@ -3623,7 +3623,8 @@ fn render_status_human(status: &serde_json::Value, runs: &[serde_json::Value], l
     let pool_busy = get_u64(pool, "busy").unwrap_or(0);
     let paused = get_u64(pool, "paused").unwrap_or(0);
     let failures = get_u64(pool, "consecutive_provision_failures").unwrap_or(0);
-    println!("  pool mode: {mode}  desired: {desired}  idle: {pool_idle}  busy: {pool_busy}  building: {building}  provisioning: {provisioning}  paused: {paused}  preparing: {preparing}  provision_failures: {failures}");
+    let released_bindings = get_u64(pool, "released_bindings").unwrap_or(0);
+    println!("  pool mode: {mode}  desired: {desired}  idle: {pool_idle}  busy: {pool_busy}  building: {building}  provisioning: {provisioning}  paused: {paused}  preparing: {preparing}  provision_failures: {failures}  released_bindings: {released_bindings}");
     let runners = status.get("runners").unwrap_or(&serde_json::Value::Null);
     let reg = get_u64(runners, "registered").unwrap_or(0);
     let sessions = get_u64(runners, "sessions").unwrap_or(0);
