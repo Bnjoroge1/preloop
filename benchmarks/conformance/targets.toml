@@ -4,9 +4,3 @@
 [[targets]]
 runner_version = "2.336.0"
 exclude_prefix = ["2"]
-
-[[targets]]
-runner_version = "2.337.0"
-cell = "gh-official"
-scenario_prefix = "2"
-validate_ownership = true

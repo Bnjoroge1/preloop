@@ -326,14 +326,12 @@ Body-value diffs (different URLs, IDs, tokens) are expected and not gated.
 > The other three were contaminated captures, not divergences, and are now
 > quarantined: see `.runner-watch/quarantine.toml`.
 >
-> Fixing the v2.336.0 gate exposed a second failure it had been masking:
-> `run.sh` uses `set -e`, so it aborted before reaching the optional
-> `v2.337.0/gh-official` cell. All 27 of those captures were committed
-> without the scenario manifests they replay from — no
-> `experiments/mitm/scenarios/2xx-*/scenario.toml` has ever existed in any
-> commit — so that cell errors on its first scenario. It is now skipped with
-> a loud notice rather than failing the build or being silently counted as
-> covered. Committing the 27 definitions brings it back into the gate.
+The v2.337.0 cell is retained for comparison, but it is not a required CI
+target. Its 27 workflows were reconstructed from acquirejob payloads rather
+than recorded as complete workflow sources; replay therefore exposes
+reference-field and lifecycle differences that cannot distinguish an engine
+regression from reconstruction loss. Keep it out of the green gate until a
+complete, protocol-equivalent capture set is available.
 
 ### 1a.2 Scenario coverage
 

@@ -12,6 +12,7 @@ import argparse
 import json
 import os
 import secrets
+import shutil
 import signal
 import socket
 import subprocess
@@ -107,7 +108,9 @@ def submit(
         raise RuntimeError(f"client returned invalid submission JSON: {output!r}") from error
 
 
-def configure_runner(runner: Path, root: Path, server_url: str, token: str) -> None:
+def configure_runner(
+    runner: Path, root: Path, server_url: str, token: str, name: str
+) -> None:
     env = os.environ.copy()
     env["PRELOOP_SYSTEM_TOKEN"] = token
     command_output(
@@ -121,12 +124,12 @@ def configure_runner(runner: Path, root: Path, server_url: str, token: str) -> N
             "--token",
             "t",
             "--name",
-            "runner-light-local",
+            name,
             "--unattended",
             "--replace",
             "--no-externals",
             "--labels",
-            "self-hosted,Linux,X64",
+            "self-hosted,mitm",
         ],
         env=env,
     )
@@ -175,11 +178,31 @@ def scenario_workflow(scenario: Path) -> tuple[Path, int]:
     return workflow, int(metadata.get("duration_seconds_max", 300))
 
 
+def prepare_scenario_workspace(
+    scenario: Path, temp_root: Path
+) -> tuple[Path, Path, int]:
+    """Expose fixture-local reusable workflows through the client convention."""
+    workflow, duration = scenario_workflow(scenario)
+    workflows = scenario / "workflows"
+    if not workflows.is_dir():
+        return workflow, scenario, duration
+
+    workspace = temp_root / "workspaces" / scenario.name
+    shutil.copytree(scenario, workspace)
+    github_workflows = workspace / ".github" / "workflows"
+    github_workflows.mkdir(parents=True, exist_ok=True)
+    for reusable in workflows.iterdir():
+        if reusable.is_file():
+            shutil.copy2(reusable, github_workflows / reusable.name)
+
+    return workspace / workflow.relative_to(scenario), workspace, duration
+
+
 def wait_for_run(
     server_url: str,
     token: str,
     run_id: str,
-    runner: subprocess.Popen[str],
+    runners: list[subprocess.Popen[str]],
     timeout_seconds: int,
 ) -> dict[str, Any]:
     deadline = time.monotonic() + timeout_seconds
@@ -188,10 +211,11 @@ def wait_for_run(
         last = http_json(f"{server_url}/api/v1/runs/{run_id}", token)
         if last.get("conclusion") is not None:
             return last
-        if runner.poll() is not None:
-            raise RuntimeError(
-                f"runner exited with {runner.returncode} before run {run_id} completed"
-            )
+        for runner in runners:
+            if runner.poll() is not None:
+                raise RuntimeError(
+                    f"runner exited with {runner.returncode} before run {run_id} completed"
+                )
         time.sleep(1)
     raise RuntimeError(
         f"run {run_id} did not complete within {timeout_seconds}s; last={last}"
@@ -223,14 +247,23 @@ def official_workflows(path: Path) -> set[str]:
     return names
 
 
-def scenario_names(root: Path, official: Path) -> list[str]:
+def scenario_names(
+    root: Path, official: Path, exclude_prefixes: list[str]
+) -> list[str]:
     import tomllib
 
-    names = official_workflows(official)
+    names = {
+        name
+        for name in official_workflows(official)
+        if not any(name.startswith(prefix) for prefix in exclude_prefixes)
+    }
     # Include every checked-in scenario that has exactly one runnable
     # submit_workflow step. Other manifests are setup-only fixtures and cannot
     # be submitted by this harness.
     for manifest in root.glob("*/scenario.toml"):
+        name = manifest.parent.name
+        if any(name.startswith(prefix) for prefix in exclude_prefixes):
+            continue
         metadata = tomllib.loads(manifest.read_text())
         steps = metadata.get("steps", [])
         submit_steps = [
@@ -239,24 +272,39 @@ def scenario_names(root: Path, official: Path) -> list[str]:
             if isinstance(step, dict) and step.get("kind") == "submit_workflow"
         ]
         if len(submit_steps) == 1:
-            names.add(manifest.parent.name)
+            names.add(name)
     return sorted(names)
-
 def main() -> int:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--server-binary", type=Path, required=True)
     parser.add_argument("--runner-binary", type=Path, required=True)
     parser.add_argument("--client-binary", type=Path, required=True)
-    parser.add_argument("--scenarios-root", type=Path, default=Path("experiments/mitm/scenarios"))
+    parser.add_argument(
+        "--scenarios-root",
+        type=Path,
+        default=Path("experiments/mitm/scenarios"),
+    )
     parser.add_argument("--official", type=Path, required=True)
     parser.add_argument("--output", type=Path, required=True)
     parser.add_argument("--scenario", action="append", dest="scenarios")
+    parser.add_argument(
+        "--exclude-prefix",
+        action="append",
+        default=[],
+        help="exclude discovered scenarios whose name starts with this prefix",
+    )
     args = parser.parse_args()
 
     if args.scenarios:
-        scenarios = args.scenarios
+        scenarios = [
+            name
+            for name in args.scenarios
+            if not any(name.startswith(prefix) for prefix in args.exclude_prefix)
+        ]
     else:
-        scenarios = scenario_names(args.scenarios_root, args.official)
+        scenarios = scenario_names(
+            args.scenarios_root, args.official, args.exclude_prefix
+        )
         missing = [
             name
             for name in scenarios
@@ -280,9 +328,18 @@ def main() -> int:
         temp_root = Path(temp)
         server_state = temp_root / "server-state"
         server_log = temp_root / "server.log"
-        runner_root = temp_root / "runner"
-        runner_log = temp_root / "runner.log"
+        runner_roots = [temp_root / f"runner-{index}" for index in range(4)]
+        runner_logs = [temp_root / f"runner-{index}.log" for index in range(4)]
         env = os.environ.copy()
+        # The cpane runner exports these for jobs executed inside smolVMs.
+        # This harness runs the runner directly on the host, so inheriting the
+        # guest bridge origin makes it try to bind cpane's fixed 9090 port.
+        for key in (
+            "PRELOOP_CONTROL_ORIGIN",
+            "PRELOOP_CONTROL_SOCKET",
+            "PRELOOP_CONTROL_UPSTREAM",
+        ):
+            env.pop(key, None)
         env.update(
             {
                 "PRELOOP_PUBLIC_URL": server_url,
@@ -307,29 +364,42 @@ def main() -> int:
                 stderr=subprocess.STDOUT,
                 text=True,
             )
-        runner: subprocess.Popen[str] | None = None
+        runners: list[subprocess.Popen[str]] = []
         try:
             wait_for_health(server_url, server, server_log)
-            configure_runner(args.runner_binary, runner_root, server_url, token)
-            with runner_log.open("w") as log_file:
-                runner = subprocess.Popen(
-                    [str(args.runner_binary), "--runner-root", str(runner_root), "run"],
-                    env=env,
-                    stdout=log_file,
-                    stderr=subprocess.STDOUT,
-                    text=True,
+            for index, (root, log_path) in enumerate(zip(runner_roots, runner_logs)):
+                configure_runner(
+                    args.runner_binary,
+                    root,
+                    server_url,
+                    token,
+                    f"runner-light-local-{index}",
                 )
+                with log_path.open("w") as log_file:
+                    runners.append(
+                        subprocess.Popen(
+                            [str(args.runner_binary), "--runner-root", str(root), "run"],
+                            env=env,
+                            stdout=log_file,
+                            stderr=subprocess.STDOUT,
+                            text=True,
+                        )
+                    )
 
             records: list[dict[str, Any]] = []
             for scenario_name in scenarios:
                 scenario = args.scenarios_root / scenario_name
-                workflow, duration = scenario_workflow(scenario)
-                run_id = submit(args.client_binary, server_url, token, workflow, scenario)
+                workflow, workspace, duration = prepare_scenario_workspace(
+                    scenario, temp_root
+                )
+                run_id = submit(
+                    args.client_binary, server_url, token, workflow, workspace
+                )
                 run = wait_for_run(
                     server_url,
                     token,
                     run_id,
-                    runner,
+                    runners,
                     max(180, duration + 60),
                 )
                 result = semantic_result(run)
@@ -346,12 +416,13 @@ def main() -> int:
             args.output.write_text("\n".join(json.dumps(record) for record in records) + "\n")
         except Exception:
             print(f"runner-light: failure artifacts at {temp_root}", file=sys.stderr)
-            for log in (server_log, runner_log):
+            for log in (server_log, *runner_logs):
                 if log.exists():
                     print(log.read_text(errors="replace"), file=sys.stderr)
             raise
         finally:
-            stop_process(runner)
+            for runner in runners:
+                stop_process(runner)
             stop_process(server)
 
     print(f"runner-light: wrote {len(scenarios)} records to {args.output}")
