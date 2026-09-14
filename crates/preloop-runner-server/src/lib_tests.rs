@@ -5017,13 +5017,19 @@ async fn current_runner_registration_to_broker_job_e2e() {
         acquired["steps"]
     );
 
+    let runtime_job_id: uuid::Uuid = runner_request_id.parse().unwrap();
+    let runtime_token = state.mint_runtime_token(
+        acquired["plan"]["planId"].as_str().unwrap(),
+        &runtime_job_id,
+    );
+
     let response = app
         .clone()
         .oneshot(
             Request::builder()
                 .method(Method::POST)
                 .uri(format!("/broker/{runner_id}/completejob"))
-                .header(header::AUTHORIZATION, format!("Bearer {runner_token}"))
+                .header(header::AUTHORIZATION, format!("Bearer {runtime_token}"))
                 .header(header::CONTENT_TYPE, "application/json")
                 .body(Body::from(
                     json!({"jobId": runner_request_id, "planId": acquired["plan"]["planId"]})
@@ -5451,12 +5457,18 @@ jobs:
     assert!(acquired["jobId"].is_string());
     assert!(acquired["steps"].is_array());
 
+    let runtime_job_id: uuid::Uuid = runner_request_id.parse().unwrap();
+    let runtime_token = state.mint_runtime_token(
+        acquired["plan"]["planId"].as_str().unwrap(),
+        &runtime_job_id,
+    );
+
     let renewed = request_json_with_bearer(
         &app,
         Method::POST,
         "/broker/1/renewjob",
         json!({"jobId": runner_request_id, "planId": acquired["plan"]["planId"]}),
-        &runner_token,
+        &runtime_token,
     )
     .await;
     let locked_until = renewed["lockedUntil"]
@@ -5477,7 +5489,7 @@ jobs:
             Request::builder()
                 .method(Method::POST)
                 .uri("/broker/1/completejob")
-                .header(header::AUTHORIZATION, format!("Bearer {runner_token}"))
+                .header(header::AUTHORIZATION, format!("Bearer {runtime_token}"))
                 .header(header::CONTENT_TYPE, "application/json")
                 .body(Body::from(
                     json!({"jobId": runner_request_id, "planId": acquired["plan"]["planId"]})
@@ -5490,7 +5502,7 @@ jobs:
     assert_eq!(response.status(), StatusCode::NO_CONTENT);
     let duplicate_completion = status_with_bearer(
         &app,
-        &runner_token,
+        &runtime_token,
         Method::POST,
         "/broker/1/completejob",
         json!({"jobId": runner_request_id, "planId": acquired["plan"]["planId"]}),
@@ -5503,7 +5515,7 @@ jobs:
     );
     let renew_after_completion = status_with_bearer(
         &app,
-        &runner_token,
+        &runtime_token,
         Method::POST,
         "/broker/1/renewjob",
         json!({"jobId": runner_request_id, "planId": acquired["plan"]["planId"]}),
@@ -5685,6 +5697,11 @@ async fn broker_job_refs_use_session_runner_id_for_pool_and_root_polls() {
             acquired["resources"]["endpoints"][0]["url"],
             expected_run_service_url
         );
+        let runtime_job_id: uuid::Uuid = request_id.parse().unwrap();
+        let runtime_token = state.mint_runtime_token(
+            acquired["plan"]["planId"].as_str().unwrap(),
+            &runtime_job_id,
+        );
         let _ = request_json_with_bearer(
             &app,
             Method::POST,
@@ -5693,7 +5710,7 @@ async fn broker_job_refs_use_session_runner_id_for_pool_and_root_polls() {
                 "jobId": request_id,
                 "planId": acquired["plan"]["planId"]
             }),
-            &runner_token,
+            &runtime_token,
         )
         .await;
     }
