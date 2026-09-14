@@ -493,9 +493,10 @@ impl JobContext {
                 // `${{ secrets['system.github.token'] }}`.
                 // Real GitHub Actions does not expose them either. Every
                 // legitimate consumer reads these straight out of the raw
-                // `variables` map by exact key, so nothing is starved; log
-                // masking is applied independently in `new`, so they stay
-                // redacted regardless.
+                // `variables` map by exact key, while the built-in
+                // `github_token` variable is mapped to the canonical
+                // `secrets.GITHUB_TOKEN` name below; log masking is applied
+                // independently in `new`, so they stay redacted regardless.
                 //
                 // This is defence in depth, not the only defence: a credential
                 // that must not reach workflow code is not shipped as a job
@@ -521,6 +522,12 @@ impl JobContext {
                 if is_secret {
                     if let Some(value) = val.get("value").and_then(|v| v.as_str()) {
                         secrets_map.insert(key.clone(), serde_json::json!(value));
+                        // The wire uses the official runner's lower-case
+                        // `github_token` variable, while workflow expressions
+                        // address the built-in secret as `GITHUB_TOKEN`.
+                        if key == "github_token" {
+                            secrets_map.insert("GITHUB_TOKEN".to_owned(), serde_json::json!(value));
+                        }
                     }
                 }
             }

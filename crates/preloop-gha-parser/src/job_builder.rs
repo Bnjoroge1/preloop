@@ -843,9 +843,9 @@ fn populate_runner_variables(variables: &mut BTreeMap<String, VariableValue>, pl
         .entry("github_token".to_owned())
         .or_insert_with(|| VariableValue::secret(String::new()));
     // The permissions the job's GITHUB_TOKEN actually carries, in the wire
-    // format's PascalCase spelling (e.g. "Contents", "PullRequests"). Derived
-    // from the same policy the installation token is minted against, so the
-    // runner's `GITHUB_TOKEN Permissions` group never overstates the token.
+    // format's PascalCase spelling (e.g. "Contents", "PullRequests"). OIDC
+    // (`id-token`) is an Actions capability, not a GITHUB_TOKEN permission,
+    // so it controls the request URL separately and is absent from this map.
     let permissions = crate::effective_token_permissions(plan.permissions.as_ref());
     let perms_json = token_permissions_wire_json(&permissions);
     variables
@@ -856,18 +856,25 @@ fn populate_runner_variables(variables: &mut BTreeMap<String, VariableValue>, pl
         .or_insert_with(|| VariableValue::secret(String::new()));
 }
 
-/// Render a permission map in the wire format's PascalCase spelling.
+/// Render the repository permissions of a job's GITHUB_TOKEN in the wire
+/// format's PascalCase spelling.
 ///
-/// Exported so the dispatch path can restate the permissions a token *actually*
-/// carries after the App installation narrowed them, using the same spelling
-/// the runner's `GITHUB_TOKEN Permissions` group prints. Two renderers would
-/// drift, and the group would then disagree with itself between runs.
+/// `id-token` and `models` are Actions-only capabilities, not token scopes;
+/// their grants are carried by their dedicated protocol fields. `Metadata:
+/// read` is implicit for a non-empty GitHub permissions declaration and is
+/// included because the official runner reports the effective token scope.
+/// Exported so the dispatch path can restate narrowed permissions with the
+/// same renderer.
 pub fn token_permissions_wire_json(permissions: &BTreeMap<String, String>) -> String {
-    let pascal: serde_json::Map<String, serde_json::Value> = permissions
+    let mut pascal: BTreeMap<String, String> = permissions
         .iter()
-        .map(|(scope, level)| (pascal_case(scope), serde_json::Value::String(level.clone())))
+        .filter(|(scope, _)| !matches!(scope.as_str(), "id-token" | "models"))
+        .map(|(scope, level)| (pascal_case(scope), level.clone()))
         .collect();
-    serde_json::Value::Object(pascal).to_string()
+    if !permissions.is_empty() && !permissions.contains_key("metadata") {
+        pascal.insert("Metadata".to_owned(), "read".to_owned());
+    }
+    serde_json::to_string(&pascal).expect("permission map serialization cannot fail")
 }
 
 /// `pull-requests` → `PullRequests`, the wire spelling of a permission scope.
@@ -1676,6 +1683,27 @@ jobs:
         assert_eq!(special_secret.value.as_deref(), Some("p@$$(word)"));
         assert_eq!(special_secret.is_secret, Some(true));
     }
+    #[test]
+    fn token_permission_wire_matches_effective_runner_scopes() {
+        let permissions = BTreeMap::from([
+            ("contents".to_owned(), "read".to_owned()),
+            ("id-token".to_owned(), "write".to_owned()),
+            ("pull-requests".to_owned(), "write".to_owned()),
+        ]);
+        assert_eq!(
+            token_permissions_wire_json(&permissions),
+            r#"{"Contents":"read","Metadata":"read","PullRequests":"write"}"#
+        );
+        assert_eq!(
+            token_permissions_wire_json(&BTreeMap::from([(
+                "id-token".to_owned(),
+                "write".to_owned()
+            )])),
+            r#"{"Metadata":"read"}"#
+        );
+        assert_eq!(token_permissions_wire_json(&BTreeMap::new()), "{}");
+    }
+
     #[test]
     fn workflow_dispatch_inputs_are_in_event_context() {
         let yaml = r#"

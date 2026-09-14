@@ -28,8 +28,8 @@ pub struct ServerConfig {
     pub next_job_runs_on: Option<Arc<std::sync::RwLock<Vec<String>>>>,
     /// Raised while a co-hosted runner pool is still preparing its
     /// immutable machine image (artifact download or build, golden prep)
-    /// and cannot register a runner yet. The starvation sweep pauses the
-    /// queued-job grace clock while it is set.
+    /// and cannot register a runner yet. The starvation sweep protects queued
+    /// jobs during this warm, bounded by the absolute queue-age ceiling.
     pub pool_preparing: Option<Arc<std::sync::atomic::AtomicBool>>,
     /// Enable privileged local/CI simulation endpoints.
     pub enable_test_api: bool,
@@ -230,28 +230,29 @@ pub(crate) async fn reap_once(shared: &Arc<SharedState>) {
         .map(|(id, ..)| (*id, inner.debug_sessions.paused_for_request(*id, now)))
         .collect();
     crate::debug_sessions::sweep(&mut inner.debug_sessions, now, &active_request_ids);
+    crate::runtime_scheduling::sweep_stale_bindings(&mut inner, now);
 
     // Starvation sweep: a ready-queue job that no runner can ever claim must
     // not sit queued forever with no explanation. The pool is provisioned on
     // demand and external runners may register at any moment, so a job is
     // only failed after a grace window during which nothing matched its
     // labels. The `queued_at` map is maintained here, from the queue itself:
-    // first observation stamps the time, a match clears it, and jobs that
-    // left the queue drop their entry, so no enqueue-site coordination is
-    // needed and the map cannot go stale. While a co-hosted pool is still
-    // preparing its machine image (artifact download or build, golden prep)
-    // or booting a runner it cannot register a runner no matter how long the
-    // job waits, so the clock is reset for the whole warm: a job queued
-    // mid-warm gets a full grace window once provisioning actually starts.
-    // The reset is bounded by MAX_QUEUED_GRACE (see below) so continuous
-    // provisioning cannot pause the clock forever.
+    // its first observation uses the persisted ready-enqueue time when
+    // available, and entries are dropped when jobs leave the queue. This
+    // avoids enqueue-site coordination and preserves queue age across
+    // restarts. While a co-hosted pool is still preparing its machine image
+    // (artifact download or build, golden prep) or booting a runner it cannot
+    // register a runner no matter how long the job waits, so keep the job
+    // protected during that warm. The protection is bounded by
+    // MAX_QUEUED_GRACE (see below), measured from ready-enqueue, so continuous
+    // provisioning cannot protect an unschedulable job forever.
     const QUEUED_JOB_GRACE: Duration = Duration::from_secs(120);
     // Absolute backstop, measured from ready-enqueue, on how long
-    // provisioning/preparing may pause a job's starvation clock. It protects
-    // a job whose runner is genuinely on the way, but keeps continuous
-    // successor prebuilds or a provision that fails and retries forever from
-    // masking an unschedulable job (bad `runs-on`, or a persistently broken
-    // provision) indefinitely.
+    // provisioning/preparing may protect a job from starvation failure. It
+    // protects a job whose runner is genuinely on the way, but keeps
+    // continuous successor prebuilds or a provision that fails and retries
+    // forever from masking an unschedulable job (bad `runs-on`, or a
+    // persistently broken provision) indefinitely.
     const MAX_QUEUED_GRACE: Duration = Duration::from_secs(600);
     let pool_status = shared.state.pool_status.snapshot();
     let pool_preparing = shared
@@ -292,6 +293,12 @@ pub(crate) async fn reap_once(shared: &Arc<SharedState>) {
             inner.queued_at.remove(&key);
             continue;
         }
+        let enqueued_at =
+            SystemTime::UNIX_EPOCH + Duration::from_nanos(job.enqueued_at_unix_nanos as u64);
+        let enqueue_age_expired = now
+            .duration_since(enqueued_at)
+            .map(|age| age >= MAX_QUEUED_GRACE)
+            .unwrap_or(true);
         let grace = if pool_preparing {
             // A restart restores the queue's original enqueue timestamps but
             // destroys every pool VM. Give the replacement pool one process-
@@ -315,10 +322,20 @@ pub(crate) async fn reap_once(shared: &Arc<SharedState>) {
             // MAX_QUEUED_GRACE measured from ready-enqueue: once a job has
             // waited that long it starves even while the pool is still
             // preparing, so sustained provisioning cannot mask it forever.
+            if !enqueue_age_expired {
+                inner.queued_at.remove(&key);
+                continue;
+            }
             MAX_QUEUED_GRACE
         } else {
-            let first_seen = *inner.queued_at.entry(key.clone()).or_insert(now);
-            if now.duration_since(first_seen).unwrap_or_default() < QUEUED_JOB_GRACE {
+            // Seed the observation clock from the persisted ready-enqueue
+            // timestamp so restart does not grant a fresh grace window.
+            let first_seen = *inner.queued_at.entry(key.clone()).or_insert(enqueued_at);
+            if now
+                .duration_since(first_seen)
+                .map(|age| age < QUEUED_JOB_GRACE)
+                .unwrap_or(false)
+            {
                 continue;
             }
             QUEUED_JOB_GRACE
@@ -457,15 +474,31 @@ pub(crate) async fn reap_once(shared: &Arc<SharedState>) {
     // the dead machine new jobs. Restored sessions from a restart have no
     // last-seen entry and are deliberately skipped here (the runner
     // re-registers and polls, or the lease reaper bounds them).
-    let stale_runners: std::collections::BTreeSet<i64> = {
+    let (stale_runners, phantom_runners) = {
         let inner = shared.state.inner.lock().await;
         let now = std::time::Instant::now();
-        inner
+        let stale: std::collections::BTreeSet<i64> = inner
             .session_last_seen
             .iter()
             .filter(|(_, seen)| now.duration_since(**seen) > inner.runner_liveness_timeout)
             .filter_map(|(session_id, _)| inner.runner_id_for_session(session_id))
-            .collect()
+            .collect();
+        // Reap registrations with no active AzDO or broker session and no
+        // successful poll within the liveness timeout.
+        let phantom: std::collections::BTreeSet<i64> = inner
+            .runner_registered_at
+            .iter()
+            .filter(|(runner_id, registered_at)| {
+                now.duration_since(**registered_at) > inner.runner_liveness_timeout
+                    && !inner.sessions.values().any(|s| s.runner_id == **runner_id)
+                    && !inner
+                        .broker_session_runners
+                        .values()
+                        .any(|session_runner_id| *session_runner_id == **runner_id)
+            })
+            .map(|(runner_id, _)| *runner_id)
+            .collect();
+        (stale, phantom)
     };
     for runner_id in stale_runners {
         warn!(
@@ -473,6 +506,13 @@ pub(crate) async fn reap_once(shared: &Arc<SharedState>) {
             "liveness sweep: reaping deaf runner (no poll within timeout)"
         );
         purge_runner_identity(shared, runner_id).await;
+    }
+    for runner_id in phantom_runners {
+        warn!(
+            runner_id,
+            "liveness sweep: reaping phantom registration (no session created within timeout)"
+        );
+        crate::runner_lifecycle::purge_phantom_runner(shared, runner_id).await;
     }
 
     // Notify if cancellations or starvation failures occurred
@@ -553,6 +593,12 @@ struct SnapshotInputs {
     runner_idle: u32,
     runner_busy: u32,
     runner_stale: u32,
+    /// Pool-managed runners currently executing a job. The pool section's
+    /// `busy` counter has no other source: the orchestrator only tracks warm
+    /// idle slots, so without this it always read zero while the pool ran
+    /// jobs. Restricted to `pool_proven_runners` so external runners do not
+    /// inflate the pool's own view.
+    pool_busy: u32,
     runner_assignments: Vec<preloop_observability::status::RunnerAssignment>,
     oldest_ready_seconds: Option<f64>,
     oldest_ready_run_id: Option<String>,
@@ -574,6 +620,7 @@ struct SnapshotInputs {
     concurrency_groups_contended: u32,
     concurrency_pending_holders: u32,
     concurrency_deepest_group_pending: u32,
+    released_bindings: u64,
 }
 
 fn count_run_statuses(statuses: impl IntoIterator<Item = ExecutionStatus>) -> (u32, u32, u32) {
@@ -600,10 +647,12 @@ fn collect_snapshot_inputs(inner: &InnerState) -> SnapshotInputs {
     let mut runner_ids_by_run: std::collections::BTreeMap<RunId, std::collections::BTreeSet<i64>> =
         std::collections::BTreeMap::new();
     for (key, assignment) in &inner.job_assignments {
-        runner_ids_by_run
-            .entry(key.0)
-            .or_default()
-            .insert(assignment.runner_id);
+        if let Some(runner_id) = assignment.runner_id {
+            runner_ids_by_run
+                .entry(key.0)
+                .or_default()
+                .insert(runner_id);
+        }
     }
     for request in inner.job_requests.values() {
         if request.result.is_none() {
@@ -693,6 +742,7 @@ fn collect_snapshot_inputs(inner: &InnerState) -> SnapshotInputs {
     let mut runner_idle = 0u32;
     let mut runner_busy = 0u32;
     let mut runner_stale = 0u32;
+    let mut pool_busy = 0u32;
     for runner_id in inner.runners.keys() {
         let mut owned: std::collections::BTreeSet<&String> = inner
             .broker_session_runners
@@ -722,6 +772,9 @@ fn collect_snapshot_inputs(inner: &InnerState) -> SnapshotInputs {
             });
         if busy {
             runner_busy += 1;
+            if inner.pool_proven_runners.contains(runner_id) {
+                pool_busy += 1;
+            }
         }
         if stale {
             runner_stale += 1;
@@ -786,6 +839,7 @@ fn collect_snapshot_inputs(inner: &InnerState) -> SnapshotInputs {
         runner_idle,
         runner_busy,
         runner_stale,
+        pool_busy,
         runner_assignments: assignments,
         oldest_ready_seconds,
         oldest_ready_run_id: oldest_ready.map(|job| job.run_id.to_string()),
@@ -807,12 +861,166 @@ fn collect_snapshot_inputs(inner: &InnerState) -> SnapshotInputs {
         concurrency_groups_contended,
         concurrency_pending_holders,
         concurrency_deepest_group_pending,
+        released_bindings: inner.released_bindings_count,
     }
+}
+
+/// Webhook-repair inputs for the operational snapshot.
+///
+/// Collected asynchronously (store + status locks) and handed to the
+/// synchronous builder, so the snapshot can report repair health without
+/// the builder learning how to read a database.
+#[derive(Debug, Default, Clone)]
+struct WebhookConditionInputs {
+    stats: Option<crate::models::WebhookQueueStats>,
+    watchdog: crate::webhook_status::WatchdogStatus,
+    breaker: crate::github_breaker::BreakerSnapshot,
+    app_config: Vec<crate::webhook_status::AppWebhookConfigStatus>,
+}
+
+/// A queue whose oldest unprocessed delivery is older than this is not
+/// "busy", it is stuck: the worker retries with at most a 30s backoff.
+const WEBHOOK_QUEUE_STALL_SECONDS: f64 = 900.0;
+/// The watchdog polls every 5 minutes by default. Six missed polls is not a
+/// blip, and a watchdog that has stopped reading GitHub's delivery history
+/// looks exactly like a period with no failed deliveries.
+const WEBHOOK_WATCHDOG_STALE_SECONDS: f64 = 1800.0;
+
+/// Conditions derived from the webhook repair layers.
+fn webhook_conditions(
+    inputs: &WebhookConditionInputs,
+    now_us: i64,
+) -> Vec<preloop_observability::status::Condition> {
+    use preloop_observability::status::Condition;
+    let condition = |code: &str, severity: &str, message: String| Condition {
+        code: code.to_owned(),
+        severity: severity.to_owned(),
+        message,
+        exemplars: Vec::new(),
+    };
+    let mut conditions = Vec::new();
+    match &inputs.stats {
+        Some(stats) => {
+            if stats.failed > 0 {
+                conditions.push(condition(
+                    "webhook_dead_letter",
+                    "warning",
+                    format!(
+                        "{} webhook deliveries failed with unreportable or permanent errors",
+                        stats.failed
+                    ),
+                ));
+            }
+            if let Some(oldest) = stats.oldest_pending_received_at_us {
+                let age = crate::webhook_status::age_seconds(oldest, now_us);
+                if age > WEBHOOK_QUEUE_STALL_SECONDS {
+                    conditions.push(condition(
+                        "webhook_queue_stalled",
+                        "warning",
+                        format!("oldest unprocessed webhook delivery is {age:.0}s old"),
+                    ));
+                }
+            }
+        }
+        None => {
+            conditions.push(condition(
+                "webhook_queue_stats_unavailable",
+                "warning",
+                "webhook queue statistics have not been published by the queue worker".to_owned(),
+            ));
+        }
+    }
+    if inputs.breaker.open {
+        conditions.push(condition(
+            "github_unavailable",
+            "warning",
+            format!(
+                "GitHub calls are circuit-broken for another {}s ({}): queued deliveries are parked, not failing",
+                inputs.breaker.retry_in_seconds.unwrap_or_default(),
+                inputs
+                    .breaker
+                    .last_error
+                    .clone()
+                    .unwrap_or_else(|| "no detail".to_owned())
+            ),
+        ));
+    }
+    if inputs.watchdog.enabled {
+        let stale = match inputs.watchdog.last_success_at_us {
+            Some(last) => {
+                crate::webhook_status::age_seconds(last, now_us) > WEBHOOK_WATCHDOG_STALE_SECONDS
+            }
+            // Never succeeded: only alarming once the process has been up
+            // long enough for an attempted poll to prove the watchdog is
+            // actually unable to complete.
+            None => inputs.watchdog.first_poll_at_us.is_some_and(|poll| {
+                crate::webhook_status::age_seconds(poll, now_us) > WEBHOOK_WATCHDOG_STALE_SECONDS
+            }),
+        };
+        if stale {
+            conditions.push(condition(
+                "webhook_watchdog_stale",
+                "warning",
+                format!(
+                    "webhook delivery watchdog has not completed a poll recently ({}); \
+                     lost deliveries would go unnoticed",
+                    inputs
+                        .watchdog
+                        .last_error
+                        .clone()
+                        .unwrap_or_else(|| "no error recorded".to_owned())
+                ),
+            ));
+        }
+        if inputs.watchdog.open_repairs > 0 {
+            conditions.push(condition(
+                "webhook_repairs_pending",
+                "warning",
+                format!(
+                    "{} GitHub deliveries have been asked for redelivery and have not arrived",
+                    inputs.watchdog.open_repairs
+                ),
+            ));
+        }
+    }
+    for app in inputs.app_config.iter().filter(|app| !app.healthy()) {
+        let mut detail = Vec::new();
+        if app.url_drifted() {
+            detail.push(format!(
+                "delivery URL is {} but this server expects {}",
+                app.hook_url.clone().unwrap_or_else(|| "<none>".to_owned()),
+                app.expected_url
+                    .clone()
+                    .unwrap_or_else(|| "<unknown>".to_owned())
+            ));
+        }
+        if !app.missing_events.is_empty() {
+            detail.push(format!(
+                "not subscribed to {} (fix in App settings; GitHub has no API for it)",
+                app.missing_events.join(", ")
+            ));
+        }
+        if !app.missing_permissions.is_empty() {
+            detail.push(format!(
+                "missing permissions {}",
+                app.missing_permissions.join(", ")
+            ));
+        }
+        if let Some(error) = &app.error {
+            detail.push(error.clone());
+        }
+        conditions.push(condition(
+            "webhook_config_drift",
+            "warning",
+            format!("GitHub App {}: {}", app.app_id, detail.join("; ")),
+        ));
+    }
+    conditions
 }
 
 fn build_operational_snapshot_sync(
     inputs: SnapshotInputs,
-    pool_snapshot: preloop_observability::status::PoolSnapshot,
+    mut pool_snapshot: preloop_observability::status::PoolSnapshot,
     observability: &preloop_observability::Observability,
     started_at: std::time::Instant,
     shutdown_requested: bool,
@@ -821,6 +1029,7 @@ fn build_operational_snapshot_sync(
     storage_components: Vec<preloop_observability::status::StorageComponent>,
     github_snapshot: preloop_observability::status::GithubSnapshot,
     store_backend: preloop_observability::status::StoreBackend,
+    webhook: WebhookConditionInputs,
 ) -> preloop_observability::status::OperationalSnapshot {
     use chrono::Utc;
     use preloop_observability::status::*;
@@ -915,6 +1124,8 @@ fn build_operational_snapshot_sync(
                 .collect(),
         });
     }
+    pool_snapshot.released_bindings = inputs.released_bindings;
+    pool_snapshot.busy = inputs.pool_busy;
 
     OperationalSnapshot {
         schema_version: 2,
@@ -1006,7 +1217,13 @@ fn build_operational_snapshot_sync(
             otlp_enabled: observability.otlp_enabled(),
             ..Default::default()
         },
-        conditions,
+        conditions: {
+            conditions.extend(webhook_conditions(
+                &webhook,
+                crate::webhook_status::now_us(),
+            ));
+            conditions
+        },
     }
 }
 
@@ -1054,6 +1271,7 @@ async fn publish_snapshot(
         tokio::task::spawn_blocking(move || collect_storage_components(&state_dir_for_meta))
             .await
             .unwrap_or_default();
+    let webhook = collect_webhook_condition_inputs(&shared.state);
     let snap = build_operational_snapshot_sync(
         inputs,
         pool_snapshot,
@@ -1065,8 +1283,24 @@ async fn publish_snapshot(
         storage_components,
         github_snapshot,
         store_backend.clone(),
+        webhook,
     );
     *shared.state.status_snapshot.write() = snap;
+}
+
+/// Read the repair layers' published state plus the queue counters.
+///
+/// A publisher that has not run yet leaves the counters absent rather than
+/// zero: the snapshot must not claim an empty queue (and so report no
+/// dead-letter warning) merely because nothing has read the store. The queue
+/// worker publishes them, so the 5s tick never takes the store's connection.
+fn collect_webhook_condition_inputs(state: &AppState) -> WebhookConditionInputs {
+    WebhookConditionInputs {
+        stats: state.webhook_status.queue_stats(),
+        watchdog: state.webhook_status.watchdog(),
+        breaker: state.github_breaker.snapshot(),
+        app_config: state.webhook_status.app_config_snapshot().0,
+    }
 }
 
 async fn run_state_sampler(
@@ -1234,6 +1468,10 @@ pub async fn serve(config: ServerConfig) -> anyhow::Result<()> {
     // next-job labels, pending registrations and preparing flag instead of
     // waiting for the first 5s tick to mirror them.
     {
+        // The queue counters are read from the store once here, so the seeded
+        // snapshot reports real webhook depth and the queue worker only has to
+        // keep the cache fresh from then on.
+        crate::github::refresh_webhook_queue_stats(&state).await;
         let inputs = {
             let inner = state.inner.lock().await;
             collect_snapshot_inputs(&inner)
@@ -1254,6 +1492,7 @@ pub async fn serve(config: ServerConfig) -> anyhow::Result<()> {
                 ..Default::default()
             },
             store_backend.clone(),
+            collect_webhook_condition_inputs(&state),
         );
         *state.status_snapshot.write() = init;
     }
@@ -1403,6 +1642,30 @@ pub async fn serve(config: ServerConfig) -> anyhow::Result<()> {
     let checker_shared = shared.clone();
     tokio::spawn(async move {
         run_background_reaper(checker_shared).await;
+    });
+
+    let webhook_worker_heartbeat = state.observability.heartbeat().clone();
+    let webhook_worker_handle = webhook_worker_heartbeat.register(
+        "webhook_queue_worker",
+        preloop_observability::Criticality::Critical,
+    );
+    let webhook_worker_shared = shared.clone();
+    tokio::spawn(async move {
+        crate::github::run_webhook_queue_worker(webhook_worker_shared, webhook_worker_handle).await;
+    });
+
+    // Repair layers. None of them is on the request path, and each is
+    // independently disable-able, so they are best-effort tasks rather than
+    // critical heartbeats: a stalled watchdog must not fail `/readyz` while
+    // the queue itself is draining fine. Their staleness is reported through
+    // the operational snapshot instead.
+    let watchdog_shared = shared.clone();
+    tokio::spawn(async move {
+        crate::webhook_watchdog::run_webhook_watchdog(watchdog_shared).await;
+    });
+    let health_shared = shared.clone();
+    tokio::spawn(async move {
+        crate::webhook_health::run_webhook_health_monitor(health_shared).await;
     });
 
     // Claims held by machines the restart destroyed can never be completed by
@@ -1648,6 +1911,7 @@ mod tests {
             Vec::new(),
             Default::default(),
             Default::default(),
+            Default::default(),
         );
         assert_eq!(
             snapshot.overall,
@@ -1677,6 +1941,7 @@ mod tests {
             true,
             temp.path(),
             Vec::new(),
+            Default::default(),
             Default::default(),
             Default::default(),
         );
@@ -1711,6 +1976,7 @@ mod tests {
             temp.path(),
             Vec::new(),
             github,
+            Default::default(),
             Default::default(),
         );
         assert_eq!(

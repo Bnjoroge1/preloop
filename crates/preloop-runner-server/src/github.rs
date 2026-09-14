@@ -13,11 +13,13 @@ use sha2::Sha256;
 use std::collections::{BTreeMap, BTreeSet};
 use std::path::PathBuf;
 use std::sync::Arc;
-use tracing::{error, info, warn};
+use std::time::{Duration, Instant};
+use tracing::{debug, error, info, warn};
 
+use crate::models::{WebhookDeliveryRecord, WebhookDeliveryStatus};
 use crate::{
-    changed_paths_from_payload, submit_run_inner, ExecutionStatus, SharedState,
-    WebhookDeliveryState,
+    changed_paths_from_payload, submit_run_inner_with_webhook_delivery, ExecutionStatus,
+    SharedState,
 };
 use preloop_gha_protocol::{AnnotationLevel, JobId, NdjsonEvent, RunId, WorkflowSubmission};
 
@@ -204,6 +206,7 @@ async fn resolve_check_run_token(shared: &Arc<SharedState>, repo: &str) -> Optio
 
 async fn send_github_check_request(
     shared: &Arc<SharedState>,
+    breaker: &crate::github_breaker::GithubBreaker,
     token: &str,
     repo: &str,
     method: reqwest::Method,
@@ -212,21 +215,16 @@ async fn send_github_check_request(
 ) -> anyhow::Result<Value> {
     let client = crate::shared_http::CLIENT.clone();
     let url = format!("{}/repos/{}/{}", github_api_base(), repo, path);
-    let res = client
-        .request(method, &url)
-        .header("User-Agent", "preloop")
-        .header("Authorization", format!("Bearer {}", token))
-        .header("Accept", "application/vnd.github+json")
-        .json(&body)
-        .send()
-        .await;
-    let res = match res {
-        Ok(response) => response,
-        Err(error) => {
-            record_check_reporting(shared, false);
-            return Err(error.into());
-        }
-    };
+    let res = crate::github_breaker::send_observed(
+        breaker,
+        client
+            .request(method, &url)
+            .header("User-Agent", "preloop")
+            .header("Authorization", format!("Bearer {}", token))
+            .header("Accept", "application/vnd.github+json")
+            .json(&body),
+    )
+    .await?;
 
     if !res.status().is_success() {
         let status = res.status();
@@ -257,11 +255,39 @@ pub(crate) async fn report_check_run_queued(
     sha: &str,
     job_id: &JobId,
     run_id: RunId,
-) {
+) -> anyhow::Result<Option<u64>> {
+    let existing_check_run_id = {
+        let inner = shared.state.inner.lock().await;
+        inner
+            .runs
+            .get(&run_id)
+            .and_then(|run| run.job_check_run_ids.get(job_id).copied())
+    };
     let token = resolve_check_run_token(shared, repo).await;
-    let mut check_run_id = None;
 
-    if let Some(token) = &token {
+    if let Some(check_run_id) = existing_check_run_id {
+        match report_existing_check_run_queued(shared, repo, job_id, run_id, check_run_id).await {
+            Ok(()) => return Ok(Some(check_run_id)),
+            Err(error) if !is_check_run_not_found(&error) => return Err(error),
+            Err(error) => {
+                warn!(
+                    %run_id,
+                    %job_id,
+                    check_run_id,
+                    %error,
+                    "persisted GitHub check run is stale; reconciling it"
+                );
+                let mut inner = shared.state.inner.lock().await;
+                if let Some(run) = inner.runs.get_mut(&run_id) {
+                    if run.job_check_run_ids.get(job_id) == Some(&check_run_id) {
+                        run.job_check_run_ids.remove(job_id);
+                    }
+                }
+            }
+        }
+    }
+
+    let check_run_id = if let Some(token) = &token {
         let details_url = run_details_url(run_id);
 
         let job_name = {
@@ -288,6 +314,7 @@ pub(crate) async fn report_check_run_queued(
 
         match send_github_check_request(
             shared,
+            &shared.state.github_breaker,
             token,
             repo,
             reqwest::Method::POST,
@@ -296,47 +323,60 @@ pub(crate) async fn report_check_run_queued(
         )
         .await
         {
-            Ok(res) => {
-                if let Some(id) = res.get("id").and_then(|id| id.as_u64()) {
-                    check_run_id = Some(id);
+            Ok(response) => match response.get("id").and_then(Value::as_u64) {
+                Some(id) => {
                     info!(
                         %run_id,
                         %job_id,
                         check_run_id = id,
                         "GitHub check run created successfully"
                     );
+                    id
                 }
-            }
-            Err(e) => {
-                warn!(%run_id, %job_id, error = %e, "Failed to create GitHub check run");
+                None => find_existing_check_run(shared, token, repo, sha, &job_id.to_string())
+                    .await?
+                    .ok_or_else(|| anyhow::anyhow!("GitHub check-run POST returned no id"))?,
+            },
+            Err(error) => {
+                // A transport error is ambiguous: GitHub may have
+                // committed the POST before the connection failed.
+                match find_existing_check_run(shared, token, repo, sha, &job_id.to_string()).await {
+                    Ok(Some(id)) => id,
+                    Ok(None) => return Err(error),
+                    Err(reconcile_error) => {
+                        return Err(anyhow::anyhow!(
+                            "{error}; check-run reconciliation failed: {reconcile_error}"
+                        ));
+                    }
+                }
             }
         }
     } else {
         info!(%run_id, %job_id, "GitHub token not configured, using mock check run");
-        check_run_id = Some(rand::random::<u32>() as u64);
-    }
+        rand::random::<u32>() as u64
+    };
 
-    if let Some(check_id) = check_run_id {
-        let mapping_changed = {
-            let mut inner = shared.state.inner.lock().await;
-            inner.runs.get_mut(&run_id).map(|run| {
-                run.job_check_run_ids
-                    .insert(job_id.clone(), check_id)
-                    .is_none_or(|previous| previous != check_id)
-            })
-        };
-        if mapping_changed == Some(true) {
-            // Persist the record now. The mapping is only meaningful while
-            // the run lives, and the next status event may be hours away (a
-            // long queue); a restart in that window used to restore the run
-            // with an empty mapping, silently orphaning the GitHub check in
-            // "queued" forever even though the job ran and completed.
-            shared
-                .state
-                .emit(preloop_gha_protocol::NdjsonEvent::CheckRunCreated { run_id })
-                .await;
-        }
+    let mapping_changed = {
+        let mut inner = shared.state.inner.lock().await;
+        inner.runs.get_mut(&run_id).map(|run| {
+            run.job_check_run_ids
+                .insert(job_id.clone(), check_run_id)
+                .is_none_or(|previous| previous != check_run_id)
+        })
+    };
+    if mapping_changed == Some(true) {
+        // The mapping is meaningful while the run lives, and the next status
+        // event may be hours away. Persist it before returning to the caller.
+        shared
+            .state
+            .emit(preloop_gha_protocol::NdjsonEvent::CheckRunCreated { run_id })
+            .await;
     }
+    Ok(Some(check_run_id))
+}
+
+fn is_check_run_not_found(error: &anyhow::Error) -> bool {
+    error.to_string().contains("status 404")
 }
 
 /// Move an existing GitHub check run back to the queue after a rerequest.
@@ -346,7 +386,7 @@ pub(crate) async fn report_existing_check_run_queued(
     job_id: &JobId,
     run_id: RunId,
     check_run_id: u64,
-) {
+) -> anyhow::Result<()> {
     let token = resolve_check_run_token(shared, repo).await;
     if let Some(token) = &token {
         let mut body = serde_json::json!({
@@ -356,9 +396,16 @@ pub(crate) async fn report_existing_check_run_queued(
             body["details_url"] = serde_json::json!(url);
         }
         let path = format!("check-runs/{check_run_id}");
-        if let Err(error) =
-            send_github_check_request(shared, token, repo, reqwest::Method::PATCH, &path, body)
-                .await
+        if let Err(error) = send_github_check_request(
+            shared,
+            &shared.state.github_breaker,
+            token,
+            repo,
+            reqwest::Method::PATCH,
+            &path,
+            body,
+        )
+        .await
         {
             warn!(
                 %run_id,
@@ -367,6 +414,7 @@ pub(crate) async fn report_existing_check_run_queued(
                 %error,
                 "Failed to requeue GitHub check run"
             );
+            return Err(error);
         }
     } else {
         info!(
@@ -376,6 +424,87 @@ pub(crate) async fn report_existing_check_run_queued(
             "Mock requeued GitHub check run"
         );
     }
+    Ok(())
+}
+async fn find_existing_check_run(
+    shared: &Arc<SharedState>,
+    token: &str,
+    repo: &str,
+    sha: &str,
+    name: &str,
+) -> anyhow::Result<Option<u64>> {
+    let payload = match send_github_check_request(
+        shared,
+        &shared.state.github_breaker,
+        token,
+        repo,
+        reqwest::Method::GET,
+        &format!("commits/{sha}/check-runs"),
+        Value::Null,
+    )
+    .await
+    {
+        Ok(payload) => payload,
+        Err(error) if is_check_run_not_found(&error) => return Ok(None),
+        Err(error) => return Err(error),
+    };
+    Ok(payload
+        .get("check_runs")
+        .and_then(Value::as_array)
+        .and_then(|check_runs| {
+            check_runs.iter().find_map(|check_run| {
+                (check_run.get("name").and_then(Value::as_str) == Some(name)
+                    && check_run.get("head_sha").and_then(Value::as_str) == Some(sha))
+                .then(|| check_run.get("id").and_then(Value::as_u64))
+                .flatten()
+            })
+        }))
+}
+
+/// Report a permanent failure check run to GitHub (e.g. invalid workflow YAML, expression failure).
+///
+/// The check name and head SHA are the idempotency key. A retry after a crash
+/// first finds the existing check and patches it, avoiding duplicate failed
+/// checks in GitHub's UI.
+pub(crate) async fn report_check_run_permanent_failure(
+    shared: &Arc<SharedState>,
+    repo: &str,
+    sha: &str,
+    name: &str,
+    summary: &str,
+) -> anyhow::Result<()> {
+    let token = resolve_check_run_token(shared, repo).await;
+    if let Some(token) = &token {
+        let body = serde_json::json!({
+            "name": name,
+            "head_sha": sha,
+            "status": "completed",
+            "conclusion": "failure",
+            "completed_at": chrono::Utc::now().to_rfc3339(),
+            "output": {
+                "title": "Workflow evaluation failed",
+                "summary": summary,
+            }
+        });
+        let existing = find_existing_check_run(shared, token, repo, sha, name).await?;
+        let (method, path) = match existing {
+            Some(check_run_id) => (reqwest::Method::PATCH, format!("check-runs/{check_run_id}")),
+            None => (reqwest::Method::POST, "check-runs".to_owned()),
+        };
+        send_github_check_request(
+            shared,
+            &shared.state.github_breaker,
+            token,
+            repo,
+            method,
+            &path,
+            body,
+        )
+        .await?;
+    } else {
+        info!(%repo, %name, "GitHub token not configured, mock failure check run recorded");
+    }
+    Ok(())
 }
 
 /// Publish queued/completed checks for a native rerun.
@@ -399,19 +528,26 @@ pub(crate) async fn report_check_runs_for_run(
     for job_id in jobs {
         if let Some((reused_job_id, check_run_id)) = &reused_check_run {
             if reused_job_id == &job_id {
-                report_existing_check_run_queued(
+                if let Err(error) = report_existing_check_run_queued(
                     shared,
                     &repository,
                     &job_id,
                     run_id,
                     *check_run_id,
                 )
-                .await;
-            } else {
-                report_check_run_queued(shared, &repository, &sha, &job_id, run_id).await;
+                .await
+                {
+                    warn!(%run_id, %job_id, ?error, "failed to requeue GitHub check run");
+                }
+            } else if let Err(error) =
+                report_check_run_queued(shared, &repository, &sha, &job_id, run_id).await
+            {
+                warn!(%run_id, %job_id, ?error, "failed to report queued GitHub check run");
             }
-        } else {
-            report_check_run_queued(shared, &repository, &sha, &job_id, run_id).await;
+        } else if let Err(error) =
+            report_check_run_queued(shared, &repository, &sha, &job_id, run_id).await
+        {
+            warn!(%run_id, %job_id, ?error, "failed to report queued GitHub check run");
         }
 
         let status = {
@@ -470,9 +606,16 @@ pub(crate) async fn report_check_run_in_progress(
         }
 
         let path = format!("check-runs/{}", check_run_id);
-        if let Err(e) =
-            send_github_check_request(shared, token, &repo, reqwest::Method::PATCH, &path, body)
-                .await
+        if let Err(e) = send_github_check_request(
+            shared,
+            &shared.state.github_lifecycle_breaker,
+            token,
+            &repo,
+            reqwest::Method::PATCH,
+            &path,
+            body,
+        )
+        .await
         {
             warn!(
                 %run_id,
@@ -684,9 +827,16 @@ pub(crate) async fn report_check_run_completed(
                     body["details_url"] = serde_json::json!(url);
                 }
             }
-            if let Err(error) =
-                send_github_check_request(shared, token, &repo, reqwest::Method::PATCH, &path, body)
-                    .await
+            if let Err(error) = send_github_check_request(
+                shared,
+                &shared.state.github_lifecycle_breaker,
+                token,
+                &repo,
+                reqwest::Method::PATCH,
+                &path,
+                body,
+            )
+            .await
             {
                 warn!(
                     %run_id,
@@ -826,7 +976,8 @@ pub(crate) async fn fetch_workflows_at(
             shared.state.static_github_pat()
         };
         if let Some(token) = &token {
-            fetch_remote_workflows(token, repo, git_ref, api_base).await
+            fetch_remote_workflows(&shared.state.github_breaker, token, repo, git_ref, api_base)
+                .await
         } else if !git_ref.is_empty() {
             anyhow::bail!(
                 "cannot fetch workflow revision {git_ref:?} without a local workspace or GitHub credentials"
@@ -856,6 +1007,7 @@ pub(crate) async fn fetch_workflows_at(
 }
 
 async fn fetch_remote_workflows(
+    breaker: &crate::github_breaker::GithubBreaker,
     token: &str,
     repo: &str,
     git_ref: &str,
@@ -868,13 +1020,15 @@ async fn fetch_remote_workflows(
         repo,
         git_ref
     );
-    let response = client
-        .get(&url)
-        .header("User-Agent", "preloop")
-        .header("Authorization", format!("Bearer {}", token))
-        .header("Accept", "application/vnd.github+json")
-        .send()
-        .await?;
+    let response = crate::github_breaker::send_observed(
+        breaker,
+        client
+            .get(&url)
+            .header("User-Agent", "preloop")
+            .header("Authorization", format!("Bearer {}", token))
+            .header("Accept", "application/vnd.github+json"),
+    )
+    .await?;
 
     if !response.status().is_success() {
         return Err(anyhow::anyhow!(
@@ -896,16 +1050,26 @@ async fn fetch_remote_workflows(
     for item in &items {
         if item.r#type == "file" && (item.name.ends_with(".yml") || item.name.ends_with(".yaml")) {
             if let Some(download_url) = &item.download_url {
-                let file_res = client
-                    .get(download_url)
-                    .header("User-Agent", "preloop")
-                    .header("Authorization", format!("Bearer {}", token))
-                    .send()
-                    .await?;
-                if file_res.status().is_success() {
-                    let content = file_res.text().await?;
-                    workflows.insert(item.name.clone(), content);
+                let file_res = crate::github_breaker::send_observed(
+                    breaker,
+                    client
+                        .get(download_url)
+                        .header("User-Agent", "preloop")
+                        .header("Authorization", format!("Bearer {}", token)),
+                )
+                .await?;
+                if !file_res.status().is_success() {
+                    let status = file_res.status();
+                    let err_text = file_res.text().await.unwrap_or_default();
+                    anyhow::bail!(
+                        "failed to download workflow file {}: GitHub returned {} ({})",
+                        item.name,
+                        status,
+                        err_text
+                    );
                 }
+                let content = file_res.text().await?;
+                workflows.insert(item.name.clone(), content);
             }
         }
     }
@@ -958,16 +1122,18 @@ pub(crate) async fn resolve_ref_sha(
         .strip_prefix("refs/heads/")
         .or_else(|| git_ref.strip_prefix("refs/tags/"))
         .unwrap_or(git_ref);
-    let response = crate::shared_http::CLIENT
-        .clone()
-        .get(format!(
-            "{api_base}/repos/{repository}/commits/{commit_ref}"
-        ))
-        .header("User-Agent", "preloop")
-        .header("Authorization", format!("Bearer {token}"))
-        .header("Accept", "application/vnd.github+json")
-        .send()
-        .await?;
+    let response = crate::github_breaker::send_observed(
+        &shared.state.github_breaker,
+        crate::shared_http::CLIENT
+            .clone()
+            .get(format!(
+                "{api_base}/repos/{repository}/commits/{commit_ref}"
+            ))
+            .header("User-Agent", "preloop")
+            .header("Authorization", format!("Bearer {token}"))
+            .header("Accept", "application/vnd.github+json"),
+    )
+    .await?;
     if !response.status().is_success() {
         return Ok(None);
     }
@@ -976,6 +1142,7 @@ pub(crate) async fn resolve_ref_sha(
 }
 
 async fn get_pr_changed_files(
+    breaker: &crate::github_breaker::GithubBreaker,
     token: &str,
     repo: &str,
     pr_number: u64,
@@ -998,13 +1165,15 @@ async fn get_pr_changed_files(
             pr_number,
             page
         );
-        let response = client
-            .get(&url)
-            .header("User-Agent", "preloop")
-            .header("Authorization", format!("Bearer {}", token))
-            .header("Accept", "application/vnd.github+json")
-            .send()
-            .await?;
+        let response = crate::github_breaker::send_observed(
+            breaker,
+            client
+                .get(&url)
+                .header("User-Agent", "preloop")
+                .header("Authorization", format!("Bearer {}", token))
+                .header("Accept", "application/vnd.github+json"),
+        )
+        .await?;
 
         if !response.status().is_success() {
             return Err(anyhow::anyhow!(
@@ -1052,12 +1221,131 @@ pub(crate) async fn resolve_pr_changed_files_at(
     let Some(token) = token else {
         return Ok(None);
     };
-    get_pr_changed_files(&token, repo, pr_number, api_base)
+    get_pr_changed_files(
+        &shared.state.github_breaker,
+        &token,
+        repo,
+        pr_number,
+        api_base,
+    )
+    .await
+    .map(Some)
+}
+
+const WEBHOOK_ACK_BUDGET: Duration = Duration::from_secs(8);
+const WEBHOOK_ENQUEUE_ATTEMPTS: usize = 2;
+const WEBHOOK_LEASE_DURATION_SECS: u64 = 60;
+const WEBHOOK_LEASE_RENEW_INTERVAL_SECS: u64 = 20;
+const WEBHOOK_DELIVERY_RETENTION_SECS: i64 = 30 * 24 * 60 * 60;
+const WEBHOOK_MAX_ATTEMPTS: u32 = 6;
+const WEBHOOK_PRUNE_INTERVAL: Duration = Duration::from_secs(5 * 60);
+const WEBHOOK_PRUNE_BATCH_SIZE: usize = 256;
+/// How stale the published queue counters may get while the worker has nothing
+/// to do. The worker refreshes them whenever it moves or prunes a row; this
+/// only covers changes it did not make — another engine on a shared store, or
+/// an operator replay through the native API.
+const WEBHOOK_STATS_REFRESH_INTERVAL: Duration = Duration::from_secs(60);
+
+/// Backoff ladder for transient webhook delivery failures, indexed by the
+/// delivery's attempt count (the final entry repeats).
+///
+/// The two cheap leading retries cover what this path actually sees: a
+/// workflow file momentarily unreadable, or a snapshot not yet visible. The
+/// rest stretches so a broken dependency is not hammered, and the attempt cap
+/// dead-letters a delivery long before the ladder could become a hot loop.
+pub(crate) const WEBHOOK_RETRY_BACKOFF: &[Duration] = &[
+    Duration::from_secs(1),
+    Duration::from_secs(1),
+    Duration::from_secs(5),
+    Duration::from_secs(15),
+    Duration::from_secs(30),
+];
+
+/// Delay before the next attempt at a delivery that has now failed `attempts`
+/// times.
+///
+/// Takes the ladder as an argument rather than reading the constant so the
+/// retry path is driven by state: tests shorten it instead of sleeping through
+/// real tiers. An empty ladder falls back to the first tier, never to zero —
+/// "retry immediately" is the one answer this must not invent.
+fn webhook_retry_backoff(ladder: &[Duration], attempts: u32) -> Duration {
+    ladder
+        .get(attempts as usize)
+        .or_else(|| ladder.last())
+        .copied()
+        .unwrap_or_else(|| WEBHOOK_RETRY_BACKOFF[0])
+}
+
+/// Publish the queue counters the operational snapshot reads.
+///
+/// The sampler used to query the store on every tick to report these. The
+/// queue worker both mutates the queue and already talks to the store, so it
+/// hands over what it read and the snapshot reads memory instead of taking the
+/// store's single connection for a query that usually reports "unchanged".
+pub(crate) async fn refresh_webhook_queue_stats(state: &crate::state::AppState) -> bool {
+    match state.store.webhook_queue_stats().await {
+        Ok(stats) => {
+            state.webhook_status.set_queue_stats(stats);
+            true
+        }
+        Err(error) => {
+            debug!(?error, "failed to refresh webhook queue counters");
+            false
+        }
+    }
+}
+
+/// Commit the delivery row within the webhook acknowledgement budget.
+///
+/// The 202 response is the durable boundary. GitHub does not automatically
+/// redeliver a delivery after a non-2xx response, so retry quick store errors
+/// here, but never wait indefinitely behind a contended store connection.
+async fn enqueue_webhook_delivery_with_budget(
+    shared: &Arc<SharedState>,
+    delivery: &WebhookDeliveryRecord,
+) -> anyhow::Result<bool> {
+    let deadline = Instant::now() + WEBHOOK_ACK_BUDGET;
+    let mut last_error = None;
+
+    for attempt in 0..WEBHOOK_ENQUEUE_ATTEMPTS {
+        let remaining = deadline.saturating_duration_since(Instant::now());
+        if remaining.is_zero() {
+            break;
+        }
+        let attempt_budget = remaining.min(Duration::from_secs(4));
+        match tokio::time::timeout(
+            attempt_budget,
+            shared.state.store.enqueue_webhook_delivery(delivery),
+        )
         .await
-        .map(Some)
+        {
+            Ok(Ok(inserted)) => return Ok(inserted),
+            Ok(Err(error)) => {
+                last_error = Some(error.to_string());
+                if attempt + 1 < WEBHOOK_ENQUEUE_ATTEMPTS {
+                    tokio::time::sleep(Duration::from_millis(50)).await;
+                }
+            }
+            Err(_) => {
+                return Err(anyhow::anyhow!(
+                    "timed out persisting webhook delivery after {}s",
+                    WEBHOOK_ACK_BUDGET.as_secs()
+                ));
+            }
+        }
+    }
+
+    Err(anyhow::anyhow!(
+        "failed to persist webhook delivery after {WEBHOOK_ENQUEUE_ATTEMPTS} attempts: {}",
+        last_error.unwrap_or_else(|| "acknowledgement budget exhausted".to_owned())
+    ))
 }
 
 /// Route handler for GitHub App Webhooks.
+///
+/// Verifies the signature, atomically enqueues the delivery to the durable
+/// store, and acknowledges with HTTP 202 Accepted. Background workers drain
+/// the queue asynchronously.
 pub(crate) async fn handle_github_webhook(
     State(shared): State<Arc<SharedState>>,
     headers: HeaderMap,
@@ -1085,138 +1373,61 @@ pub(crate) async fn handle_github_webhook(
         return Err(StatusCode::UNAUTHORIZED);
     }
 
-    // Dedup redelivered webhooks. GitHub redelivers on 5xx and occasionally
-    // double-fires; processing the same delivery twice created duplicate runs
-    // per workflow (observed: two runs per push, every job dispatched twice
-    // and the pool saturated). The delivery ID is the authoritative key —
-    // one delivery must produce exactly one processing pass.
-    //
-    // The reservation is only permanent once processing succeeded. A delivery
-    // that failed releases its reservation below so GitHub's redelivery of it
-    // is processed instead of being silently dropped.
-    const WEBHOOK_DEDUP_WINDOW: std::time::Duration = std::time::Duration::from_secs(300);
+    let event_name = headers
+        .get("x-github-event")
+        .and_then(|h| h.to_str().ok())
+        .ok_or(StatusCode::BAD_REQUEST)?;
+
     let delivery_id = headers
         .get("x-github-delivery")
         .and_then(|value| value.to_str().ok())
-        .map(str::to_owned);
-    if let Some(delivery_id) = &delivery_id {
-        let now = std::time::Instant::now();
-        let mut inner = shared.state.inner.lock().await;
-        inner.webhook_deliveries.retain(|(_, state)| match state {
-            WebhookDeliveryState::InFlight => true,
-            WebhookDeliveryState::Completed(at) => now.duration_since(*at) < WEBHOOK_DEDUP_WINDOW,
-        });
-        if let Some((_, state)) = inner
-            .webhook_deliveries
-            .iter()
-            .find(|(seen, _)| seen == delivery_id)
-        {
-            let reason = match state {
-                WebhookDeliveryState::InFlight => "already in flight",
-                WebhookDeliveryState::Completed(_) => "already processed",
-            };
-            info!(delivery = %delivery_id, reason, "Duplicate GitHub webhook delivery — skipping");
-            return Ok((StatusCode::OK, Json(serde_json::json!([]))));
+        .map(str::to_owned)
+        .unwrap_or_else(|| uuid::Uuid::new_v4().to_string());
+
+    let record = WebhookDeliveryRecord {
+        delivery_id: delivery_id.clone(),
+        event: event_name.to_owned(),
+        payload: body.to_vec(),
+        received_at_us: crate::store::now_us(),
+        state: WebhookDeliveryStatus::Received,
+        attempts: 0,
+        lease_until_us: None,
+        lease_token: None,
+        last_error: None,
+    };
+
+    // A failed durable commit MUST NOT be acknowledged. GitHub does not
+    // automatically redeliver non-2xx responses, so the delivery remains
+    // available for an operator/API redelivery after the store recovers.
+    match enqueue_webhook_delivery_with_budget(&shared, &record).await {
+        Ok(true) => {
+            info!(delivery = %delivery_id, event = %event_name, "GitHub webhook delivery queued");
+            // Keep one permit when the worker is between drains; `notify_waiters`
+            // can lose this wakeup and defer processing to the polling tick.
+            shared.state.webhook_queue_notify.notify_one();
+            Ok((
+                StatusCode::ACCEPTED,
+                Json(serde_json::json!({ "delivery_id": delivery_id, "status": "accepted" })),
+            ))
         }
-        inner
-            .webhook_deliveries
-            .push_back((delivery_id.clone(), WebhookDeliveryState::InFlight));
-    }
-
-    // A delivery that dies mid-processing — the future is cancelled (client
-    // disconnect, server shutdown) or the processing panics — never reaches
-    // the Completed/release code below, so its InFlight reservation would
-    // stick forever and make GitHub's later redelivery look like a duplicate
-    // that gets skipped: a silently lost run. The guard releases the
-    // reservation on every exit path, including cancellation and panic.
-    let mut reservation_guard = delivery_id
-        .as_ref()
-        .map(|id| InFlightReservationGuard::arm(shared.clone(), id.clone()));
-
-    // Everything past the reservation runs in a helper so that no `?` can
-    // escape while still holding the in-flight marker.
-    let result = process_github_webhook(&shared, &headers, &body).await;
-
-    if let Some(delivery_id) = &delivery_id {
-        let mut inner = shared.state.inner.lock().await;
-        match &result {
-            Ok(_) => {
-                let completed_at = std::time::Instant::now();
-                if let Some((_, state)) = inner
-                    .webhook_deliveries
-                    .iter_mut()
-                    .find(|(seen, _)| seen == delivery_id)
-                {
-                    *state = WebhookDeliveryState::Completed(completed_at);
-                }
-                // The Completed entry is now the durable reservation; without
-                // disarming, the guard's drop would erase it and the dedup
-                // window would admit a duplicate run.
-                if let Some(guard) = &mut reservation_guard {
-                    guard.disarm();
-                }
-            }
-            // Release the reservation: GitHub retries this delivery and the
-            // retry must be allowed to do the work this attempt did not.
-            Err(_) => inner
-                .webhook_deliveries
-                .retain(|(seen, _)| seen != delivery_id),
+        Ok(false) => {
+            info!(
+                delivery = %delivery_id,
+                event = %event_name,
+                "Duplicate GitHub webhook delivery — already enqueued"
+            );
+            Ok((
+                StatusCode::ACCEPTED,
+                Json(serde_json::json!({ "delivery_id": delivery_id, "status": "duplicate" })),
+            ))
         }
-    }
-
-    result
-}
-
-/// RAII release of a webhook delivery's in-flight reservation.
-///
-/// The reservation is normally released explicitly — `Completed` once
-/// processing succeeded, removed once it failed. If processing is cancelled or
-/// panics instead, neither path runs; this guard releases the reservation on
-/// drop so a redelivery is processed rather than skipped as a duplicate.
-struct InFlightReservationGuard {
-    shared: Arc<SharedState>,
-    delivery_id: String,
-    armed: bool,
-}
-
-impl InFlightReservationGuard {
-    fn arm(shared: Arc<SharedState>, delivery_id: String) -> Self {
-        Self {
-            shared,
-            delivery_id,
-            armed: true,
-        }
-    }
-
-    fn disarm(&mut self) {
-        self.armed = false;
-    }
-}
-
-impl Drop for InFlightReservationGuard {
-    fn drop(&mut self) {
-        if !self.armed {
-            return;
-        }
-        let shared = self.shared.clone();
-        let delivery_id = self.delivery_id.clone();
-        // Synchronous release when the state lock is free (the common case:
-        // the guard outlives the processing, so no one else is holding it).
-        if let Ok(mut inner) = shared.state.inner.try_lock() {
-            inner
-                .webhook_deliveries
-                .retain(|(seen, _)| seen != &delivery_id);
-            return;
-        }
-        // The state lock is contended; defer the release to the runtime so the
-        // reservation is still cleared promptly instead of leaking forever.
-        if let Ok(handle) = tokio::runtime::Handle::try_current() {
-            handle.spawn(async move {
-                let mut inner = shared.state.inner.lock().await;
-                inner
-                    .webhook_deliveries
-                    .retain(|(seen, _)| seen != &delivery_id);
-            });
+        Err(error) => {
+            error!(
+                delivery = %delivery_id,
+                ?error,
+                "Failed to commit webhook delivery row — returning 500; redelivery is manual"
+            );
+            Err(StatusCode::INTERNAL_SERVER_ERROR)
         }
     }
 }
@@ -1325,54 +1536,634 @@ async fn process_check_run_rerequest(
     Ok((StatusCode::OK, Json(serde_json::json!([accepted]))))
 }
 
-/// Processing half of [`handle_github_webhook`], after signature verification
-/// and delivery reservation.
-async fn process_github_webhook(
-    shared: &Arc<SharedState>,
-    headers: &HeaderMap,
-    body: &bytes::Bytes,
-) -> Result<(StatusCode, Json<Value>), StatusCode> {
-    // 2. Get event type
-    let event_name = headers
-        .get("x-github-event")
-        .and_then(|h| h.to_str().ok())
-        .ok_or(StatusCode::BAD_REQUEST)?;
+/// Outcome of processing a webhook delivery payload.
+#[derive(Debug)]
+enum WebhookOutcome {
+    Success,
+    TransientError(String),
+    PermanentErrors {
+        repo: String,
+        failures: Vec<WebhookFailure>,
+    },
+    Unreportable(String),
+    /// GitHub itself is unreachable. Distinct from `TransientError` because
+    /// the delivery did nothing wrong: it is returned to the queue with its
+    /// attempt refunded and retried after the breaker's window, instead of
+    /// spending one of six attempts on an outage it cannot influence.
+    DependencyUnavailable {
+        error: String,
+        retry_after_secs: u64,
+    },
+}
+#[derive(Debug)]
+struct WebhookFailure {
+    sha: Option<String>,
+    check_name: String,
+    error: String,
+}
 
-    // 3. Parse the event payload
-    let payload_val: Value = serde_json::from_slice(body).map_err(|_| StatusCode::BAD_REQUEST)?;
+/// Renew a claimed delivery while its workflow evaluation is in flight.
+///
+/// A worker may spend longer than the initial lease fetching workflow files or
+/// creating checks. Without renewal, another worker can reclaim the same row
+/// and submit duplicate runs before the first worker finishes. The fencing
+/// token prevents a stale worker from renewing the replacement lease.
+async fn run_webhook_lease_heartbeat(
+    shared: Arc<SharedState>,
+    delivery_id: String,
+    lease_token: String,
+    lease_until_us: i64,
+    lease_lost: tokio_util::sync::CancellationToken,
+) {
+    let mut interval =
+        tokio::time::interval(Duration::from_secs(WEBHOOK_LEASE_RENEW_INTERVAL_SECS));
+    let remaining_us = lease_until_us.saturating_sub(crate::store::now_us()).max(0) as u64;
+    let mut lease_deadline = Instant::now() + Duration::from_micros(remaining_us);
+    let mut deadline = Box::pin(tokio::time::sleep_until(tokio::time::Instant::from_std(
+        lease_deadline,
+    )));
+    interval.tick().await;
+    loop {
+        tokio::select! {
+            _ = shared.shutdown.cancelled() => {
+                lease_lost.cancel();
+                return;
+            }
+            _ = &mut deadline => {
+                warn!(
+                    delivery = %delivery_id,
+                    "webhook delivery lease expired while renewal was unavailable"
+                );
+                lease_lost.cancel();
+                return;
+            }
+            _ = interval.tick() => {
+                let renewal_timeout = lease_deadline
+                    .saturating_duration_since(Instant::now())
+                    .min(Duration::from_secs(WEBHOOK_LEASE_RENEW_INTERVAL_SECS));
+                if renewal_timeout.is_zero() {
+                    lease_lost.cancel();
+                    return;
+                }
+                let renewal = tokio::time::timeout(
+                    renewal_timeout,
+                    shared
+                        .state
+                        .store
+                        .renew_webhook_delivery(
+                            &delivery_id,
+                            &lease_token,
+                            WEBHOOK_LEASE_DURATION_SECS,
+                        ),
+                )
+                .await;
+                match renewal {
+                    Ok(Ok(true)) => {
+                        debug!(delivery = %delivery_id, "renewed webhook delivery lease");
+                        lease_deadline =
+                            Instant::now() + Duration::from_secs(WEBHOOK_LEASE_DURATION_SECS);
+                        deadline
+                            .as_mut()
+                            .reset(tokio::time::Instant::from_std(lease_deadline));
+                    }
+                    Ok(Ok(false)) => {
+                        warn!(
+                            delivery = %delivery_id,
+                            "webhook delivery lease was fenced while processing"
+                        );
+                        lease_lost.cancel();
+                        return;
+                    }
+                    Ok(Err(error)) => {
+                        warn!(
+                            delivery = %delivery_id,
+                            ?error,
+                            "failed to renew webhook delivery lease"
+                        );
+                        if Instant::now() >= lease_deadline {
+                            lease_lost.cancel();
+                            return;
+                        }
+                    }
+                    Err(_) => {
+                        warn!(
+                            delivery = %delivery_id,
+                            "timed out renewing webhook delivery lease"
+                        );
+                        if Instant::now() >= lease_deadline {
+                            lease_lost.cancel();
+                            return;
+                        }
+                    }
+                }
+            }
+        }
+    }
+}
 
-    if event_name == "check_run" {
-        return process_check_run_rerequest(shared, &payload_val).await;
+/// Background task that continuously drains the durable webhook queue.
+pub(crate) async fn run_webhook_queue_worker(
+    shared: Arc<SharedState>,
+    heartbeat: preloop_observability::HeartbeatHandle,
+) {
+    // Registering happens before the task is spawned so a panic during
+    // startup remains visible to readiness checks. Beat before recovery and
+    // again on every loop; a stuck queue worker must not look healthy.
+    heartbeat.beat();
+    // Crash recovery: on boot, reset processing rows whose lease has expired back to received.
+    if let Err(error) = shared.state.store.recover_webhook_deliveries().await {
+        warn!(
+            ?error,
+            "failed to recover stale webhook deliveries on startup"
+        );
+    }
+    let mut last_prune = Instant::now();
+    let mut last_stats_refresh = Instant::now();
+    // Publish once before the first drain: the boot snapshot is built while
+    // this task is still starting, and every later snapshot reads the cache.
+    if !refresh_webhook_queue_stats(&shared.state).await {
+        // Startup refresh failed; keep it due immediately on the next loop
+        // rather than treating the unpopulated cache as fresh for 60 seconds.
+        last_stats_refresh = Instant::now() - WEBHOOK_STATS_REFRESH_INTERVAL;
     }
 
-    // 4. Look up the event adapter
-    let adapter = match crate::events::adapter_for(event_name) {
-        Some(a) => a,
-        None => {
-            info!("No adapter for event: {}", event_name);
-            return Ok((StatusCode::OK, Json(serde_json::json!([]))));
+    loop {
+        heartbeat.beat();
+        if shared.shutdown.is_cancelled() {
+            break;
+        }
+        let processed = match drain_webhook_queue_with_heartbeat(&shared, &heartbeat).await {
+            Ok(processed) => processed,
+            Err(error) => {
+                if !shared.shutdown.is_cancelled() {
+                    warn!(?error, "error draining webhook delivery queue");
+                }
+                0
+            }
+        };
+        let mut pruned = 0u64;
+        if last_prune.elapsed() >= WEBHOOK_PRUNE_INTERVAL {
+            last_prune = Instant::now();
+            let cutoff = crate::store::now_us()
+                .saturating_sub(WEBHOOK_DELIVERY_RETENTION_SECS.saturating_mul(1_000_000));
+            match shared
+                .state
+                .store
+                .prune_webhook_deliveries(cutoff, WEBHOOK_PRUNE_BATCH_SIZE)
+                .await
+            {
+                Ok(count) => {
+                    if count > 0 {
+                        info!(pruned = count, "pruned terminal webhook deliveries");
+                    }
+                    pruned = count;
+                }
+                Err(error) => warn!(?error, "failed to prune terminal webhook deliveries"),
+            }
+        }
+        // Every row this worker moved or pruned changed the counters, so the
+        // cache is refreshed then. The interval is the fallback for changes
+        // made elsewhere (a second engine on a shared store, an operator
+        // replay), and keeps a stuck queue visible instead of frozen at the
+        // last busy moment.
+        let counters_changed = processed > 0 || pruned > 0;
+        let refresh_due = last_stats_refresh.elapsed() >= WEBHOOK_STATS_REFRESH_INTERVAL;
+        if (counters_changed || refresh_due) && refresh_webhook_queue_stats(&shared.state).await {
+            last_stats_refresh = Instant::now();
+        }
+        tokio::select! {
+            _ = shared.shutdown.cancelled() => break,
+            _ = shared.state.webhook_queue_notify.notified() => {},
+            _ = tokio::time::sleep(Duration::from_secs(5)) => {},
+        }
+    }
+}
+
+/// Drain pending webhook deliveries in FIFO order by `received_at_us`.
+pub(crate) async fn drain_webhook_queue(shared: &Arc<SharedState>) -> anyhow::Result<usize> {
+    // Claim one row at a time so every processing lease is heartbeated; a
+    // claimed batch could let later rows expire while earlier ones run.
+    const BATCH_SIZE: usize = 1;
+
+    let mut total_processed = 0;
+    loop {
+        if shared.shutdown.is_cancelled() {
+            break;
+        }
+        // A known GitHub outage means every claim here would charge an
+        // attempt and then fail on the same dependency. Not claiming is the
+        // difference between riding out an incident and dead-lettering every
+        // push that arrived during it.
+        if let Some(retry_after) = shared.state.github_breaker.retry_after() {
+            debug!(
+                retry_in_secs = retry_after.as_secs(),
+                "GitHub breaker open; deferring webhook queue drain"
+            );
+            break;
+        }
+        let deliveries = shared
+            .state
+            .store
+            .claim_webhook_deliveries(BATCH_SIZE, WEBHOOK_LEASE_DURATION_SECS)
+            .await?;
+        if deliveries.is_empty() {
+            break;
+        }
+        for delivery in &deliveries {
+            process_one_delivery(shared, delivery).await;
+            total_processed += 1;
+        }
+        if deliveries.len() < BATCH_SIZE {
+            break;
+        }
+    }
+    Ok(total_processed)
+}
+
+async fn drain_webhook_queue_with_heartbeat(
+    shared: &Arc<SharedState>,
+    heartbeat: &preloop_observability::HeartbeatHandle,
+) -> anyhow::Result<usize> {
+    let mut drain = Box::pin(drain_webhook_queue(shared));
+    let mut ticker = tokio::time::interval(Duration::from_secs(5));
+    loop {
+        tokio::select! {
+            result = &mut drain => return result,
+            _ = ticker.tick() => heartbeat.beat(),
+        }
+    }
+}
+
+/// Process one claimed delivery and update its state according to the failure taxonomy.
+pub(crate) async fn process_one_delivery(
+    shared: &Arc<SharedState>,
+    delivery: &WebhookDeliveryRecord,
+) {
+    let Some(lease_token) = delivery.lease_token.as_deref() else {
+        error!(
+            delivery_id = %delivery.delivery_id,
+            "claimed webhook delivery has no lease token"
+        );
+        return;
+    };
+    let Some(lease_until_us) = delivery.lease_until_us else {
+        error!(
+            delivery_id = %delivery.delivery_id,
+            "claimed webhook delivery has no lease expiry"
+        );
+        return;
+    };
+    let lease_lost = tokio_util::sync::CancellationToken::new();
+    let heartbeat = tokio::spawn(run_webhook_lease_heartbeat(
+        shared.clone(),
+        delivery.delivery_id.clone(),
+        lease_token.to_owned(),
+        lease_until_us,
+        lease_lost.clone(),
+    ));
+    // Isolate payload processing so a panic cannot strand the heartbeat task
+    // or leave the queue row in `processing` forever. A fenced or expired
+    // lease cancels this task before it can report external side effects.
+    let processing_shared = shared.clone();
+    let processing_delivery = delivery.clone();
+    let processing_lease_lost = lease_lost.clone();
+    let mut processing = tokio::spawn(async move {
+        process_delivery_payload_with_lease(
+            &processing_shared,
+            &processing_delivery,
+            &processing_lease_lost,
+        )
+        .await
+    });
+    let outcome = tokio::select! {
+        _ = lease_lost.cancelled() => {
+            processing.abort();
+            let _ = processing.await;
+            None
+        }
+        result = &mut processing => Some(match result {
+            Ok(outcome) => outcome,
+            Err(error) => {
+                WebhookOutcome::Unreportable(format!("webhook processing task failed: {error}"))
+            }
+        }),
+    };
+    heartbeat.abort();
+    let _ = heartbeat.await;
+    let Some(outcome) = outcome else {
+        warn!(
+            delivery_id = %delivery.delivery_id,
+            "abandoned webhook processing after losing its lease"
+        );
+        return;
+    };
+    // The payload may have completed at the same instant the heartbeat
+    // observed fencing. Do not report checks or mutate the queue row after
+    // that point; the replacement worker owns the retry.
+    if lease_lost.is_cancelled() {
+        warn!(
+            delivery_id = %delivery.delivery_id,
+            "discarding webhook outcome after losing its lease"
+        );
+        return;
+    }
+    // Outage reclassification happens BEFORE the attempt cap: a delivery
+    // must never be dead-lettered for a dependency that was down. The
+    // breaker, not the delivery, is the authority on whether GitHub is the
+    // reason a step failed.
+    let outcome = match outcome {
+        WebhookOutcome::TransientError(error) => {
+            match shared.state.github_breaker.retry_after() {
+                Some(retry_after) => WebhookOutcome::DependencyUnavailable {
+                    error,
+                    // Bounded: a long breaker window still gets re-examined
+                    // periodically, and a short one does not become a spin.
+                    retry_after_secs: retry_after.as_secs().clamp(5, 300),
+                },
+                None if delivery.attempts >= WEBHOOK_MAX_ATTEMPTS => {
+                    WebhookOutcome::Unreportable(format!(
+                        "transient webhook failure exceeded {WEBHOOK_MAX_ATTEMPTS} attempts: {error}"
+                    ))
+                }
+                None => WebhookOutcome::TransientError(error),
+            }
+        }
+        outcome => outcome,
+    };
+    match outcome {
+        WebhookOutcome::Success => {
+            match shared
+                .state
+                .store
+                .complete_webhook_delivery(&delivery.delivery_id, lease_token)
+                .await
+            {
+                Ok(true) => {}
+                Ok(false) => warn!(
+                    delivery_id = %delivery.delivery_id,
+                    "lost webhook delivery lease before marking completed"
+                ),
+                Err(error) => warn!(
+                    delivery_id = %delivery.delivery_id,
+                    ?error,
+                    "failed to mark webhook delivery completed"
+                ),
+            }
+        }
+        WebhookOutcome::DependencyUnavailable {
+            error,
+            retry_after_secs,
+        } => {
+            warn!(
+                delivery_id = %delivery.delivery_id,
+                attempts = delivery.attempts,
+                retry_after_secs,
+                error = %error,
+                "GitHub is unavailable; parking webhook delivery without spending an attempt"
+            );
+            match shared
+                .state
+                .store
+                .park_webhook_delivery(&delivery.delivery_id, lease_token, &error, retry_after_secs)
+                .await
+            {
+                Ok(true) => {}
+                Ok(false) => warn!(
+                    delivery_id = %delivery.delivery_id,
+                    "lost webhook delivery lease before parking it"
+                ),
+                Err(error) => warn!(
+                    delivery_id = %delivery.delivery_id,
+                    ?error,
+                    "failed to park webhook delivery for a GitHub outage"
+                ),
+            }
+        }
+        WebhookOutcome::TransientError(err) => {
+            let backoff =
+                webhook_retry_backoff(&shared.state.webhook_retry_backoff, delivery.attempts);
+            warn!(
+                delivery_id = %delivery.delivery_id,
+                attempts = delivery.attempts,
+                backoff_ms = backoff.as_millis() as u64,
+                error = %err,
+                "transient error processing webhook delivery; retrying internally"
+            );
+            match shared
+                .state
+                .store
+                .fail_webhook_delivery(
+                    &delivery.delivery_id,
+                    lease_token,
+                    &err,
+                    false,
+                    Some(backoff),
+                )
+                .await
+            {
+                Ok(true) => {}
+                Ok(false) => warn!(
+                    delivery_id = %delivery.delivery_id,
+                    "lost webhook delivery lease before scheduling retry"
+                ),
+                Err(error) => warn!(
+                    delivery_id = %delivery.delivery_id,
+                    ?error,
+                    "failed to update webhook delivery for retry"
+                ),
+            }
+        }
+        WebhookOutcome::PermanentErrors { repo, failures } => {
+            let error = failures
+                .iter()
+                .map(|failure| format!("{}: {}", failure.check_name, failure.error))
+                .collect::<Vec<_>>()
+                .join("; ");
+            error!(
+                delivery_id = %delivery.delivery_id,
+                %repo,
+                error = %error,
+                failures = failures.len(),
+                "permanent errors processing webhook delivery; reporting failure check runs"
+            );
+            for failure in &failures {
+                if lease_lost.is_cancelled() {
+                    warn!(
+                        delivery_id = %delivery.delivery_id,
+                        "stopped reporting webhook failures after losing lease"
+                    );
+                    return;
+                }
+                if let Some(sha) = &failure.sha {
+                    let report_result = tokio::select! {
+                        _ = lease_lost.cancelled() => return,
+                        result = report_check_run_permanent_failure(
+                            shared,
+                            &repo,
+                            sha,
+                            &failure.check_name,
+                            &failure.error,
+                        ) => result,
+                    };
+                    if let Err(report_error) = report_result {
+                        let retry_error = format!(
+                            "failed to report permanent check run: {report_error}; \
+                             original workflow error: {error}"
+                        );
+                        let backoff = webhook_retry_backoff(
+                            &shared.state.webhook_retry_backoff,
+                            delivery.attempts,
+                        );
+                        warn!(
+                            delivery_id = %delivery.delivery_id,
+                            %report_error,
+                            "check-run failure reporting failed; retrying webhook delivery"
+                        );
+                        if let Err(store_error) = shared
+                            .state
+                            .store
+                            .fail_webhook_delivery(
+                                &delivery.delivery_id,
+                                lease_token,
+                                &retry_error,
+                                false,
+                                Some(backoff),
+                            )
+                            .await
+                        {
+                            warn!(
+                                delivery_id = %delivery.delivery_id,
+                                ?store_error,
+                                "failed to schedule webhook retry after check-run reporting failure"
+                            );
+                        }
+                        return;
+                    }
+                }
+            }
+            if lease_lost.is_cancelled() {
+                return;
+            }
+            match shared
+                .state
+                .store
+                .fail_webhook_delivery(&delivery.delivery_id, lease_token, &error, true, None)
+                .await
+            {
+                Ok(true) => {}
+                Ok(false) => warn!(
+                    delivery_id = %delivery.delivery_id,
+                    "lost webhook delivery lease before marking permanently failed"
+                ),
+                Err(error) => warn!(
+                    delivery_id = %delivery.delivery_id,
+                    ?error,
+                    "failed to mark webhook delivery permanently failed"
+                ),
+            }
+        }
+        WebhookOutcome::Unreportable(err) => {
+            error!(
+                delivery_id = %delivery.delivery_id,
+                error = %err,
+                "unreportable error processing webhook delivery; dead-lettering row"
+            );
+            match shared
+                .state
+                .store
+                .fail_webhook_delivery(&delivery.delivery_id, lease_token, &err, true, None)
+                .await
+            {
+                Ok(true) => {}
+                Ok(false) => warn!(
+                    delivery_id = %delivery.delivery_id,
+                    "lost webhook delivery lease before dead-lettering row"
+                ),
+                Err(error) => warn!(
+                    delivery_id = %delivery.delivery_id,
+                    ?error,
+                    "failed to dead-letter webhook delivery row"
+                ),
+            }
+        }
+    }
+}
+
+async fn process_delivery_payload(
+    shared: &Arc<SharedState>,
+    delivery: &WebhookDeliveryRecord,
+) -> WebhookOutcome {
+    let lease_lost = tokio_util::sync::CancellationToken::new();
+    process_delivery_payload_with_lease(shared, delivery, &lease_lost).await
+}
+
+async fn process_delivery_payload_with_lease(
+    shared: &Arc<SharedState>,
+    delivery: &WebhookDeliveryRecord,
+    lease_lost: &tokio_util::sync::CancellationToken,
+) -> WebhookOutcome {
+    let payload_val: Value = match serde_json::from_slice(&delivery.payload) {
+        Ok(v) => v,
+        Err(e) => {
+            return WebhookOutcome::Unreportable(format!("malformed JSON payload: {e}"));
         }
     };
 
-    // 5. Project the payload into effective events
-    let effective_events = adapter.project(&payload_val);
+    if lease_lost.is_cancelled() {
+        return WebhookOutcome::Success;
+    }
 
+    if delivery.event == "check_run" {
+        let rerequest = tokio::select! {
+            _ = lease_lost.cancelled() => return WebhookOutcome::Success,
+            result = process_check_run_rerequest(shared, &payload_val) => result,
+        };
+        match rerequest {
+            Ok(_) => return WebhookOutcome::Success,
+            Err(status) if status.is_server_error() => {
+                return WebhookOutcome::TransientError(format!(
+                    "check run rerequest failed with status {status}"
+                ));
+            }
+            Err(status) => {
+                info!(%status, "check run rerequest ignored");
+                return WebhookOutcome::Success;
+            }
+        }
+    }
+
+    let adapter = match crate::events::adapter_for(&delivery.event) {
+        Some(a) => a,
+        None => {
+            info!("No adapter for event: {}", delivery.event);
+            return WebhookOutcome::Success;
+        }
+    };
+
+    let effective_events = adapter.project(&payload_val);
     if effective_events.is_empty() {
         info!(
             "Event {} produced no effective events (e.g. [skip ci] or fork-gated)",
-            event_name
+            delivery.event
         );
-        return Ok((StatusCode::OK, Json(serde_json::json!([]))));
+        return WebhookOutcome::Success;
     }
 
-    let repo_full_name = payload_val
+    let repo_full_name = match payload_val
         .get("repository")
         .and_then(|r| r.get("full_name"))
         .and_then(|v| v.as_str())
-        .unwrap_or("local/repo")
-        .to_owned();
+    {
+        Some(name) => name.to_owned(),
+        None => {
+            return WebhookOutcome::Unreportable(
+                "webhook payload missing repository.full_name".to_owned(),
+            );
+        }
+    };
+
     let (changed_paths, changed_paths_known) = if matches!(
-        event_name,
+        delivery.event.as_str(),
         "pull_request" | "pull_request_target" | "pull_request_review"
     ) {
         let pr_number = payload_val
@@ -1386,17 +2177,21 @@ async fn process_github_webhook(
         let api_base = std::env::var("PRELOOP_GITHUB_API_URL")
             .unwrap_or_else(|_| "https://api.github.com".to_owned());
         let fetched = match pr_number {
-            Some(number) => resolve_pr_changed_files_at(shared, &repo_full_name, number, &api_base)
-                .await
-                .map_err(|error| {
-                    error!(?error, "failed to resolve pull request changed files");
-                    StatusCode::BAD_GATEWAY
-                })?,
+            Some(number) => {
+                match resolve_pr_changed_files_at(shared, &repo_full_name, number, &api_base).await
+                {
+                    Ok(files) => files,
+                    Err(error) => {
+                        error!(?error, "failed to resolve pull request changed files");
+                        return WebhookOutcome::TransientError(format!(
+                            "failed to resolve pull request changed files: {error:?}"
+                        ));
+                    }
+                }
+            }
             None => None,
         };
         match fetched {
-            // The list came from the API, so a `paths:` filter that matches
-            // nothing is a real "no match" rather than a missing answer.
             Some(files) => (files, true),
             None => (
                 changed_paths_from_payload(&payload_val),
@@ -1407,11 +2202,16 @@ async fn process_github_webhook(
         (changed_paths_from_payload(&payload_val), true)
     };
 
-    let mut triggered_runs = Vec::new();
     let github_owned_workflows = configured_github_owned_workflows();
+    let mut unmatched_workflows: Vec<String> = Vec::new();
+    let mut triggered_count = 0usize;
+    let mut permanent_failures: Vec<WebhookFailure> = Vec::new();
+    let mut permanent_failure_keys: BTreeSet<(Option<String>, String)> = BTreeSet::new();
 
-    // 5. For each effective event, fetch workflows and submit runs
     for effective in &effective_events {
+        if lease_lost.is_cancelled() {
+            return WebhookOutcome::Success;
+        }
         if effective.skip {
             info!("Skipping event {} (skip flag set)", effective.event);
             continue;
@@ -1424,70 +2224,66 @@ async fn process_github_webhook(
             .unwrap_or("main");
         let ref_default = format!("refs/heads/{default_branch}");
 
-        // Log filter validity warnings (non-fatal — GitHub only warns)
-        // This is done per-workflow later, but we log at the event level too
-
-        // `workflow_run` is privileged: downstream workflow YAML must always
-        // come from the repository default branch, never the upstream head.
         let workflow_ref = if effective.event == "workflow_run" {
             &ref_default
         } else {
             &effective.git_ref
         };
 
-        // The event ref is mutable: another push can move it while this
-        // delivery is in flight, and GitHub's webhook/API views may briefly
-        // converge at different times. Keep it for github.ref and trigger
-        // semantics, but resolve the workflow definition from the immutable
-        // commit that the event identifies.
         let resolved_sha = match &effective.sha {
             Some(sha) => sha.clone(),
             None if effective.event == "pull_request_target" => {
                 error!(
                     event = %effective.event,
                     ref_name = %workflow_ref,
-                    "pull_request_target has no base commit SHA — delivery failed, will be redelivered"
+                    "pull_request_target has no base commit SHA"
                 );
-                return Err(StatusCode::BAD_GATEWAY);
+                return WebhookOutcome::TransientError(
+                    "pull_request_target has no base commit SHA".to_owned(),
+                );
             }
             None => match resolve_ref_sha(shared, &repo_full_name, workflow_ref).await {
                 Ok(Some(sha)) => sha,
                 Ok(None) => {
                     error!(
                         ref_name = %workflow_ref,
-                        "webhook workflow ref has no resolvable commit SHA — delivery failed, will be redelivered"
+                        "webhook workflow ref has no resolvable commit SHA"
                     );
-                    return Err(StatusCode::BAD_GATEWAY);
+                    return WebhookOutcome::TransientError(
+                        "webhook workflow ref has no resolvable commit SHA".to_owned(),
+                    );
                 }
                 Err(error) => {
                     error!(
                         ?error,
                         ref_name = %workflow_ref,
-                        "failed to resolve webhook workflow ref SHA — delivery failed, will be redelivered"
+                        "failed to resolve webhook workflow ref SHA"
                     );
-                    return Err(StatusCode::BAD_GATEWAY);
+                    return WebhookOutcome::TransientError(format!(
+                        "failed to resolve webhook workflow ref SHA: {error:?}"
+                    ));
                 }
             },
         };
 
-        let workflows = fetch_workflows(shared, &repo_full_name, &resolved_sha)
-            .await
-            .map_err(|error| {
+        let workflows = match fetch_workflows(shared, &repo_full_name, &resolved_sha).await {
+            Ok(w) => w,
+            Err(error) => {
                 error!(
                     event = %effective.event,
                     sha = %resolved_sha,
                     source_ref = %workflow_ref,
                     ?error,
-                    "Failed to fetch workflows at the event commit — delivery failed, will be redelivered"
+                    "Failed to fetch workflows at the event commit"
                 );
-                StatusCode::BAD_GATEWAY
-            })?;
+                return WebhookOutcome::TransientError(format!(
+                    "Failed to fetch workflows at event commit: {error:?}"
+                ));
+            }
+        };
+
         if effective.event == "push" && effective.git_ref == ref_default {
             if let Some(scheduler) = &shared.state.scheduler {
-                // Cron definitions are global state, so reconcile them from
-                // the current default-branch head rather than this delivery's
-                // possibly stale event commit. Triggered runs still use the
-                // event-pinned `workflows` above.
                 let scheduler_source = match resolve_ref_sha(shared, &repo_full_name, &ref_default)
                     .await
                 {
@@ -1538,6 +2334,9 @@ async fn process_github_webhook(
         }
 
         for (filename, content) in workflows {
+            if lease_lost.is_cancelled() {
+                return WebhookOutcome::Success;
+            }
             if is_github_owned_workflow(&filename, &github_owned_workflows) {
                 info!(
                     workflow = %filename,
@@ -1546,10 +2345,7 @@ async fn process_github_webhook(
                 );
                 continue;
             }
-            // Scheduler reconciliation runs once for the complete workflow
-            // inventory above so deletions are observable too.
-            // Validate filter keys / conflicting filters (warning only — submit_run_inner
-            // does the actual match; we warn early so the log is tied to the file).
+
             match preloop_gha_parser::parse_workflow(&content) {
                 Ok(parsed) => {
                     if let Err(e) = parsed.on.validate_filters(&effective.event) {
@@ -1561,7 +2357,21 @@ async fn process_github_webhook(
                     }
                 }
                 Err(e) => {
-                    warn!("Failed to parse workflow file {filename}: {e:?}");
+                    let error_msg = format!("Failed to parse workflow file {filename}: {e:?}");
+                    warn!("{error_msg}");
+                    let sha = effective
+                        .status_check_sha
+                        .clone()
+                        .or_else(|| Some(resolved_sha.clone()));
+                    if permanent_failure_keys.insert((sha.clone(), filename.clone())) {
+                        permanent_failures.push(WebhookFailure {
+                            sha,
+                            check_name: filename.clone(),
+                            error: error_msg,
+                        });
+                    }
+                    // A malformed file must not prevent other workflows at
+                    // the same commit from being evaluated and queued.
                     continue;
                 }
             }
@@ -1608,8 +2418,6 @@ async fn process_github_webhook(
                 })
                 .collect::<BTreeMap<_, _>>();
 
-            // Construct a fully resolved submission. Adapters own event ref,
-            // SHA, activity, and upstream workflow identity semantics.
             let submission = WorkflowSubmission {
                 workflow_yaml: content,
                 event: effective.event.clone(),
@@ -1655,10 +2463,6 @@ async fn process_github_webhook(
                 push_tree: None,
             };
 
-            // Push-back already ran this exact workflow against this exact
-            // commit and published its checks; the delivery we are handling
-            // is the echo of that push. Re-running would duplicate the work
-            // and overwrite good results with a second set.
             if let Some(tested_by) = crate::github_push::already_published(
                 shared,
                 &repo_full_name,
@@ -1676,9 +2480,19 @@ async fn process_github_webhook(
                 continue;
             }
 
-            // Call submit_run_inner — it performs the authoritative trigger match.
-            match submit_run_inner(shared, submission).await {
+            let submission_result = tokio::select! {
+                _ = lease_lost.cancelled() => return WebhookOutcome::Success,
+                result = submit_run_inner_with_webhook_delivery(
+                    shared,
+                    submission,
+                    Some(&delivery.delivery_id),
+                ) => result,
+            };
+            match submission_result {
                 Ok(accepted) => {
+                    if lease_lost.is_cancelled() {
+                        return WebhookOutcome::Success;
+                    }
                     let run_id = accepted.run_id;
                     let sha = effective
                         .status_check_sha
@@ -1693,52 +2507,79 @@ async fn process_github_webhook(
                     };
                     if let Some(jobs) = jobs {
                         for job_id in jobs {
-                            report_check_run_queued(shared, &repo_full_name, &sha, &job_id, run_id)
-                                .await;
-                            // If the job was already resolved at submission
-                            // time (e.g. skipped due to unsatisfiable
-                            // dependencies), report completion immediately so
-                            // the GitHub check does not stay queued forever.
-                            let status = {
-                                let inner = shared.state.inner.lock().await;
-                                inner
-                                    .runs
-                                    .get(&run_id)
-                                    .and_then(|r| r.jobs.get(&job_id).copied())
+                            tokio::select! {
+                                _ = lease_lost.cancelled() => return WebhookOutcome::Success,
+                                res = report_check_run_queued(
+                                    shared,
+                                    &repo_full_name,
+                                    &sha,
+                                    &job_id,
+                                    run_id,
+                                ) => {
+                                    if let Err(error) = res {
+                                        return WebhookOutcome::TransientError(format!(
+                                            "failed to report check run for {job_id:?}: {error:?}"
+                                        ));
+                                    }
+                                }
+                            }
+                            let status = tokio::select! {
+                                _ = lease_lost.cancelled() => return WebhookOutcome::Success,
+                                status = async {
+                                    let inner = shared.state.inner.lock().await;
+                                    inner
+                                        .runs
+                                        .get(&run_id)
+                                        .and_then(|r| r.jobs.get(&job_id).copied())
+                                } => status,
                             };
                             if let Some(status) = status.filter(|s| s.is_terminal()) {
-                                report_check_run_completed(shared, run_id, &job_id, status).await;
+                                tokio::select! {
+                                    _ = lease_lost.cancelled() => return WebhookOutcome::Success,
+                                    _ = report_check_run_completed(shared, run_id, &job_id, status) => {}
+                                }
                             }
                         }
                     }
-                    triggered_runs.push(accepted);
+                    triggered_count += 1;
                 }
                 Err(e) => {
-                    // A 4xx submission outcome means the workflow legitimately
-                    // does not run for this event — no trigger match, or a
-                    // permanent workflow problem a redelivery cannot fix — so
-                    // the delivery itself is complete. A 5xx means the
-                    // delivery's work did not finish: surface it as a failure
-                    // so the delivery is not marked Completed and GitHub's
-                    // redelivery gets a real chance to do the work.
                     let detail = format!("{e:?}");
                     let status = e.into_response().status();
                     if status.is_client_error() {
-                        info!(
-                            "Workflow {filename} was not triggered by this event ({detail}) — not a delivery failure"
+                        debug!(
+                            workflow = %filename,
+                            event = %effective.event,
+                            "workflow not triggered by this event ({detail}) — not a delivery failure"
                         );
+                        unmatched_workflows.push(filename.clone());
                         continue;
                     }
-                    error!(
-                        "Failed to submit run for {filename}: {detail} — delivery failed, will be redelivered"
-                    );
-                    return Err(status);
+                    error!("Failed to submit run for {filename}: {detail}");
+                    return WebhookOutcome::TransientError(format!(
+                        "Failed to submit run for {filename}: {detail}"
+                    ));
                 }
             }
         }
     }
+    if !unmatched_workflows.is_empty() {
+        info!(
+            event = %delivery.event,
+            unmatched = unmatched_workflows.len(),
+            triggered = triggered_count,
+            workflows = %unmatched_workflows.join(", "),
+            "workflows evaluated but not triggered by this event"
+        );
+    }
+    if !permanent_failures.is_empty() {
+        return WebhookOutcome::PermanentErrors {
+            repo: repo_full_name,
+            failures: permanent_failures,
+        };
+    }
 
-    Ok((StatusCode::OK, Json(serde_json::json!(triggered_runs))))
+    WebhookOutcome::Success
 }
 
 /// Webhook events the App-manifest flow asks GitHub to subscribe a new App to.
@@ -1935,8 +2776,7 @@ mod tests {
     use super::*;
     use crate::AppState;
     use axum::body::Body;
-    use axum::http::{HeaderValue, Method, Request};
-    use std::future::Future;
+    use axum::http::{Method, Request};
     use tokio_util::sync::CancellationToken;
     use tower::ServiceExt;
 
@@ -2155,80 +2995,218 @@ mod tests {
                 .unwrap()
                 .status()
         }
+        async fn drain(&self) -> usize {
+            let shared = Arc::new(SharedState {
+                state: self.state.clone(),
+                shutdown: CancellationToken::new(),
+            });
+            drain_webhook_queue(&shared).await.unwrap()
+        }
+
+        /// Replace the retry ladder for this fixture.
+        ///
+        /// The real ladder opens at one second, so a test that exercises a
+        /// retry would otherwise have to sleep through it. The delay still has
+        /// to be non-zero: a zero-delay retry is immediately claimable, and
+        /// one drain pass would burn the whole attempt budget in a hot loop.
+        fn with_retry_backoff(mut self, ladder: Vec<Duration>) -> Self {
+            self.state.webhook_retry_backoff = ladder;
+            self
+        }
     }
 
-    /// Issue 1: a delivery whose workflow inventory cannot be fetched must not
-    /// be acknowledged as processed. GitHub only redelivers after an error
-    /// response, and a Completed (or lingering InFlight) marker would make the
-    /// retry look like a duplicate and skip it — a silently lost run.
+    /// A delivery whose workflow inventory cannot be fetched fails internally
+    /// and is retried with backoff rather than dropped.
     #[tokio::test]
     async fn webhook_workflow_fetch_failure_is_redelivered() {
         let temp = tempfile::tempdir().unwrap();
         let ws_dir = temp.path().join("ws");
-        std::fs::create_dir_all(&ws_dir).unwrap();
-        std::fs::create_dir_all(ws_dir.join(".github")).unwrap();
-        // The initial workspace has no Git object for the immutable payload
-        // SHA, so processing fails before the delivery can be acknowledged.
-        std::fs::write(ws_dir.join(".github/workflows"), "not a directory").unwrap();
-        let mut fixture = WebhookFixture::with_workspace(&temp, ws_dir.clone()).await;
-
-        let status = fixture.post("delivery-fetch-fail", Some("push")).await;
-        assert_eq!(
-            status,
-            StatusCode::BAD_GATEWAY,
-            "a delivery whose processing failed must not be acknowledged as processed"
-        );
-        {
-            let inner = fixture.state.inner.lock().await;
-            assert!(
-                !inner
-                    .webhook_deliveries
-                    .iter()
-                    .any(|(id, _)| id == "delivery-fetch-fail"),
-                "a failed delivery must not keep a Completed/InFlight marker"
-            );
-            assert!(
-                inner.runs.is_empty(),
-                "a failed delivery must not create a run"
-            );
-        }
-
-        // Repair the workspace: the redelivery GitHub sends after the error
-        // response must be processed instead of dropped as a duplicate.
-        std::fs::remove_file(ws_dir.join(".github/workflows")).unwrap();
         std::fs::create_dir_all(ws_dir.join(".github/workflows")).unwrap();
         std::fs::write(
             ws_dir.join(".github/workflows/build.yml"),
             "on: push\njobs:\n  build:\n    runs-on: ubuntu-latest\n    steps:\n      - run: echo hello\n",
         )
         .unwrap();
-        commit_workspace(&ws_dir);
-        fixture.refresh_payload_from_head();
+        let fixture = WebhookFixture::with_workspace(&temp, ws_dir.clone())
+            .await
+            // One 40ms tier: the retry is still a real scheduled retry (the row
+            // is not claimable while its backoff is pending), but the test does
+            // not sleep through the production ladder.
+            .with_retry_backoff(vec![Duration::from_millis(40)]);
 
+        // Hide workspace temporarily so workflow fetching fails transiently.
+        let hidden_ws = temp.path().join("hidden_ws");
+        std::fs::rename(&ws_dir, &hidden_ws).unwrap();
+
+        let status = fixture.post("delivery-fetch-fail", Some("push")).await;
         assert_eq!(
-            fixture.post("delivery-fetch-fail", Some("push")).await,
-            StatusCode::OK
+            status,
+            StatusCode::ACCEPTED,
+            "durable enqueue must be acknowledged with 202"
         );
+        fixture.drain().await;
+        {
+            let record = fixture
+                .state
+                .store
+                .get_webhook_delivery("delivery-fetch-fail")
+                .await
+                .unwrap()
+                .expect("delivery row must exist");
+            assert_eq!(
+                record.state,
+                WebhookDeliveryStatus::Received,
+                "transient fetch failure must keep the row claimable for internal retry"
+            );
+            assert_eq!(record.attempts, 1);
+            assert!(record.last_error.is_some());
+            let inner = fixture.state.inner.lock().await;
+            assert!(
+                inner.runs.is_empty(),
+                "a failed delivery must not create a run"
+            );
+        }
+
+        // Restore the workspace: internal retry drains the queue and creates the run.
+        std::fs::rename(&hidden_ws, &ws_dir).unwrap();
+        // Past the injected tier, so the retry is due rather than early.
+        tokio::time::sleep(Duration::from_millis(80)).await;
+        fixture.drain().await;
+        let record = fixture
+            .state
+            .store
+            .get_webhook_delivery("delivery-fetch-fail")
+            .await
+            .unwrap()
+            .expect("delivery row must exist");
+        assert_eq!(record.state, WebhookDeliveryStatus::Done);
         let inner = fixture.state.inner.lock().await;
         assert_eq!(
             inner.runs.len(),
             1,
-            "the redelivery of a failed delivery must create the run"
+            "internal retry must successfully create the run"
         );
     }
 
-    /// Issue 1: a delivery whose ref SHA cannot be resolved must not be
-    /// acknowledged as processed either — the run cannot be created and would
-    /// be silently lost if the delivery were marked Completed.
+    /// Trip the shared breaker the way three consecutive 5xx responses would.
+    fn open_breaker(state: &AppState) {
+        for _ in 0..3 {
+            state.github_breaker.record_failure(
+                &crate::github_breaker::GithubFailureKind::Unavailable,
+                "GitHub responded 503",
+            );
+        }
+        assert!(state.github_breaker.is_open(), "breaker must be open");
+    }
+
+    /// A known GitHub outage must stop the queue from claiming: every claim
+    /// charges an attempt and would fail on the same dependency.
+    #[tokio::test]
+    async fn webhook_queue_stops_claiming_while_github_is_unavailable() {
+        let temp = tempfile::tempdir().unwrap();
+        let fixture = WebhookFixture::new(&temp).await;
+        assert_eq!(
+            fixture.post("delivery-outage-gate", Some("push")).await,
+            StatusCode::ACCEPTED
+        );
+        open_breaker(&fixture.state);
+
+        assert_eq!(
+            fixture.drain().await,
+            0,
+            "no delivery may be claimed while GitHub is circuit-broken"
+        );
+
+        let record = fixture
+            .state
+            .store
+            .get_webhook_delivery("delivery-outage-gate")
+            .await
+            .unwrap()
+            .expect("delivery row must exist");
+        assert_eq!(record.state, WebhookDeliveryStatus::Received);
+        assert_eq!(
+            record.attempts, 0,
+            "an outage must not spend the delivery's retry budget"
+        );
+    }
+
+    /// A delivery that fails because GitHub is down is parked with its
+    /// attempt refunded — never dead-lettered, even past the attempt cap.
+    #[tokio::test]
+    async fn github_outage_parks_a_delivery_instead_of_dead_lettering_it() {
+        let temp = tempfile::tempdir().unwrap();
+        let ws_dir = temp.path().join("ws");
+        std::fs::create_dir_all(ws_dir.join(".github/workflows")).unwrap();
+        std::fs::write(
+            ws_dir.join(".github/workflows/build.yml"),
+            "on: push\njobs:\n  build:\n    runs-on: ubuntu-latest\n    steps:\n      - run: echo hello\n",
+        )
+        .unwrap();
+        let fixture = WebhookFixture::with_workspace(&temp, ws_dir.clone()).await;
+        // Make workflow evaluation fail the way an unreachable dependency
+        // would, and start from an attempt count already past the cap.
+        let hidden_ws = temp.path().join("hidden_ws");
+        std::fs::rename(&ws_dir, &hidden_ws).unwrap();
+        fixture
+            .state
+            .store
+            .enqueue_webhook_delivery(&WebhookDeliveryRecord {
+                delivery_id: "delivery-outage-park".to_owned(),
+                event: "push".to_owned(),
+                payload: fixture.payload_bytes.clone(),
+                received_at_us: crate::store::now_us(),
+                state: WebhookDeliveryStatus::Received,
+                attempts: WEBHOOK_MAX_ATTEMPTS,
+                lease_until_us: None,
+                lease_token: None,
+                last_error: None,
+            })
+            .await
+            .unwrap();
+        let shared = Arc::new(SharedState {
+            state: fixture.state.clone(),
+            shutdown: CancellationToken::new(),
+        });
+        let claimed = shared
+            .state
+            .store
+            .claim_webhook_deliveries(1, WEBHOOK_LEASE_DURATION_SECS)
+            .await
+            .unwrap();
+        let delivery = claimed.into_iter().next().expect("claimed the delivery");
+        assert_eq!(delivery.attempts, WEBHOOK_MAX_ATTEMPTS + 1);
+
+        open_breaker(&fixture.state);
+        process_one_delivery(&shared, &delivery).await;
+
+        let record = fixture
+            .state
+            .store
+            .get_webhook_delivery("delivery-outage-park")
+            .await
+            .unwrap()
+            .expect("delivery row must exist");
+        assert_eq!(
+            record.state,
+            WebhookDeliveryStatus::Received,
+            "a dependency outage must never dead-letter a delivery"
+        );
+        assert_eq!(
+            record.attempts, WEBHOOK_MAX_ATTEMPTS,
+            "parking refunds the attempt the claim charged"
+        );
+        assert!(record
+            .lease_until_us
+            .is_some_and(|lease_until| lease_until > crate::store::now_us()));
+    }
+
+    /// A delivery whose ref SHA cannot be resolved is retried internally rather than dropped.
     #[tokio::test]
     async fn webhook_unresolvable_sha_is_redelivered() {
         let temp = tempfile::tempdir().unwrap();
         let fixture = WebhookFixture::new(&temp).await;
 
-        // A push that names a commit absent from the local repository must
-        // fail rather than execute workflow YAML from the current checkout.
-        // The delivery's work cannot be done until that immutable commit is
-        // available.
         let payload = serde_json::json!({
             "ref": "refs/heads/main",
             "before": "0000000000000000000000000000000000000000",
@@ -2246,29 +3224,199 @@ mod tests {
         let status = fixture
             .post_body("delivery-no-sha", Some("push"), &bytes)
             .await;
+        assert_eq!(status, StatusCode::ACCEPTED);
+        fixture.drain().await;
+
+        let record = fixture
+            .state
+            .store
+            .get_webhook_delivery("delivery-no-sha")
+            .await
+            .unwrap()
+            .expect("delivery row must exist");
         assert_eq!(
-            status,
-            StatusCode::BAD_GATEWAY,
-            "a delivery whose ref SHA cannot be resolved must not be acknowledged as processed"
+            record.state,
+            WebhookDeliveryStatus::Received,
+            "transient unresolvable SHA must keep the row claimable for retry"
         );
+        assert_eq!(record.attempts, 1);
+        assert!(record.last_error.is_some());
         let inner = fixture.state.inner.lock().await;
-        assert!(
-            !inner
-                .webhook_deliveries
-                .iter()
-                .any(|(id, _)| id == "delivery-no-sha"),
-            "a failed delivery must not keep a Completed/InFlight marker"
-        );
         assert!(
             inner.runs.is_empty(),
             "a failed delivery must not create a run"
         );
     }
 
+    /// A malformed workflow is reported permanently without preventing valid
+    /// workflows from the same webhook commit from being submitted.
+    #[tokio::test]
+    async fn malformed_workflow_does_not_abort_other_workflows() {
+        let temp = tempfile::tempdir().unwrap();
+        let ws_dir = temp.path().join("ws");
+        std::fs::create_dir_all(ws_dir.join(".github/workflows")).unwrap();
+        std::fs::write(
+            ws_dir.join(".github/workflows/a-malformed.yml"),
+            "on: [push\njobs:\n",
+        )
+        .unwrap();
+        std::fs::write(
+            ws_dir.join(".github/workflows/z-valid.yml"),
+            "on: push\njobs:\n  build:\n    runs-on: ubuntu-latest\n    steps:\n      - run: echo valid\n",
+        )
+        .unwrap();
+        let fixture = WebhookFixture::with_workspace(&temp, ws_dir).await;
+
+        assert_eq!(
+            fixture.post("delivery-malformed", Some("push")).await,
+            StatusCode::ACCEPTED
+        );
+        fixture.drain().await;
+
+        let record = fixture
+            .state
+            .store
+            .get_webhook_delivery("delivery-malformed")
+            .await
+            .unwrap()
+            .expect("delivery row exists");
+        assert_eq!(record.state, WebhookDeliveryStatus::Failed);
+        assert!(
+            record
+                .last_error
+                .as_deref()
+                .is_some_and(|error| error.contains("a-malformed.yml")),
+            "permanent delivery error must identify malformed workflow"
+        );
+        let inner = fixture.state.inner.lock().await;
+        assert_eq!(
+            inner.runs.len(),
+            1,
+            "valid workflow must still be submitted after malformed workflow"
+        );
+        assert_eq!(
+            inner.runs.values().next().unwrap().workflow_path_str,
+            ".github/workflows/z-valid.yml"
+        );
+    }
+
+    #[tokio::test]
+    async fn malformed_pull_request_workflow_reports_head_sha() {
+        let temp = tempfile::tempdir().unwrap();
+        let ws_dir = temp.path().join("ws");
+        std::fs::create_dir_all(ws_dir.join(".github/workflows")).unwrap();
+        std::fs::write(
+            ws_dir.join(".github/workflows/a-malformed.yml"),
+            "on: [push\njobs:\n",
+        )
+        .unwrap();
+        let fixture = WebhookFixture::with_workspace(&temp, ws_dir).await;
+        let base_sha = git_output(&fixture.workspace, &["rev-parse", "HEAD"]);
+        let payload = serde_json::json!({
+            "action": "opened",
+            "repository": {
+                "full_name": "owner/repo",
+                "default_branch": "main"
+            },
+            "pull_request": {
+                "base": { "ref": "main", "sha": base_sha },
+                "head": { "ref": "feature", "sha": "head-sha-456" }
+            }
+        });
+        let payload = serde_json::to_vec(&payload).unwrap();
+        assert_eq!(
+            fixture
+                .post_body(
+                    "delivery-pr-failure-sha",
+                    Some("pull_request_target"),
+                    &payload
+                )
+                .await,
+            StatusCode::ACCEPTED
+        );
+
+        let shared = Arc::new(SharedState {
+            state: fixture.state.clone(),
+            shutdown: CancellationToken::new(),
+        });
+        let claimed = fixture
+            .state
+            .store
+            .claim_webhook_deliveries(1, 60)
+            .await
+            .unwrap();
+        assert_eq!(claimed.len(), 1);
+        let outcome = process_delivery_payload(&shared, &claimed[0]).await;
+        match outcome {
+            WebhookOutcome::PermanentErrors { failures, .. } => {
+                assert_eq!(failures.len(), 1);
+                assert_eq!(failures[0].sha.as_deref(), Some("head-sha-456"));
+            }
+            other => panic!("malformed pull request workflow must be permanent: {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn malformed_pull_request_workflow_failure_is_deduplicated() {
+        let temp = tempfile::tempdir().unwrap();
+        let ws_dir = temp.path().join("ws");
+        std::fs::create_dir_all(ws_dir.join(".github/workflows")).unwrap();
+        std::fs::write(
+            ws_dir.join(".github/workflows/a-malformed.yml"),
+            "on: [push\njobs:\n",
+        )
+        .unwrap();
+        let fixture = WebhookFixture::with_workspace(&temp, ws_dir).await;
+        let commit_sha = git_output(&fixture.workspace, &["rev-parse", "HEAD"]);
+        let payload = serde_json::json!({
+            "action": "opened",
+            "number": 7,
+            "repository": {
+                "full_name": "owner/repo",
+                "default_branch": "main"
+            },
+            "pull_request": {
+                "number": 7,
+                "base": { "ref": "main", "sha": commit_sha },
+                "head": {
+                    "ref": "feature",
+                    "sha": "head-sha-456",
+                    "repo": { "fork": false }
+                },
+                "merge_commit_sha": commit_sha
+            }
+        });
+        let shared = Arc::new(SharedState {
+            state: fixture.state.clone(),
+            shutdown: CancellationToken::new(),
+        });
+        let delivery = WebhookDeliveryRecord {
+            delivery_id: "delivery-pr-duplicate-failure".to_owned(),
+            event: "pull_request".to_owned(),
+            payload: serde_json::to_vec(&payload).unwrap(),
+            received_at_us: crate::store::now_us(),
+            state: WebhookDeliveryStatus::Processing,
+            attempts: 1,
+            lease_until_us: Some(crate::store::now_us() + 60_000_000),
+            lease_token: Some("test-lease".to_owned()),
+            last_error: None,
+        };
+
+        match process_delivery_payload(&shared, &delivery).await {
+            WebhookOutcome::PermanentErrors { failures, .. } => {
+                assert_eq!(
+                    failures.len(),
+                    1,
+                    "pull_request target and pull_request projections share one failure"
+                );
+                assert_eq!(failures[0].sha.as_deref(), Some("head-sha-456"));
+            }
+            other => panic!("malformed pull request workflow must be permanent: {other:?}"),
+        }
+    }
+
     /// Regression guard: a workflow that simply is not triggered by the event
-    /// is a *completed* delivery, not a failure. Pushing to a repository whose
-    /// workflows all gate on `pull_request` must stay a 200 or GitHub would
-    /// redeliver forever.
+    /// is a *completed* delivery, not a failure.
     #[tokio::test]
     async fn webhook_untriggered_workflow_still_completes_delivery() {
         let temp = tempfile::tempdir().unwrap();
@@ -2283,17 +3431,23 @@ mod tests {
 
         assert_eq!(
             fixture.post("delivery-no-match", Some("push")).await,
-            StatusCode::OK
+            StatusCode::ACCEPTED
+        );
+        fixture.drain().await;
+
+        let record = fixture
+            .state
+            .store
+            .get_webhook_delivery("delivery-no-match")
+            .await
+            .unwrap()
+            .expect("delivery row must exist");
+        assert_eq!(
+            record.state,
+            WebhookDeliveryStatus::Done,
+            "a delivery that triggered no workflow is still completed successfully"
         );
         let inner = fixture.state.inner.lock().await;
-        assert!(
-            inner
-                .webhook_deliveries
-                .iter()
-                .any(|(id, s)| id == "delivery-no-match"
-                    && matches!(s, WebhookDeliveryState::Completed(_))),
-            "a delivery that triggered no workflow is still processed"
-        );
         assert!(inner.runs.is_empty());
     }
 
@@ -2316,95 +3470,491 @@ mod tests {
 
         assert_eq!(
             fixture.post("delivery-github-owned", Some("push")).await,
-            StatusCode::OK
+            StatusCode::ACCEPTED
+        );
+        fixture.drain().await;
+
+        let record = fixture
+            .state
+            .store
+            .get_webhook_delivery("delivery-github-owned")
+            .await
+            .unwrap()
+            .expect("delivery row must exist");
+        assert_eq!(
+            record.state,
+            WebhookDeliveryStatus::Done,
+            "skipped github-owned workflow completes delivery"
         );
         let inner = fixture.state.inner.lock().await;
         assert!(inner.runs.is_empty());
-        assert!(inner.webhook_deliveries.iter().any(|(id, state)| {
-            id == "delivery-github-owned" && matches!(state, WebhookDeliveryState::Completed(_))
-        }));
 
         std::env::remove_var(GITHUB_OWNED_WORKFLOWS_ENV);
     }
 
-    /// Issue 2: a delivery whose processing future is cancelled (client
-    /// disconnect, server shutdown) or panics must not keep its InFlight
-    /// reservation. A stale reservation makes GitHub's redelivery look like an
-    /// in-flight duplicate, gets skipped with a 200, and the run is lost.
+    /// Crash recovery: processing that died mid-flight has its expired lease
+    /// recovered on boot and drains to completion.
     #[tokio::test]
     async fn webhook_cancelled_processing_releases_reservation() {
         let temp = tempfile::tempdir().unwrap();
         let fixture = WebhookFixture::new(&temp).await;
 
-        let shared = Arc::new(SharedState {
-            state: fixture.state.clone(),
-            shutdown: CancellationToken::new(),
-        });
+        let record = WebhookDeliveryRecord {
+            delivery_id: "delivery-cancel".to_owned(),
+            event: "push".to_owned(),
+            payload: fixture.payload_bytes.clone(),
+            received_at_us: crate::store::now_us() - 100_000_000,
+            state: WebhookDeliveryStatus::Processing,
+            attempts: 1,
+            lease_until_us: Some(crate::store::now_us() - 1_000_000), // expired lease
+            lease_token: Some("expired-token".to_owned()),
+            last_error: None,
+        };
+        fixture
+            .state
+            .store
+            .enqueue_webhook_delivery(&record)
+            .await
+            .unwrap();
 
-        let mut headers = HeaderMap::new();
-        headers.insert(
-            "x-github-delivery",
-            HeaderValue::from_static("delivery-cancel"),
-        );
-        headers.insert("x-github-event", HeaderValue::from_static("push"));
-        headers.insert(
-            "x-hub-signature-256",
-            HeaderValue::from_str(&fixture.signature_header).unwrap(),
-        );
-        headers.insert("content-type", HeaderValue::from_static("application/json"));
+        let recovered = fixture
+            .state
+            .store
+            .recover_webhook_deliveries()
+            .await
+            .unwrap();
+        assert_eq!(recovered, 1, "expired processing lease must be recovered");
 
-        let future = handle_github_webhook(
-            State(shared.clone()),
-            headers,
-            bytes::Bytes::from(fixture.payload_bytes.clone()),
-        );
-        let mut future = Box::pin(future);
+        let rec = fixture
+            .state
+            .store
+            .get_webhook_delivery("delivery-cancel")
+            .await
+            .unwrap()
+            .expect("delivery row exists");
+        assert_eq!(rec.state, WebhookDeliveryStatus::Received);
 
-        // Poll once with a waker that never fires. The handler reserves the
-        // delivery and parks inside processing (the workspace snapshot runs
-        // real git subprocesses it cannot pass within one poll), so the future
-        // cannot complete while parked — exactly a cancelled request.
-        let waker = std::task::Waker::noop();
-        let mut context = std::task::Context::from_waker(waker);
-        assert!(
-            future.as_mut().poll(&mut context).is_pending(),
-            "processing must still be in flight after the first poll"
-        );
-        {
-            let inner = fixture.state.inner.lock().await;
-            assert!(
-                inner.webhook_deliveries.iter().any(|(id, s)| {
-                    id == "delivery-cancel" && matches!(s, WebhookDeliveryState::InFlight)
-                }),
-                "the delivery must be reserved InFlight while processing"
-            );
-        }
-
-        // Drop the future mid-processing: the reservation must not survive the
-        // processing that owned it.
-        drop(future);
-        {
-            let inner = fixture.state.inner.lock().await;
-            assert!(
-                !inner
-                    .webhook_deliveries
-                    .iter()
-                    .any(|(id, _)| id == "delivery-cancel"),
-                "a cancelled delivery must not keep an InFlight reservation"
-            );
-        }
-
-        // GitHub redelivers after the failed delivery; the retry must be
-        // processed, not skipped as an in-flight duplicate.
-        assert_eq!(
-            fixture.post("delivery-cancel", Some("push")).await,
-            StatusCode::OK
-        );
+        fixture.drain().await;
         let inner = fixture.state.inner.lock().await;
         assert_eq!(
             inner.runs.len(),
             1,
-            "a redelivery after cancellation must be processed"
+            "recovered delivery must be processed to create run"
         );
+    }
+    #[tokio::test]
+    async fn webhook_replay_reuses_existing_run() {
+        let temp = tempfile::tempdir().unwrap();
+        let fixture = WebhookFixture::new(&temp).await;
+
+        assert_eq!(
+            fixture.post("delivery-replay", Some("push")).await,
+            StatusCode::ACCEPTED
+        );
+        let shared = Arc::new(SharedState {
+            state: fixture.state.clone(),
+            shutdown: CancellationToken::new(),
+        });
+        let claimed = fixture
+            .state
+            .store
+            .claim_webhook_deliveries(1, 60)
+            .await
+            .unwrap();
+        assert_eq!(claimed.len(), 1);
+        let outcome = process_delivery_payload(&shared, &claimed[0]).await;
+        assert!(matches!(outcome, WebhookOutcome::Success));
+        let (original_run_id, original_check_run_ids) = {
+            let inner = fixture.state.inner.lock().await;
+            assert_eq!(inner.runs.len(), 1);
+            let run = inner.runs.values().next().unwrap();
+            assert_eq!(run.webhook_delivery_id.as_deref(), Some("delivery-replay"));
+            (run.run_id, run.job_check_run_ids.clone())
+        };
+
+        // Simulate a worker crash after run creation but before marking the
+        // delivery done. The replay must reuse that persisted run.
+        let lease_token = claimed[0].lease_token.as_deref().unwrap();
+        assert!(fixture
+            .state
+            .store
+            .fail_webhook_delivery(
+                "delivery-replay",
+                lease_token,
+                "simulated crash",
+                false,
+                Some(Duration::ZERO),
+            )
+            .await
+            .unwrap());
+        fixture.drain().await;
+
+        let inner = fixture.state.inner.lock().await;
+        assert_eq!(
+            inner.runs.len(),
+            1,
+            "replaying one delivery must not create a second run"
+        );
+        let run = inner
+            .runs
+            .get(&original_run_id)
+            .expect("original run survives replay");
+        assert_eq!(
+            run.job_check_run_ids, original_check_run_ids,
+            "replaying a persisted run must reuse its GitHub check-run mapping"
+        );
+    }
+    #[tokio::test]
+    async fn failed_webhook_delivery_can_be_reopened_for_redelivery() {
+        let temp = tempfile::tempdir().unwrap();
+        let fixture = WebhookFixture::new(&temp).await;
+        let delivery = WebhookDeliveryRecord {
+            delivery_id: "delivery-redelivery".to_owned(),
+            event: "push".to_owned(),
+            payload: fixture.payload_bytes.clone(),
+            received_at_us: crate::store::now_us(),
+            state: WebhookDeliveryStatus::Received,
+            attempts: 0,
+            lease_until_us: None,
+            lease_token: None,
+            last_error: None,
+        };
+        assert!(fixture
+            .state
+            .store
+            .enqueue_webhook_delivery(&delivery)
+            .await
+            .unwrap());
+        let claimed = fixture
+            .state
+            .store
+            .claim_webhook_deliveries(1, 60)
+            .await
+            .unwrap();
+        let lease_token = claimed[0].lease_token.as_deref().unwrap();
+        assert!(fixture
+            .state
+            .store
+            .fail_webhook_delivery(
+                &delivery.delivery_id,
+                lease_token,
+                "permanent test failure",
+                true,
+                None,
+            )
+            .await
+            .unwrap());
+
+        let failed = fixture
+            .state
+            .store
+            .get_webhook_delivery(&delivery.delivery_id)
+            .await
+            .unwrap()
+            .expect("failed delivery row exists");
+        assert_eq!(failed.state, WebhookDeliveryStatus::Failed);
+
+        let mut redelivery = delivery.clone();
+        redelivery.received_at_us = crate::store::now_us();
+        assert!(
+            fixture
+                .state
+                .store
+                .enqueue_webhook_delivery(&redelivery)
+                .await
+                .unwrap(),
+            "GitHub redelivery must reopen a retained failed row"
+        );
+        let reopened = fixture
+            .state
+            .store
+            .get_webhook_delivery(&delivery.delivery_id)
+            .await
+            .unwrap()
+            .expect("reopened delivery row exists");
+        assert_eq!(reopened.state, WebhookDeliveryStatus::Received);
+        assert_eq!(reopened.attempts, 0);
+        assert!(reopened.lease_token.is_none());
+        assert!(reopened.last_error.is_none());
+        assert!(
+            !fixture
+                .state
+                .store
+                .enqueue_webhook_delivery(&redelivery)
+                .await
+                .unwrap(),
+            "an active redelivery remains deduplicated"
+        );
+    }
+
+    #[tokio::test]
+    async fn corrupt_webhook_payload_is_dead_lettered_without_wedging_queue() {
+        let temp = tempfile::tempdir().unwrap();
+        let fixture = WebhookFixture::new(&temp).await;
+        let corrupt = WebhookDeliveryRecord {
+            delivery_id: "delivery-corrupt".to_owned(),
+            event: "push".to_owned(),
+            payload: fixture.payload_bytes.clone(),
+            received_at_us: crate::store::now_us() - 1,
+            state: WebhookDeliveryStatus::Received,
+            attempts: 0,
+            lease_until_us: None,
+            lease_token: None,
+            last_error: None,
+        };
+        let valid = WebhookDeliveryRecord {
+            delivery_id: "delivery-after-corrupt".to_owned(),
+            received_at_us: crate::store::now_us(),
+            ..corrupt.clone()
+        };
+        assert!(fixture
+            .state
+            .store
+            .enqueue_webhook_delivery(&corrupt)
+            .await
+            .unwrap());
+        assert!(fixture
+            .state
+            .store
+            .enqueue_webhook_delivery(&valid)
+            .await
+            .unwrap());
+
+        let db_path = temp.path().join("state").join("preloop.db");
+        let connection = rusqlite::Connection::open(db_path).unwrap();
+        connection
+            .execute(
+                "UPDATE webhook_deliveries SET payload_blob = ?1 WHERE delivery_id = ?2",
+                rusqlite::params![vec![0_u8, 1, 2], corrupt.delivery_id],
+            )
+            .unwrap();
+        drop(connection);
+
+        let claimed = fixture
+            .state
+            .store
+            .claim_webhook_deliveries(1, 60)
+            .await
+            .unwrap();
+        assert!(
+            claimed.is_empty(),
+            "corrupt payload is dead-lettered instead of returned to the worker"
+        );
+        assert_eq!(
+            fixture
+                .state
+                .store
+                .count_dead_letter_webhook_deliveries()
+                .await
+                .unwrap(),
+            1
+        );
+
+        let claimed = fixture
+            .state
+            .store
+            .claim_webhook_deliveries(1, 60)
+            .await
+            .unwrap();
+        assert_eq!(
+            claimed.len(),
+            1,
+            "a corrupt FIFO row must not wedge later valid deliveries"
+        );
+        let lease_token = claimed[0].lease_token.as_deref().unwrap();
+        assert!(fixture
+            .state
+            .store
+            .complete_webhook_delivery(&valid.delivery_id, lease_token)
+            .await
+            .unwrap());
+    }
+    #[tokio::test]
+    async fn webhook_processing_lease_can_be_renewed() {
+        let temp = tempfile::tempdir().unwrap();
+        let fixture = WebhookFixture::new(&temp).await;
+        let delivery = WebhookDeliveryRecord {
+            delivery_id: "delivery-lease".to_owned(),
+            event: "push".to_owned(),
+            payload: fixture.payload_bytes.clone(),
+            received_at_us: crate::store::now_us(),
+            state: WebhookDeliveryStatus::Received,
+            attempts: 0,
+            lease_until_us: None,
+            lease_token: None,
+            last_error: None,
+        };
+        fixture
+            .state
+            .store
+            .enqueue_webhook_delivery(&delivery)
+            .await
+            .unwrap();
+        let claimed = fixture
+            .state
+            .store
+            .claim_webhook_deliveries(1, 1)
+            .await
+            .unwrap();
+        assert_eq!(claimed.len(), 1);
+
+        let lease_token = claimed[0].lease_token.as_deref().unwrap();
+        assert!(
+            !fixture
+                .state
+                .store
+                .renew_webhook_delivery("delivery-lease", "stale-token", 60)
+                .await
+                .unwrap(),
+            "a stale worker must not renew a reclaimed lease"
+        );
+        assert!(fixture
+            .state
+            .store
+            .renew_webhook_delivery("delivery-lease", lease_token, 60)
+            .await
+            .unwrap());
+        assert!(
+            !fixture
+                .state
+                .store
+                .complete_webhook_delivery("delivery-lease", "stale-token")
+                .await
+                .unwrap(),
+            "a stale worker must not finalize a reclaimed lease"
+        );
+        let renewed = fixture
+            .state
+            .store
+            .get_webhook_delivery("delivery-lease")
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(
+            renewed.lease_until_us.unwrap() > crate::store::now_us() + 50_000_000,
+            "renewal must move the lease beyond the original one-second claim"
+        );
+    }
+    #[tokio::test]
+    async fn expired_webhook_lease_rejects_all_mutations() {
+        let temp = tempfile::tempdir().unwrap();
+        let fixture = WebhookFixture::new(&temp).await;
+        let delivery = WebhookDeliveryRecord {
+            delivery_id: "delivery-expired-lease".to_owned(),
+            event: "push".to_owned(),
+            payload: fixture.payload_bytes.clone(),
+            received_at_us: crate::store::now_us(),
+            state: WebhookDeliveryStatus::Received,
+            attempts: 0,
+            lease_until_us: None,
+            lease_token: None,
+            last_error: None,
+        };
+        fixture
+            .state
+            .store
+            .enqueue_webhook_delivery(&delivery)
+            .await
+            .unwrap();
+        let claimed = fixture
+            .state
+            .store
+            .claim_webhook_deliveries(1, 0)
+            .await
+            .unwrap();
+        let lease_token = claimed[0].lease_token.as_deref().unwrap();
+        tokio::time::sleep(Duration::from_millis(2)).await;
+
+        assert!(
+            !fixture
+                .state
+                .store
+                .renew_webhook_delivery(&delivery.delivery_id, lease_token, 60)
+                .await
+                .unwrap(),
+            "an expired lease must not be renewed by its old owner"
+        );
+        assert!(
+            !fixture
+                .state
+                .store
+                .complete_webhook_delivery(&delivery.delivery_id, lease_token)
+                .await
+                .unwrap(),
+            "an expired lease must not be completed by its old owner"
+        );
+        assert!(
+            !fixture
+                .state
+                .store
+                .fail_webhook_delivery(
+                    &delivery.delivery_id,
+                    lease_token,
+                    "stale failure",
+                    false,
+                    Some(Duration::ZERO),
+                )
+                .await
+                .unwrap(),
+            "an expired lease must not be failed by its old owner"
+        );
+        let retained = fixture
+            .state
+            .store
+            .get_webhook_delivery(&delivery.delivery_id)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(retained.state, WebhookDeliveryStatus::Processing);
+        assert_eq!(retained.lease_token.as_deref(), Some(lease_token));
+    }
+
+    #[tokio::test]
+    async fn webhook_terminal_rows_are_pruned_after_retention() {
+        let temp = tempfile::tempdir().unwrap();
+        let fixture = WebhookFixture::new(&temp).await;
+        let now = crate::store::now_us();
+        for (delivery_id, received_at_us) in
+            [("delivery-old", now - 2_000_000), ("delivery-fresh", now)]
+        {
+            fixture
+                .state
+                .store
+                .enqueue_webhook_delivery(&WebhookDeliveryRecord {
+                    delivery_id: delivery_id.to_owned(),
+                    event: "push".to_owned(),
+                    payload: fixture.payload_bytes.clone(),
+                    received_at_us,
+                    state: WebhookDeliveryStatus::Done,
+                    attempts: 1,
+                    lease_until_us: None,
+                    lease_token: None,
+                    last_error: None,
+                })
+                .await
+                .unwrap();
+        }
+
+        let pruned = fixture
+            .state
+            .store
+            .prune_webhook_deliveries(now - 1_000_000, 10)
+            .await
+            .unwrap();
+        assert_eq!(pruned, 1);
+        assert!(fixture
+            .state
+            .store
+            .get_webhook_delivery("delivery-old")
+            .await
+            .unwrap()
+            .is_none());
+        assert!(fixture
+            .state
+            .store
+            .get_webhook_delivery("delivery-fresh")
+            .await
+            .unwrap()
+            .is_some());
     }
 }

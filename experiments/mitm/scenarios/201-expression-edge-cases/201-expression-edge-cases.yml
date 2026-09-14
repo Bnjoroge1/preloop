@@ -1,0 +1,36 @@
+name: 201-expression-edge-cases
+on: workflow_dispatch
+jobs:
+  expr:
+    runs-on: self-hosted
+    outputs:
+      joined: "${{ steps.build.outputs.joined }}"
+      json_out: "${{ steps.build.outputs.json_out }}"
+    steps:
+
+
+
+
+      - name: "functions"
+
+        env:
+          HAS: "${{ contains(fromJSON('[\"alpha\",\"beta\"]'), 'beta') }}"
+          ESCAPED: "{${{ 'brace' }}}"
+          NESTED_JSON: "${{ toJSON(fromJSON('{\"a\":{\"b\":[1,2,{\"c\":\"d\"}]}}')) }}"
+          STAR: "${{ join(fromJSON('[\"x\",\"y\",\"z\"]'), '-') }}"
+        run: |
+          echo "has=$HAS" >> "$GITHUB_OUTPUT"
+          echo "joined=$STAR" >> "$GITHUB_OUTPUT"
+          {
+            echo "json_out<<EOF"
+            echo "$NESTED_JSON"
+            echo "EOF"
+          } >> "$GITHUB_OUTPUT"
+          # case-insensitive equality
+          [ "${{ 'ABC' == 'abc' }}" = "true" ] || exit 1
+      - name: "truthiness"
+        run: |
+          echo "zero-is-true=${{ 0 }}"
+          echo "empty-false=${{ '' }}"
+          echo "null=${{ null }}"
+          [ "${{ '' == 0 }}" = "true" ] || exit 1   # loose cast: '' casts to 0

@@ -1,0 +1,20 @@
+name: 213-oidc-token-claims
+on: workflow_dispatch
+permissions:
+  id-token: write
+  contents: read
+jobs:
+  oidc:
+    runs-on: self-hosted
+    environment: production
+    steps:
+
+
+
+
+      - name: "request token"
+        run: |
+          TOKEN=$(curl -sS -H "Authorization: Bearer $ACTIONS_ID_TOKEN_REQUEST_TOKEN" "$ACTIONS_ID_TOKEN_REQUEST_URL&audience=conformance-test")
+          echo "$TOKEN" | cut -d. -f1 | base64 -d 2>/dev/null | head -c 400; echo
+          echo "$TOKEN" | cut -d. -f2 | base64 -d 2>/dev/null | grep -o '"aud[^,]*' || echo "no-aud-decoded"
+          test -n "$TOKEN"

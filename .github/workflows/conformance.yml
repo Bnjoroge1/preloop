@@ -15,7 +15,7 @@ jobs:
   server-light:
     name: Server light conformance
     runs-on: [self-hosted, preloop-cpane]
-    timeout-minutes: 15
+    timeout-minutes: 30
     env:
       CARGO_BUILD_JOBS: "4"
     steps:
@@ -25,7 +25,7 @@ jobs:
           lfs: true
       - uses: dtolnay/rust-toolchain@6bed0761d98439e5a578e2877258200ad565ba87 # stable
       - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
-      - name: Replay official runner flows
+      - name: Replay configured official runner flows
         run: bash ./benchmarks/conformance/run.sh
       - name: Name the diverging scenarios
         if: failure()

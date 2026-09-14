@@ -18,6 +18,11 @@ whole point of this document.
 | Runner/service token | `ACTIONS_RUNTIME_TOKEN`, `ACTIONS_ID_TOKEN_REQUEST_TOKEN` | `endpoint.authorization.parameters.AccessToken` | Yes — always the local HMAC JWT |
 | Job token | `GITHUB_TOKEN` | `system.github.token` / `github_token` | No — becomes a real GitHub credential when an App or PAT is configured |
 
+The runner message uses the official lower-case `github_token` variable. The
+runner maps that built-in variable to the canonical
+`${{ secrets.GITHUB_TOKEN }}` expression; an uppercase `GITHUB_TOKEN` variable
+is not transmitted in the acquire response.
+
 The **local HMAC JWT** is signed with a per-instance key persisted at
 `<state-dir>/hmac-key.bin` and carries `sub: preloop-job-<job-id>` plus
 `scp: Actions.Results:<plan-id>:<job-id>`. It authenticates against *the Preloop

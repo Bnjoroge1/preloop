@@ -1,0 +1,18 @@
+name: 214-checkout-repo-inspect
+on: workflow_dispatch
+jobs:
+  checkout:
+    runs-on: self-hosted
+    steps:
+
+      - with:
+          fetch-depth: "0"
+        uses: "actions/checkout@v4"
+      - name: "inspect repo"
+        run: |
+          git log --oneline -3
+          git rev-parse HEAD
+          git status --short
+          test -f README.md
+      - name: "nested actions"
+        uses: "./.github/actions/nested-outer"

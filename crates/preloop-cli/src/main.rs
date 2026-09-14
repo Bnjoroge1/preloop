@@ -23,6 +23,7 @@ mod github_setup;
 mod push;
 mod server_install;
 mod update;
+mod webhooks;
 
 pub(crate) fn server_url() -> String {
     std::env::var("PRELOOP_URL").unwrap_or_else(|_| "http://127.0.0.1:9090".to_owned())
@@ -534,6 +535,13 @@ enum Command {
     /// idempotent.
     Push(PushArgs),
 
+    /// Inspect, replay and health-check the durable webhook queue.
+    ///
+    /// GitHub keeps three days of delivery history; preloop keeps the
+    /// payload for thirty, so `replay` still works long after GitHub can no
+    /// longer redeliver.
+    Webhooks(webhooks::WebhooksArgs),
+
     /// Poll GitHub Releases and atomically install the matching binary.
     Update(update::UpdateArgs),
 
@@ -836,6 +844,7 @@ async fn main() -> anyhow::Result<()> {
                     }
                     Command::Dap(args) => dap_client::run(args, server_url(), api_token()).await,
                     Command::Push(args) => cmd_push(args).await,
+                    Command::Webhooks(args) => webhooks::run(args).await,
                     Command::Update(_)
                     | Command::Serve(_)
                     | Command::Engine
@@ -3614,7 +3623,8 @@ fn render_status_human(status: &serde_json::Value, runs: &[serde_json::Value], l
     let pool_busy = get_u64(pool, "busy").unwrap_or(0);
     let paused = get_u64(pool, "paused").unwrap_or(0);
     let failures = get_u64(pool, "consecutive_provision_failures").unwrap_or(0);
-    println!("  pool mode: {mode}  desired: {desired}  idle: {pool_idle}  busy: {pool_busy}  building: {building}  provisioning: {provisioning}  paused: {paused}  preparing: {preparing}  provision_failures: {failures}");
+    let released_bindings = get_u64(pool, "released_bindings").unwrap_or(0);
+    println!("  pool mode: {mode}  desired: {desired}  idle: {pool_idle}  busy: {pool_busy}  building: {building}  provisioning: {provisioning}  paused: {paused}  preparing: {preparing}  provision_failures: {failures}  released_bindings: {released_bindings}");
     let runners = status.get("runners").unwrap_or(&serde_json::Value::Null);
     let reg = get_u64(runners, "registered").unwrap_or(0);
     let sessions = get_u64(runners, "sessions").unwrap_or(0);
@@ -3962,6 +3972,7 @@ fn condition_action(code: &str) -> &'static str {
         "debug_audit_evicted" => "increase audit retention or flush audits",
         "telemetry_export_failure" => "check OTLP endpoint and credentials",
         "state_sampler_stale" | "task_stale" | "task_exited" => "check background task health",
+        "webhook_dead_letter" => "inspect dead-lettered webhook deliveries and last_error",
         _ => "see runbook for this condition",
     }
 }

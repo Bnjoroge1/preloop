@@ -925,6 +925,7 @@ mod tests {
                 run_id,
                 RunRecord {
                     run_id,
+                    webhook_delivery_id: None,
                     run_name: Some("timeline-conclusion-test".to_owned()),
                     submission: Arc::new(WorkflowSubmission {
                         workflow_yaml: "on: push\njobs: {}\n".to_owned(),
@@ -974,6 +975,7 @@ mod tests {
                     timeline_id,
                     result: None,
                     locked_until: String::new(),
+                    claimed_at: None,
                     owner_runner_id: None,
                     started_at: None,
                     last_renewed_at: None,

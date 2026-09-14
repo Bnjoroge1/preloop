@@ -389,6 +389,20 @@ pub struct AppState {
     pub(crate) store: Arc<dyn Store>,
     pub(crate) events: broadcast::Sender<NdjsonEvent>,
     pub(crate) message_notify: Arc<Notify>,
+    pub(crate) webhook_queue_notify: Arc<Notify>,
+    /// Circuit breaker for durable webhook delivery work. Lifecycle check-run
+    /// updates use a separate breaker so an ingress outage cannot suppress
+    /// status transitions for runs already in progress.
+    pub(crate) github_breaker: Arc<crate::github_breaker::GithubBreaker>,
+    pub(crate) github_lifecycle_breaker: Arc<crate::github_breaker::GithubBreaker>,
+    /// Live status published by the delivery watchdog and App webhook health
+    /// monitor.
+    pub(crate) webhook_status: Arc<crate::webhook_status::WebhookResilienceStatus>,
+    /// Backoff ladder for transient webhook delivery failures, indexed by the
+    /// delivery's attempt count (the last entry repeats). State rather than a
+    /// constant so tests can drive the retry path without sleeping through the
+    /// real tiers.
+    pub(crate) webhook_retry_backoff: Vec<std::time::Duration>,
     /// Atomic counter for pre-allocating request IDs outside the dispatch
     /// lock.  Monotonically increases; the inner counter is no longer the
     /// source of truth once this is in use.
@@ -1026,6 +1040,11 @@ impl AppState {
             store,
             events,
             message_notify: Arc::new(Notify::new()),
+            webhook_queue_notify: Arc::new(Notify::new()),
+            github_breaker: Arc::new(crate::github_breaker::GithubBreaker::default()),
+            github_lifecycle_breaker: Arc::new(crate::github_breaker::GithubBreaker::default()),
+            webhook_status: Arc::new(crate::webhook_status::WebhookResilienceStatus::default()),
+            webhook_retry_backoff: crate::github::WEBHOOK_RETRY_BACKOFF.to_vec(),
             next_request_id: Arc::new(std::sync::atomic::AtomicI64::new(next_request_id)),
             observability: preloop_observability::Observability::noop(),
             status_snapshot: Arc::new(parking_lot::RwLock::new(
@@ -1407,6 +1426,9 @@ pub(crate) struct InnerState {
     pub(crate) metadata_revision: std::sync::atomic::AtomicU64,
     pub(crate) runs: BTreeMap<RunId, RunRecord>,
     pub(crate) workflow_run_counters: BTreeMap<String, u64>,
+    /// Webhook run submissions currently building outside the state lock.
+    /// Entries prevent a replay from doing the same expensive work twice.
+    pub(crate) webhook_run_reservations: BTreeSet<(String, String)>,
     pub(crate) queue: VecDeque<QueuedJob>,
     /// When each ready-queue job was first seen by the reaper, used to fail
     /// jobs no runner can ever claim. Maintained by the reaper itself, so it
@@ -1430,6 +1452,7 @@ pub(crate) struct InnerState {
     /// the same node, and cancellation drops it so a build that finishes after
     /// the run was cancelled is discarded instead of resurrecting jobs.
     pub(crate) expanding: BTreeSet<(RunId, JobId)>,
+    pub(crate) runner_registered_at: BTreeMap<i64, std::time::Instant>,
     pub(crate) runners: BTreeMap<i64, RegisteredRunner>,
     pub(crate) sessions: BTreeMap<String, RunnerSession>,
     /// When each runner session last polled. In-memory only: sessions are
@@ -1477,23 +1500,14 @@ pub(crate) struct InnerState {
     /// external runners. Default false keeps bring-your-own-runner installs
     /// working unchanged.
     pub(crate) require_job_assignments: bool,
+    /// Observable counter of stale job bindings released back to waitlist or expired.
+    pub(crate) released_bindings_count: u64,
     /// Jobs popped from the queue by a dispatch claim, keyed for requeueing:
     /// if the runner that claimed a job dies mid-execution (machine torn down,
     /// identity purged), the stashed copy is what gets the same job back into
     /// the queue intact instead of waiting for the lease reaper to fail it.
     /// Entries drop on normal completion.
     pub(crate) claimed_jobs: BTreeMap<(RunId, JobId), QueuedJob>,
-    /// Recently seen GitHub webhook delivery IDs, so a redelivered (or
-    /// double-fired) webhook does not create duplicate runs. An entry is
-    /// `InFlight` while the handler is still processing that delivery, so a
-    /// concurrent second copy of the same delivery is skipped, and
-    /// `Completed` once processing succeeded, so a later redelivery inside
-    /// the dedup window is skipped. A failed delivery has its entry removed
-    /// entirely: GitHub redelivers after an error response and that retry is
-    /// the only remaining chance to process the event, so keeping the
-    /// reservation would swallow it permanently. Completed entries are pruned
-    /// by the dedup window on every insert.
-    pub(crate) webhook_deliveries: VecDeque<(String, WebhookDeliveryState)>,
     pub(crate) pending_caches: BTreeMap<i64, PendingCache>,
     pub(crate) artifacts: BTreeMap<String, ArtifactRecord>,
     pub(crate) logs: BTreeMap<String, Vec<u8>>,

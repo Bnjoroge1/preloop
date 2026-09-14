@@ -1,13 +1,23 @@
 use super::*;
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum RunnerAuthSource {
+    RunnerListenToken,
+    RuntimeJwt,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) struct AuthenticatedRunnerId {
+    pub(crate) runner_id: i64,
+    pub(crate) auth_source: RunnerAuthSource,
+}
 ///
 /// The two are deliberately separate counters. `Lifecycle` records a
-/// credential fencing carrier assumes cannot occur, so its count
-/// is the dogfood gate and must stay at zero. `Acquire` records the
-/// Listener's own `acquirejob`, where the listen token is the only credential
-/// the runner has folding it into one counter (as the first cut of this
-/// probe did, together with every message claim) makes a zero-gate
-/// unreachable and the whole experiment unfalsifiable.
+/// rejected bare-listener-token attempt; official runner renew/complete calls
+/// must use the job runtime token, so this counter is the compatibility gate
+/// and must stay at zero in dogfood. `Acquire` records the Listener's own
+/// `acquirejob`, where the listen token is the only credential it has. Folding
+/// these into one counter would make that zero-gate unreachable.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) enum ListenerTokenProbe {
     Lifecycle,
@@ -43,6 +53,36 @@ pub(crate) fn record_listener_token_use(
     }
 }
 
+pub(crate) async fn authenticated_runner_id_with_source(
+    shared: &Arc<SharedState>,
+    headers: &HeaderMap,
+    expected_runner_id: Option<i64>,
+) -> Result<AuthenticatedRunnerId, ApiError> {
+    let bearer = crate::auth::bearer_from_headers(headers)
+        .ok_or_else(|| ApiError::unauthorized("runner or job runtime token required"))?;
+    if let Some(runner_id) = crate::auth::registered_runner_id(shared, bearer).await {
+        if expected_runner_id.is_some_and(|expected| expected != runner_id) {
+            return Err(ApiError::forbidden(
+                "runner token does not match broker path",
+            ));
+        }
+        return Ok(AuthenticatedRunnerId {
+            runner_id,
+            auth_source: RunnerAuthSource::RunnerListenToken,
+        });
+    }
+    if shared.state.job_uuid_from_token(bearer).is_some() {
+        let runner_id =
+            expected_runner_id.ok_or_else(|| ApiError::unauthorized("runner id required"))?;
+        return Ok(AuthenticatedRunnerId {
+            runner_id,
+            auth_source: RunnerAuthSource::RuntimeJwt,
+        });
+    }
+    Err(ApiError::unauthorized(
+        "runner or job runtime token required",
+    ))
+}
 #[derive(Debug, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub(crate) struct BrokerAcquireJobRequest {
@@ -267,6 +307,9 @@ pub(crate) async fn next_message_broker_ref(
         .get("waitSeconds")
         .and_then(|value| value.parse::<u64>().ok())
         .unwrap_or(50);
+    let runner_busy = params
+        .get("status")
+        .is_some_and(|status| status.eq_ignore_ascii_case("busy"));
 
     loop {
         let mut inner = shared.state.inner.lock().await;
@@ -309,10 +352,31 @@ pub(crate) async fn next_message_broker_ref(
                 }
 
                 if request.result.is_none() {
-                    return Ok(Json(broker_job_ref(request, runner_id)).into_response());
+                    if !runner_busy {
+                        return Ok(Json(broker_job_ref(request, runner_id)).into_response());
+                    }
+                } else {
+                    inner.session_active_requests.remove(&session_id);
                 }
+            } else {
+                inner.session_active_requests.remove(&session_id);
             }
-            inner.session_active_requests.remove(&session_id);
+        }
+        if runner_busy {
+            drop(inner);
+            if wait_seconds == 0 {
+                return Ok((StatusCode::ACCEPTED, Json(serde_json::Value::Null)).into_response());
+            }
+            if tokio::time::timeout(
+                Duration::from_secs(wait_seconds),
+                shared.state.message_notify.notified(),
+            )
+            .await
+            .is_err()
+            {
+                return Ok((StatusCode::ACCEPTED, Json(serde_json::Value::Null)).into_response());
+            }
+            continue;
         }
 
         let runner = inner.runner_capabilities_for_session(&session_id);
@@ -344,6 +408,7 @@ pub(crate) async fn next_message_broker_ref(
             continue;
         };
 
+        let claimed_at = std::time::SystemTime::now();
         if let Some(run) = inner.runs.get_mut(&queued.run_id) {
             run.status = ExecutionStatus::InProgress;
             run.started_at.get_or_insert_with(chrono::Utc::now);
@@ -357,8 +422,9 @@ pub(crate) async fn next_message_broker_ref(
             .insert(session_id.clone(), request_id);
         if let Some(request) = inner.job_requests.get_mut(&request_id) {
             request.owner_runner_id = Some(runner_id);
-            request.started_at = Some(std::time::SystemTime::now());
-            request.last_renewed_at = Some(std::time::SystemTime::now());
+            request.claimed_at = Some(claimed_at);
+            request.started_at = Some(claimed_at);
+            request.last_renewed_at = Some(claimed_at);
         }
         inner
             .broker_messages
@@ -430,6 +496,14 @@ pub(crate) async fn broker_session_root(
     let session_id = uuid::Uuid::new_v4().to_string();
     {
         let mut inner = shared.state.inner.lock().await;
+        // Authentication and insertion must share a final registration check:
+        // the liveness sweep may have purged this runner after token
+        // validation but before this lock was acquired.
+        if !inner.runners.contains_key(&runner_id) {
+            return Err(ApiError::unauthorized(
+                "runner registration is no longer active",
+            ));
+        }
         inner
             .session_keys
             .insert(session_id.clone(), SessionEncryption::generate());
@@ -547,10 +621,7 @@ pub(crate) async fn authenticated_runner_id(
     headers: &HeaderMap,
     expected_runner_id: Option<i64>,
 ) -> Result<i64, ApiError> {
-    let bearer = headers
-        .get(header::AUTHORIZATION)
-        .and_then(|value| value.to_str().ok())
-        .and_then(|value| value.strip_prefix("Bearer "))
+    let bearer = crate::auth::bearer_from_headers(headers)
         .ok_or_else(|| ApiError::unauthorized("runner listen token required"))?;
     let runner_id = crate::auth::registered_runner_id(shared, bearer)
         .await
@@ -563,33 +634,27 @@ pub(crate) async fn authenticated_runner_id(
     Ok(runner_id)
 }
 
-/// Authenticate a broker renew/complete call with either the live runner
-/// listen credential or the runtime token for the exact agent job in the body.
+/// Authenticate a broker renew/complete call with the runtime token for the
+/// exact agent job in the body. The runner listen token is deliberately
+/// observed and rejected: acquirejob is its only broker lifecycle call.
 pub(crate) async fn authenticated_runner_id_for_job(
     shared: &Arc<SharedState>,
     headers: &HeaderMap,
     expected_runner_id: i64,
     job_id: uuid::Uuid,
+    route: &'static str,
 ) -> Result<i64, ApiError> {
-    let bearer = headers
-        .get(header::AUTHORIZATION)
-        .and_then(|value| value.to_str().ok())
-        .and_then(|value| value.strip_prefix("Bearer "))
+    let bearer = crate::auth::bearer_from_headers(headers)
         .ok_or_else(|| ApiError::unauthorized("runner or job runtime token required"))?;
-    if let Some(runner_id) = crate::auth::registered_runner_id(shared, bearer).await {
-        if runner_id != expected_runner_id {
-            return Err(ApiError::forbidden(
-                "runner token does not match broker path",
-            ));
-        }
-        return Ok(runner_id);
+    let auth =
+        authenticated_runner_id_with_source(shared, headers, Some(expected_runner_id)).await?;
+    if auth.auth_source == RunnerAuthSource::RunnerListenToken {
+        record_listener_token_use(&shared.state, ListenerTokenProbe::Lifecycle, route);
+        return Err(ApiError::forbidden(
+            "job lifecycle requires the job runtime token",
+        ));
     }
-
-    let runtime_job = shared
-        .state
-        .job_uuid_from_token(bearer)
-        .ok_or_else(|| ApiError::unauthorized("runner or job runtime token required"))?;
-    if runtime_job != job_id {
+    if shared.state.job_uuid_from_token(bearer) != Some(job_id) {
         return Err(ApiError::forbidden(
             "job runtime token does not match broker job",
         ));
@@ -762,6 +827,7 @@ pub(crate) async fn next_message_broker_ref_root(
                 runtime_scheduling::sync_next_job_labels(&inner, &shared.state.next_job_runs_on);
                 record_claim_queue_wait(&shared, &claimed);
                 if let Some(queued) = claimed {
+                    let claimed_at = std::time::SystemTime::now();
                     if let Some(run) = inner.runs.get_mut(&queued.run_id) {
                         run.status = ExecutionStatus::InProgress;
                         run.started_at.get_or_insert_with(chrono::Utc::now);
@@ -771,8 +837,9 @@ pub(crate) async fn next_message_broker_ref_root(
                     let request_id = queued.message.request_id;
                     if let Some(request) = inner.job_requests.get_mut(&request_id) {
                         request.owner_runner_id = Some(runner_id);
-                        request.started_at = Some(std::time::SystemTime::now());
-                        request.last_renewed_at = Some(std::time::SystemTime::now());
+                        request.claimed_at = Some(claimed_at);
+                        request.started_at = Some(claimed_at);
+                        request.last_renewed_at = Some(claimed_at);
                     }
                     // Job messageId = request_id (low range). Cancels use 1_000_000+.
                     inner
@@ -822,12 +889,19 @@ pub(crate) async fn broker_acquire_job(
     headers: HeaderMap,
     Json(request): Json<BrokerAcquireJobRequest>,
 ) -> Result<Json<serde_json::Value>, ApiError> {
-    authenticated_runner_id(&shared, &headers, Some(runner_id)).await?;
-    record_listener_token_use(
-        &shared.state,
-        ListenerTokenProbe::Acquire,
-        "broker.acquirejob",
-    );
+    let auth = authenticated_runner_id_with_source(&shared, &headers, Some(runner_id)).await?;
+    if auth.auth_source == RunnerAuthSource::RuntimeJwt {
+        return Err(ApiError::forbidden(
+            "acquirejob requires the runner listen token",
+        ));
+    }
+    if auth.auth_source == RunnerAuthSource::RunnerListenToken {
+        record_listener_token_use(
+            &shared.state,
+            ListenerTokenProbe::Acquire,
+            "broker.acquirejob",
+        );
+    }
     let (request_id, mut message, github_token_request, id_token_granted) = {
         let inner = shared.state.inner.lock().await;
         let request_id = inner
@@ -969,19 +1043,31 @@ pub(crate) async fn broker_acquire_job(
                             .map(|(scope, level)| (wire_scope_to_kebab(&scope), level))
                             .collect::<BTreeMap<_, _>>()
                     });
-                    // `system.github.token.permissions` carries the effective
-                    // set (defaults substituted when nothing was declared).
-                    // Passing it as the declared set is faithful: for a
-                    // declared job it is exactly the job's set, and for an
-                    // undeclared job `job_authorization` treats a set equal
-                    // to the default identically to `None`. The fork case is
-                    // safe too — the wire variable was restated to the fork
-                    // profile at build, and clamping it again is idempotent.
+                    // The wire variable carries repository-token scopes only;
+                    // the OIDC grant is persisted in the job's endpoint
+                    // metadata. Fall back to the old wire marker so jobs
+                    // queued before this renderer change can still recover.
+                    let id_token_granted = inner
+                        .id_token_grants
+                        .get(&(record.run_id, record.job_id.clone()))
+                        .copied()
+                        .unwrap_or_else(|| {
+                            wire_permissions
+                                .as_ref()
+                                .and_then(|permissions| permissions.get("id-token"))
+                                .is_some_and(|level| level == "write")
+                                || message.resources.endpoints.iter().any(|endpoint| {
+                                    endpoint
+                                        .data
+                                        .get("GenerateIdTokenUrl")
+                                        .is_some_and(|url| !url.is_empty())
+                                })
+                        });
                     let declared = wire_permissions.clone();
                     let policy = crate::events::trust_tier::job_authorization(
                         tier,
                         declared.as_ref(),
-                        false,
+                        id_token_granted,
                     );
                     Some((
                         crate::models::GitHubTokenRequest {
@@ -1153,15 +1239,14 @@ pub(crate) struct MintedGitHubToken {
     pub(crate) effective_permissions: Option<BTreeMap<String, String>>,
 }
 
-/// Apply a freshly minted dispatch token to the job message: inject the
-/// three secret variables (`system.github.token`, `github_token`,
-/// `GITHUB_TOKEN`), restate the narrowed permission set, and patch the
-/// minted token into the `github` context so `${{ github.token }}` inputs
-/// (checkout's token, persist-credentials config) authenticate. Shared by
-/// the normal mint path and the re-derived-request fallback, which had
-/// already diverged (the fallback lost the success log). `re_derived` only
-/// tailors the log wording: the derived path historically logged no
-/// success line.
+/// Apply a freshly minted dispatch token to the job message: inject the two
+/// secret variables (`system.github.token`, `github_token`), restate the
+/// narrowed permission set, and patch the minted token into the `github`
+/// context so `${{ github.token }}` inputs (checkout's token,
+/// persist-credentials config) authenticate. Shared by the normal mint path
+/// and the re-derived-request fallback, which had already diverged (the
+/// fallback lost the success log). `re_derived` only tailors the log wording:
+/// the derived path historically logged no success line.
 fn apply_minted_token_to_message(
     message: &mut azdo::AgentJobRequestMessage,
     minted: &MintedGitHubToken,
@@ -1176,37 +1261,14 @@ fn apply_minted_token_to_message(
         "github_token".to_owned(),
         preloop_gha_protocol::azdo::VariableValue::secret(token.clone()),
     );
-    // The build-time message also injects the token as `GITHUB_TOKEN` (the
-    // `${{ secrets.GITHUB_TOKEN }}` alias). It must follow the minted token
-    // too, or a fork job's hostile step code could read the stale local
-    // runtime token from `secrets.GITHUB_TOKEN` while `github.token` already
-    // carries the scoped mint.
-    message.variables.insert(
-        "GITHUB_TOKEN".to_owned(),
-        preloop_gha_protocol::azdo::VariableValue::secret(token.clone()),
-    );
-    // Restate what the token carries when the installation could not grant
-    // everything. The message was built with the requested set, and leaving
-    // it would print authority the token does not have in the runner's
-    // `GITHUB_TOKEN Permissions` group — sending anyone debugging the
-    // resulting 403 to the wrong place. The narrowed grant replaces only
-    // App-scoped entries: Actions-only metadata (`IdToken: write` for a
-    // trusted job whose OIDC grant is still live) is preserved from the
-    // build-time wire set, and a fork-restricted job's wire set has no
-    // IdToken to preserve.
+    // Restate only repository-token scopes when an installation narrowed the
+    // mint. OIDC and other Actions-only capabilities have dedicated protocol
+    // fields and never belong in `GITHUB_TOKEN Permissions`.
     if let Some(effective) = &minted.effective_permissions {
-        let merged = merge_narrowed_wire_permissions(
-            message
-                .variables
-                .get("system.github.token.permissions")
-                .and_then(|variable| variable.value.as_deref()),
-            effective,
-        );
+        let perms_json = preloop_gha_parser::job_builder::token_permissions_wire_json(effective);
         message.variables.insert(
             "system.github.token.permissions".to_owned(),
-            preloop_gha_protocol::azdo::VariableValue::new(
-                preloop_gha_parser::job_builder::token_permissions_wire_json(&merged),
-            ),
+            preloop_gha_protocol::azdo::VariableValue::new(perms_json),
         );
     }
     // The workflow's `github` context is built at submission time, before
@@ -1507,43 +1569,6 @@ pub(crate) async fn mint_dispatch_github_token(
     Ok(minted)
 }
 
-/// Merge a minted token's effective (App-scoped) permission set into the
-/// runner-visible wire permissions.
-///
-/// `original_wire` is the `system.github.token.permissions` variable the
-/// message carried at claim time — the policy set built in
-/// `build_job_artifacts`. The effective grant is authoritative for App
-/// repository scopes (a scope the installation dropped disappears from the
-/// wire, so the runner's `GITHUB_TOKEN Permissions` group never overstates
-/// the token), but Actions-only scopes (`id-token`, `models`) never appear
-/// in an installation grant, so their build-time metadata is preserved:
-/// a trusted job declared `id-token: write` keeps `IdToken: write` while its
-/// OIDC grant is live, and a fork-restricted job's wire set has no IdToken
-/// entry to preserve. Never reconstructs from broader defaults: a missing or
-/// unparseable original wire set degrades to the effective grant alone.
-fn merge_narrowed_wire_permissions(
-    original_wire: Option<&str>,
-    effective: &BTreeMap<String, String>,
-) -> BTreeMap<String, String> {
-    let mut merged: BTreeMap<String, String> = effective.clone();
-    let Some(original_wire) = original_wire else {
-        return merged;
-    };
-    let Ok(original) = serde_json::from_str::<BTreeMap<String, String>>(original_wire) else {
-        return merged;
-    };
-    for (scope, level) in original {
-        let scope = wire_scope_to_kebab(&scope);
-        if crate::github_app::ACTIONS_ONLY_SCOPES.contains(&scope.as_str()) {
-            // Keyed kebab-case so the merged map stays consistent with the
-            // effective grant, whose keys come from the requested set;
-            // `token_permissions_wire_json` pascal-cases them for the wire.
-            merged.insert(scope, level);
-        }
-    }
-    merged
-}
-
 /// `Checks` → `checks`, `PullRequests` → `pull-requests`: the workflow
 /// (kebab-case) spelling of a PascalCase wire permission scope.
 ///
@@ -1572,20 +1597,15 @@ pub(crate) async fn broker_renew_job(
     headers: HeaderMap,
     Json(request): Json<BrokerRenewJobRequest>,
 ) -> Result<Json<serde_json::Value>, ApiError> {
-    let listen_token = match crate::auth::bearer_from_headers(&headers) {
-        Some(token) => crate::auth::registered_runner_id(&shared, token)
-            .await
-            .is_some(),
-        None => false,
-    };
-    authenticated_runner_id_for_job(&shared, &headers, runner_id, request.job_id).await?;
-    if listen_token {
-        record_listener_token_use(
-            &shared.state,
-            ListenerTokenProbe::Lifecycle,
-            "broker.renewjob",
-        );
-    }
+    authenticated_runner_id_for_job(
+        &shared,
+        &headers,
+        runner_id,
+        request.job_id,
+        "broker.renewjob",
+    )
+    .await?;
+
     let mut inner = shared.state.inner.lock().await;
     let request_id = inner
         .agent_job_requests
@@ -1615,20 +1635,15 @@ pub(crate) async fn broker_complete_job(
     headers: HeaderMap,
     Json(request): Json<BrokerRenewJobRequest>,
 ) -> Result<StatusCode, ApiError> {
-    let listen_token = match crate::auth::bearer_from_headers(&headers) {
-        Some(token) => crate::auth::registered_runner_id(&shared, token)
-            .await
-            .is_some(),
-        None => false,
-    };
-    authenticated_runner_id_for_job(&shared, &headers, runner_id, request.job_id).await?;
-    if listen_token {
-        record_listener_token_use(
-            &shared.state,
-            ListenerTokenProbe::Lifecycle,
-            "broker.completejob",
-        );
-    }
+    authenticated_runner_id_for_job(
+        &shared,
+        &headers,
+        runner_id,
+        request.job_id,
+        "broker.completejob",
+    )
+    .await?;
+
     let status = match request.conclusion.as_deref() {
         Some(conclusion) => execution_status_from_runner_result(conclusion).ok_or_else(|| {
             ApiError::bad_request(format!("unknown broker conclusion `{conclusion}`"))
@@ -1806,76 +1821,6 @@ mod tests {
         assert_eq!(
             execution_status_from_runner_result("Abandoned"),
             Some(ExecutionStatus::Failure)
-        );
-    }
-
-    #[test]
-    fn narrowed_grants_preserve_trusted_actions_only_metadata() {
-        // Trusted job declared `checks: write` + `id-token: write`; the
-        // installation granted only `pull-requests: read`. The effective
-        // grant replaces App-scoped entries (checks disappears — the token
-        // does not carry it) while `IdToken: write` metadata survives.
-        let merged = merge_narrowed_wire_permissions(
-            Some(r#"{"Checks":"write","IdToken":"write"}"#),
-            &BTreeMap::from([("pull-requests".to_owned(), "read".to_owned())]),
-        );
-        assert_eq!(
-            merged,
-            BTreeMap::from([
-                ("pull-requests".to_owned(), "read".to_owned()),
-                ("id-token".to_owned(), "write".to_owned()),
-            ]),
-            "App scopes come from the effective grant; Actions-only metadata is preserved"
-        );
-    }
-
-    #[test]
-    fn narrowed_grants_never_add_actions_metadata_to_a_fork() {
-        // Fork job's build-time wire set has no IdToken; the merge must not
-        // invent one. The installation lacks `checks`, so the wire loses it.
-        let merged = merge_narrowed_wire_permissions(
-            Some(r#"{"Checks":"read","PullRequests":"read"}"#),
-            &BTreeMap::from([("pull-requests".to_owned(), "read".to_owned())]),
-        );
-        assert_eq!(
-            merged,
-            BTreeMap::from([("pull-requests".to_owned(), "read".to_owned())]),
-            "fork wire keeps no IdToken and drops ungranted App scopes"
-        );
-    }
-
-    #[test]
-    fn narrowed_grants_lower_declared_writes_to_the_granted_level() {
-        let merged = merge_narrowed_wire_permissions(
-            Some(r#"{"Contents":"write","IdToken":"write"}"#),
-            &BTreeMap::from([
-                ("contents".to_owned(), "read".to_owned()),
-                ("metadata".to_owned(), "read".to_owned()),
-            ]),
-        );
-        assert_eq!(
-            merged,
-            BTreeMap::from([
-                ("contents".to_owned(), "read".to_owned()),
-                ("metadata".to_owned(), "read".to_owned()),
-                ("id-token".to_owned(), "write".to_owned()),
-            ]),
-            "declared write is lowered to the granted read; metadata survives"
-        );
-    }
-
-    #[test]
-    fn missing_or_unparseable_original_wire_degrades_to_the_effective_grant() {
-        let effective = BTreeMap::from([("metadata".to_owned(), "read".to_owned())]);
-        assert_eq!(
-            merge_narrowed_wire_permissions(None, &effective),
-            effective,
-            "no original wire set: nothing to preserve"
-        );
-        assert_eq!(
-            merge_narrowed_wire_permissions(Some("not json"), &effective),
-            effective,
-            "unparseable wire set must not reconstruct from broader defaults"
         );
     }
 

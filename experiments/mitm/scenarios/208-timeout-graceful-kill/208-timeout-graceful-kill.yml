@@ -1,0 +1,31 @@
+name: 208-timeout-graceful-kill
+on: workflow_dispatch
+jobs:
+  quick:
+    runs-on: self-hosted
+    steps:
+
+
+
+
+
+
+
+
+
+
+
+
+
+      - run: "echo \"quick job done\""
+      - name: "long-ish"
+        timeout-minutes: 1
+        run: |
+          echo "step level timer"
+          sleep 90
+          echo "step timeout should have killed me"
+
+  replay-extra-2:
+    runs-on: self-hosted
+    steps:
+      - run: "echo \"replay placeholder 2\""

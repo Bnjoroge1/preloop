@@ -1,0 +1,20 @@
+name: 204-composite-with-outputs-ifs
+on: workflow_dispatch
+jobs:
+  use-composite:
+    runs-on: self-hosted
+    steps:
+
+
+      - with:
+          name: "edge-runner"
+        uses: "./.github/actions/composite-tool"
+      - run: "echo \"got ${{ steps.tool.outputs.tool-version }}\""
+        if: "success() && (steps.tool.outputs.tool-version != '')"
+      - run: "echo \"skipped-branch\""
+        if: "success() && (steps.tool.outputs.tool-version == 'never')"
+      - run: "echo \"always runs\""
+        if: "always()"
+      - run: "exit 3"
+        continue-on-error: true
+      - run: "echo \"previous step outcome=${{ steps.failstep.outcome }} conclusion=${{ steps.failstep.conclusion }}\""

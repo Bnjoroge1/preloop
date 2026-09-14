@@ -663,6 +663,7 @@ fn secrets_context_resolves_in_expressions() {
         "job1".into(),
         "Test".into(),
         serde_json::json!({
+            "github_token": {"value": "ghp_tok", "isSecret": true},
             "system.github.token": {"value": "ghp_tok", "isSecret": true},
             "MY_SECRET": {"value": "s3cr3t", "isSecret": true}
         }),
@@ -675,6 +676,12 @@ fn secrets_context_resolves_in_expressions() {
             .unwrap()
             .as_str(),
         Some("s3cr3t")
+    );
+    assert_eq!(
+        preloop_gha_expressions::eval_expression("secrets.GITHUB_TOKEN", &expr_ctx)
+            .unwrap()
+            .as_str(),
+        Some("ghp_tok")
     );
 }
 

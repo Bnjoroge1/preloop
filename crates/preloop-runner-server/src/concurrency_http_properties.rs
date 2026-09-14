@@ -585,22 +585,28 @@ pub(crate) mod http_sequences {
         // B should be pending.
         assert_eq!(get_run(&app, b_id).await["status"], "pending");
 
-        // Dispatch A via polling so it becomes InProgress.
-        let msg = poll_message(&app, "sess-broker").await;
-        assert!(!msg.is_null(), "A should be dispatchable");
-        assert_eq!(get_run(&app, a_id).await["jobs"]["build"], "in_progress");
-        let runner_token = state
-            .local_jwt(json!({
-                "sub": "preloop-runner-listen-1",
-                "scp": "ActionsRuntime.RunnerListen",
-            }))
-            .unwrap();
+        // Bind the legacy session to the runner before polling so the claimed
+        // request records the same owner the runtime token must prove.
         {
             let mut inner = state.inner.lock().await;
             inner
                 .broker_session_runners
                 .insert("sess-broker".to_owned(), 1);
         }
+
+        // Dispatch A via polling so it becomes InProgress.
+        let msg = poll_message(&app, "sess-broker").await;
+        assert!(!msg.is_null(), "A should be dispatchable");
+        assert_eq!(get_run(&app, a_id).await["jobs"]["build"], "in_progress");
+        let runtime_token = {
+            let inner = state.inner.lock().await;
+            let request = inner
+                .job_requests
+                .values()
+                .find(|request| request.run_id.to_string() == a_id)
+                .expect("dispatched job request must exist");
+            state.mint_runtime_token(&request.plan_id, &request.agent_job_id)
+        };
 
         // Complete via broker path.
         // We need to find the agent_job_id and plan_id.
@@ -615,7 +621,7 @@ pub(crate) mod http_sequences {
         };
 
         let status =
-            broker_complete(&app, &runner_token, 1, &plan_id, &agent_job_id.to_string()).await;
+            broker_complete(&app, &runtime_token, 1, &plan_id, &agent_job_id.to_string()).await;
         assert!(
             status.is_success() || status == StatusCode::NO_CONTENT,
             "broker complete should succeed: {status}"

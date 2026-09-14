@@ -1,0 +1,29 @@
+name: 210-service-containers-health
+on: workflow_dispatch
+jobs:
+  with-services:
+    runs-on: self-hosted
+    services:
+      redis:
+        image: "redis:7-alpine"
+        ports: ["6379:6379"]
+        options: "--health-cmd \"redis-cli ping\" --health-interval 5s --health-timeout 3s --health-retries 10"
+      httpbin:
+        image: "kennethreitz/httpbin"
+        ports: ["8080:80"]
+    steps:
+
+
+
+
+
+
+      - name: "probe services"
+        run: |
+          for i in $(seq 1 30); do
+            if (echo > /dev/tcp/127.0.0.1/6379) 2>/dev/null; then break; fi
+            sleep 1
+          done
+          echo "redis reachable"
+      - name: "env check"
+        run: "env | grep -E 'REDIS_SERVICE|HTTPBIN_SERVICE' | sort"

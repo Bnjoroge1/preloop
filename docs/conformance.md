@@ -195,6 +195,83 @@ mitmproxy, the official runner cache, Rust toolchain, and `gh`, and
 CLIs (`codex`, `claude`) are installed; otherwise the tiered PRs surface the
 specs for human implementation.
 
+## Recovered v2.337.0 MITM scenarios
+
+The v2.337.0 capture set contains four cells under
+`.runner-watch/golden/v2.337.0/`: `gh-official` (27), `gh-preloop` (11),
+`pl-official` (19), and `pl-preloop` (27). `gh-official` is the cell used by
+the reconstruction and replay gate: its 27 captures all contain a populated
+`acquirejob` response. The other cells remain comparison material; they are
+not silently presented as official-runner provenance.
+
+`benchmarks/conformance/targets.toml` is the single CI target list. The
+conformance workflow starts one replay server and iterates that list, currently
+replaying v2.336.0 plus the recovered v2.337.0 `gh-official` cell. Adding a
+future version is one target entry, not another workflow job.
+
+`experiments/mitm/bin/reconstruct_scenario.py` decodes the first populated
+`acquirejob` response and emits the workflow plus the standard submit/wait
+`scenario.toml`. It recovers job/step names, conditions, environment maps,
+outputs, containers/services, action references, and script bodies. Script
+expressions are rebuilt from the runner's `format(...)` template, including
+`{{`/`}}` brace unescaping. Source-span line numbers are honored whenever the
+inferred YAML structure is still before the token; inferred `on`, job IDs,
+`runs-on`, `jobs`, and `steps` keys have no acquirejob source token. When a
+multiline body or inferred structure has already consumed a token's line, the
+generator emits that field at the next available line and reports the shift.
+Comments and original scalar/flow formatting are unavailable.
+
+The checker accepts the recorded count either with or without the single
+`mitm.it` connectivity probe; the v2.337.0 summaries are not uniform about
+whether that probe is included.
+
+Per-scenario recovery gaps:
+
+| Scenario | Not recoverable or inferred |
+|---|---|
+| `201-expression-edge-cases` | `on` trigger; comments/formatting |
+| `202-dynamic-matrix-dataflow` | trigger; matrix definition before expansion; seven other expanded jobs; comments/formatting |
+| `203-needs-dag-deep-chain` | trigger; `needs` DAG and matrix definition; other jobs/cells; comments/formatting |
+| `204-composite-with-outputs-ifs` | trigger; composite action implementation; comments/formatting |
+| `205-reusable-workflow-chain` | trigger; reusable child workflow and dispatch inputs; second job; comments/formatting |
+| `206-cache-artifact-roundtrip` | trigger; second consumer job; action internals; comments/formatting |
+| `207-masking-secrets-vars` | trigger; secret/variable declarations and values; comments/formatting |
+| `208-timeout-graceful-kill` | trigger; second cancelled job and concurrency behavior; comments/formatting |
+| `209-continue-on-error-cascade` | trigger; second job's job-level `continue-on-error`; comments/formatting |
+| `210-service-containers-health` | trigger; original service-map formatting and implicit service environment details; comments/formatting |
+| `211-job-container-volumes` | trigger; second container job; source formatting for container/volume declarations; comments/formatting |
+| `212-docker-action` | trigger; local Docker action implementation; comments/formatting |
+| `213-oidc-token-claims` | trigger; permissions/id-token declaration and local runner script details; comments/formatting |
+| `214-checkout-repo-inspect` | trigger; nested local actions and repository contents; comments/formatting |
+| `215-concurrency-cancel-in-progress` | trigger; concurrency group declaration and any unobserved run; comments/formatting |
+| `216-summaries-env-cascade` | trigger; comments/formatting |
+| `217-shell-variants` | trigger; comments/formatting |
+| `218-node-migration` | trigger; second job and local Node action implementation; comments/formatting |
+| `219-env-state-files` | trigger; comments/formatting |
+| `220-label-routing` | trigger; second job and exact runner-label/group declarations; comments/formatting |
+| `221-failure-reporting` | trigger; second reporter job; comments/formatting |
+| `222-dispatch-inputs-typed` | trigger; typed dispatch-input declarations and matrix definition; second expanded cell; comments/formatting |
+| `223-tojson-contexts` | trigger; comments/formatting |
+| `224-matrix-include-exclude` | trigger; matrix include/exclude definition; other expanded cells and fail-fast ordering; comments/formatting |
+| `225-docker-build-run` | trigger; comments/formatting |
+| `226-multiline-outputs` | trigger; consumer job; comments/formatting |
+| `227-composite-pre-post` | trigger; second job; composite action implementation and pre/post source; comments/formatting |
+
+`on: workflow_dispatch` is an inference from the corpus convention, not a
+fact present in acquirejob. Likewise, an expanded acquirejob payload cannot
+prove the pre-expansion `strategy.matrix`, jobs that never ran, permissions,
+concurrency declarations, or comments.
+
+The ownership check is intentionally limited to the first populated
+`acquirejob` payload used for each reconstructed workflow; matrix and
+multi-job captures contain additional expanded payloads that the one-job
+reconstruction does not claim to reproduce. A reconstructed workflow agrees
+with that payload by construction, so the “declared job” invariant is
+circular for these 27 scenarios and does **not** establish that a capture is
+uncontaminated. The plan-GUID uniqueness check is independent and remains
+meaningful. These artifacts must not be described as equivalent provenance to
+the 39 genuinely recorded v2.336.0 scenarios.
+
 ## Layer 2: replayed wire using the goldens
 
 `.runner-watch/golden/v2.335.1/` holds **23 scenario captures** from the

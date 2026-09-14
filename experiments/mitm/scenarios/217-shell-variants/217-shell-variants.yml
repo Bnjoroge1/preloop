@@ -1,0 +1,29 @@
+name: 217-shell-variants
+on: workflow_dispatch
+jobs:
+  shells:
+    runs-on: self-hosted
+    steps:
+      - name: "bash-e"
+        shell: "bash"
+        run: |
+          set -e
+          false
+          echo "unreachable"
+      - name: "sh"
+        shell: "sh"
+        run: "echo \"posix sh works\""
+      - name: "python"
+        shell: "python"
+        run: |
+          import sys, platform
+          print("python", sys.version.split()[0], platform.machine())
+      - name: "multiline-fail"
+        shell: "bash -e {0}"
+        continue-on-error: true
+        run: |
+          echo one
+          exit 4
+      - name: "after"
+        if: "always()"
+        run: "echo \"outcome of previous=${{ job.status }}\""

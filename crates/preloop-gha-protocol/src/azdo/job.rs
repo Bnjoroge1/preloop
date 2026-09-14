@@ -322,10 +322,13 @@ pub fn number_from_template_token(value: &serde_json::Value) -> Option<u64> {
 }
 
 /// Deployment environment metadata (`actionsEnvironment`).
+///
+/// `url` is explicit `null` when the workflow does not define a deployment
+/// URL; the official runner keeps that member in the response shape.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, Default)]
 pub struct ActionsEnvironment {
     pub name: String,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[serde(default)]
     pub url: Option<serde_json::Value>,
 }
 

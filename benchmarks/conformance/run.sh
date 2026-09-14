@@ -3,9 +3,6 @@ set -euo pipefail
 
 ROOT="$(cd "$(dirname "$0")/../.." && pwd)"
 cd "$ROOT"
-RUNNER_VERSION="$(
-  python3 -c 'import tomllib; print(tomllib.load(open("versions.toml", "rb"))["runner_version"])'
-)"
 STATE_DIR="$(mktemp -d "${TMPDIR:-/tmp}/preloop-conform.XXXXXX")"
 SERVER_LOG="$STATE_DIR/server.log"
 SERVER_PID=""
@@ -33,7 +30,40 @@ cleanup() {
 }
 trap cleanup EXIT
 
-python3 benchmarks/conformance/check_corpus.py
+TARGETS="$(
+  python3 -c '
+import tomllib
+from pathlib import Path
+
+config = tomllib.loads(Path("benchmarks/conformance/targets.toml").read_text())
+for target in config["targets"]:
+    print("|".join((
+        target["runner_version"],
+        target.get("cell", ""),
+        target.get("scenario_prefix", ""),
+        "1" if target.get("validate_ownership", False) else "0",
+        ",".join(target.get("exclude_prefix", [])),
+    )))
+'
+)"
+
+while IFS='|' read -r runner_version cell scenario_prefix validate_ownership exclude_prefix; do
+  [[ -z "$runner_version" ]] && continue
+  check_args=(
+    --version "$runner_version"
+    --golden-root ".runner-watch/golden/v$runner_version"
+  )
+  [[ -n "$cell" ]] && check_args+=(--cell "$cell")
+  [[ -n "$scenario_prefix" ]] && check_args+=(--scenario-prefix "$scenario_prefix")
+  if [[ -n "$exclude_prefix" ]]; then
+    IFS=',' read -ra excluded <<< "$exclude_prefix"
+    for prefix in "${excluded[@]}"; do
+      check_args+=(--exclude-prefix "$prefix")
+    done
+  fi
+  [[ "$validate_ownership" == "1" ]] && check_args+=(--validate-ownership)
+  python3 benchmarks/conformance/check_corpus.py "${check_args[@]}"
+done <<< "$TARGETS"
 
 # The CI recipe already runs the workspace tests. Standalone conformance builds
 # only the server it executes; runner-watch is told not to repeat the suite.
@@ -68,36 +98,20 @@ done
 curl -fsS "$REPLAY_URL/healthz" >/dev/null ||
   { cat "$SERVER_LOG" >&2; echo "conform: replay server not ready" >&2; exit 1; }
 
-# Official runner -> GitHub is the committed golden. Replaying every request
-# into the current server establishes official runner -> Preloop and performs
-# runner-watch's strict normalized endpoint/status/header/body-schema diff.
-cargo run --quiet -p runner-watch -- conform --runner "v$RUNNER_VERSION" \
-  --preloop-url "$REPLAY_URL" --skip-cargo-test
-
-# The v2.337.0 `gh-official` captures were committed without the scenario
-# manifests they replay from (`experiments/mitm/scenarios/2xx-*/scenario.toml`
-# has never existed in any commit), so this cell errors on the first
-# scenario. It went unnoticed because `set -e` aborted at the v2.336.0 gate
-# above long before reaching here. Replay it only when its definitions are
-# present, and say so loudly otherwise rather than reporting a pass that
-# covered 36 scenarios and silently skipped 27.
-GH_OFFICIAL_ROOT=".runner-watch/golden/v2.337.0/gh-official"
-if [[ -d "$GH_OFFICIAL_ROOT" ]]; then
-  missing=0
-  for capture in "$GH_OFFICIAL_ROOT"/*/; do
-    scenario="$(basename "$capture")"
-    [[ -f "experiments/mitm/scenarios/$scenario/scenario.toml" ]] || missing=$((missing + 1))
-  done
-  if [[ $missing -gt 0 ]]; then
-    echo "conform: SKIPPING v2.337.0/gh-official — $missing capture(s) have no" >&2
-    echo "conform: scenario manifest under experiments/mitm/scenarios/." >&2
-    echo "conform: commit the definitions to bring this cell back into the gate." >&2
-  else
-    cargo run --quiet -p runner-watch -- conform --runner "2.337.0/gh-official" \
-      --preloop-url "$REPLAY_URL" --skip-cargo-test
-  fi
-fi
-
+# Each target uses the same throwaway server; reports remain isolated under
+# .runner-watch/conformance/v<version>.
+while IFS='|' read -r runner_version cell scenario_prefix validate_ownership exclude_prefix; do
+  [[ -z "$runner_version" ]] && continue
+  echo "conform: replaying runner v$runner_version${cell:+ ($cell)}"
+  conform_args=(
+    cargo run --quiet -p runner-watch -- conform
+    --runner "v$runner_version"
+    --preloop-url "$REPLAY_URL"
+    --skip-cargo-test
+  )
+  [[ -n "$cell" ]] && conform_args+=(--cell "$cell")
+  "${conform_args[@]}"
+done <<< "$TARGETS"
 kill "$SERVER_PID" >/dev/null 2>&1 || true
 wait "$SERVER_PID" >/dev/null 2>&1 || true
 SERVER_PID=""
