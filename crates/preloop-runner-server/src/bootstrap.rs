@@ -1809,6 +1809,55 @@ mod tests {
     use super::*;
     use tokio::io::AsyncWriteExt as _;
 
+    #[test]
+    fn pool_busy_counts_only_pool_proven_busy_runners() {
+        // Regression: `PoolSnapshot.busy` had no writer, so `preloop status`
+        // always showed `pool busy: 0` even while pool machines ran jobs. The
+        // server now derives it from pool-proven runners holding an active
+        // session request; external busy runners must not inflate it.
+        use preloop_gha_protocol::{RunnerSession, SessionId};
+
+        let mut inner = InnerState {
+            pool_assignments_enabled: true,
+            ..Default::default()
+        };
+        let add_busy_runner = |inner: &mut InnerState, id: i64, pool_proven: bool| {
+            inner.runners.insert(
+                id,
+                RegisteredRunner {
+                    id,
+                    name: format!("runner-{id}"),
+                    labels: vec!["self-hosted".to_owned()],
+                    ephemeral: true,
+                    public_key: None,
+                    runner_group_id: None,
+                    runner_group_name: None,
+                },
+            );
+            let session_id = format!("sess-{id}");
+            inner.sessions.insert(
+                session_id.clone(),
+                RunnerSession {
+                    session_id: SessionId::new(),
+                    runner_id: id,
+                },
+            );
+            inner.session_active_requests.insert(session_id, id);
+            if pool_proven {
+                inner.pool_proven_runners.insert(id);
+            }
+        };
+        add_busy_runner(&mut inner, 7, true);
+        add_busy_runner(&mut inner, 8, false);
+
+        let inputs = collect_snapshot_inputs(&inner);
+        assert_eq!(inputs.runner_busy, 2, "both runners hold an active request");
+        assert_eq!(
+            inputs.pool_busy, 1,
+            "only the pool-proven runner counts toward pool busy"
+        );
+    }
+
     #[tokio::test]
     async fn incomplete_unix_http_message_is_a_routine_disconnect() {
         use hyper_util::rt::{TokioExecutor, TokioIo};
