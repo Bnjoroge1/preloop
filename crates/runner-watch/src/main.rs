@@ -2219,6 +2219,8 @@ async fn replay_flows_to_preloop_inner(
     let mut count = 0usize;
     let mut broker_job_ids: HashMap<String, String> = HashMap::new();
     let mut plan_job_ids: HashMap<(String, String), (String, String)> = HashMap::new();
+    let mut plan_ids: HashMap<String, String> = HashMap::new();
+    let mut runtime_tokens = ReplayRuntimeTokens::default();
     let mut session_ids: HashMap<String, String> = HashMap::new();
     let mut official_broker_job_ids = Vec::new();
     let mut preloop_broker_job_ids = Vec::new();
@@ -2269,6 +2271,7 @@ async fn replay_flows_to_preloop_inner(
                 }
             }
         }
+        path = rewrite_replay_plan_ids(&path, &plan_ids);
         if is_external_blob_upload(method, host) {
             if let Some(upload_url) = blob_upload_urls.pop_front() {
                 replay_blob_upload(client, &upload_url, &flow).await?;
@@ -2285,6 +2288,27 @@ async fn replay_flows_to_preloop_inner(
             .await?;
         baseline.write_all(b"\n").await?;
         let url = format!("{}{}", preloop_url.trim_end_matches('/'), path);
+        let mut replay_body = replay_request_body(&flow)?;
+        if let Some(body) = replay_body.as_mut() {
+            rewrite_replay_body(
+                body,
+                &broker_job_ids,
+                &plan_ids,
+                &plan_job_ids,
+                replay_runner_id,
+            );
+        }
+        let body_json = replay_body
+            .as_deref()
+            .and_then(|body| serde_json::from_slice::<Value>(body).ok());
+        let auth_token = replay_auth_token(
+            method,
+            &path,
+            body_json.as_ref(),
+            native_token,
+            &broker_token,
+            &runtime_tokens,
+        )?;
         let mut req = client.request(Method::from_bytes(method.as_bytes())?, &url);
         let mut saw_auth = false;
         if let Some(headers) = flow.get("request_headers").and_then(Value::as_array) {
@@ -2315,18 +2339,16 @@ async fn replay_flows_to_preloop_inner(
                 if name.eq_ignore_ascii_case("authorization") {
                     saw_auth = true;
                 }
-                let header_value =
-                    rewritten_header_value(name, value, &path, native_token, &broker_token);
+                let header_value = rewritten_header_value(name, value, &path, auth_token);
                 req = req.header(name, header_value.as_ref());
             }
         }
         if !saw_auth {
-            if let Some(auth) = synthesized_authorization(&path, native_token, &broker_token) {
+            if let Some(auth) = synthesized_authorization(&path, auth_token) {
                 req = req.header("Authorization", auth.as_ref());
             }
         }
-        if let Some(mut body) = replay_request_body(&flow)? {
-            rewrite_replay_body(&mut body, &broker_job_ids, replay_runner_id);
+        if let Some(body) = replay_body {
             req = req.body(body);
         }
         let official_runner_request_id = extract_runner_request_id_from_message(
@@ -2355,6 +2377,7 @@ async fn replay_flows_to_preloop_inner(
                 captured["status"] = json!(status);
                 captured["response_headers"] = json!(headers);
                 if let Ok(body_json) = serde_json::from_str::<Value>(&text) {
+                    let mut runtime_token = None;
                     if path.ends_with("/sessions") {
                         if let (Some(official_id), Some(local_id)) = (
                             flow.pointer("/response_body_json/sessionId")
@@ -2375,30 +2398,35 @@ async fn replay_flows_to_preloop_inner(
                         &preloop_broker_job_ids,
                         &mut broker_job_ids,
                     );
-                    // Extract plan/job IDs from acquirejob responses for OIDC path mapping
-                    if path.contains("/acquirejob") {
+                    // Extract local IDs and the server-issued runtime token from
+                    // successful acquirejob responses. Lifecycle and results
+                    // calls must never fall back to the listener credential.
+                    if path.ends_with("/acquirejob") && (200..300).contains(&status) {
                         let official_resp = flow.get("response_body_json").unwrap_or(&Value::Null);
-                        if let (Some(op), Some(oj), Some(lp), Some(lj)) = (
-                            official_resp
-                                .get("plan")
-                                .and_then(|p| p.get("planId"))
-                                .and_then(Value::as_str)
-                                .or_else(|| official_resp.get("planId").and_then(Value::as_str)),
-                            official_resp.get("jobId").and_then(Value::as_str),
-                            body_json
-                                .get("plan")
-                                .and_then(|p| p.get("planId"))
-                                .and_then(Value::as_str)
-                                .or_else(|| body_json.get("planId").and_then(Value::as_str)),
-                            body_json.get("jobId").and_then(Value::as_str),
-                        ) {
-                            plan_job_ids
-                                .entry((op.to_owned(), oj.to_owned()))
-                                .or_insert_with(|| (lp.to_owned(), lj.to_owned()));
-                            broker_job_ids
-                                .entry(oj.to_owned())
-                                .or_insert_with(|| lj.to_owned());
-                        }
+                        let (op, oj) = acquire_job_ids(official_resp).ok_or_else(|| {
+                            anyhow!("acquirejob response is missing planId/jobId")
+                        })?;
+                        let (lp, lj) = acquire_job_ids(&body_json).ok_or_else(|| {
+                            anyhow!("local acquirejob response is missing planId/jobId")
+                        })?;
+                        plan_ids
+                            .entry(op.to_owned())
+                            .or_insert_with(|| lp.to_owned());
+                        plan_job_ids
+                            .entry((op.to_owned(), oj.to_owned()))
+                            .or_insert_with(|| (lp.to_owned(), lj.to_owned()));
+                        broker_job_ids
+                            .entry(oj.to_owned())
+                            .or_insert_with(|| lj.to_owned());
+                        let token = extract_system_vss_access_token(&body_json)
+                            .map(str::to_owned)
+                            .ok_or_else(|| {
+                                anyhow!(
+                                    "acquirejob response is missing a SystemVssConnection runtime token"
+                                )
+                            })?;
+                        runtime_tokens.insert(lp.to_owned(), lj.to_owned(), token.clone());
+                        runtime_token = Some(token);
                     }
                     if is_blob_create_endpoint(&path) {
                         if let Some(upload_url) = body_json
@@ -2409,13 +2437,15 @@ async fn replay_flows_to_preloop_inner(
                             blob_upload_urls.push_back(upload_url.to_owned());
                         }
                     }
-                    captured["response_body_json"] = body_json;
+                    let mut captured_body = body_json;
+                    redact_replay_credentials(&mut captured_body, runtime_token.as_deref());
+                    captured["response_body_json"] = captured_body;
                 } else if text.trim().is_empty() {
                     // Empty body (e.g. 204 No Content) — store as null so
                     // comparison tool sees null instead of substituting {}.
                     captured["response_body_json"] = Value::Null;
                 } else {
-                    captured["response_body"] = json!(text);
+                    captured["response_body"] = json!(redact_replay_text(&text, None));
                 }
             }
             Err(error) => {
@@ -2568,6 +2598,249 @@ fn extract_runner_request_id_from_message(message: &Value) -> Option<String> {
         .map(str::to_owned)
 }
 
+#[derive(Debug, Default)]
+struct ReplayRuntimeTokens {
+    by_job: HashMap<(String, String), String>,
+    active_job: Option<(String, String)>,
+}
+
+impl ReplayRuntimeTokens {
+    fn insert(&mut self, plan_id: String, job_id: String, token: String) {
+        let key = (plan_id, job_id);
+        self.by_job.insert(key.clone(), token);
+        self.active_job = Some(key);
+    }
+
+    fn active_token(&self) -> Option<&str> {
+        self.active_job
+            .as_ref()
+            .and_then(|key| self.by_job.get(key))
+            .map(String::as_str)
+    }
+
+    fn token_for_plan(&self, plan_id: &str) -> Option<&str> {
+        if let Some(key) = self.active_job.as_ref() {
+            if key.0 == plan_id {
+                return self.by_job.get(key).map(String::as_str);
+            }
+        }
+        let mut matches = self
+            .by_job
+            .iter()
+            .filter(|((candidate_plan, _), _)| candidate_plan == plan_id);
+        let (_, token) = matches.next()?;
+        if matches.next().is_some() {
+            None
+        } else {
+            Some(token.as_str())
+        }
+    }
+}
+
+fn acquire_job_ids(response: &Value) -> Option<(&str, &str)> {
+    let plan_id = response
+        .get("plan")
+        .and_then(|plan| plan.get("planId"))
+        .and_then(Value::as_str)
+        .or_else(|| response.get("planId").and_then(Value::as_str))?;
+    let job_id = response.get("jobId").and_then(Value::as_str)?;
+    Some((plan_id, job_id))
+}
+
+fn extract_system_vss_access_token(response: &Value) -> Option<&str> {
+    let endpoints = response.pointer("/resources/endpoints")?.as_array()?;
+    let endpoint = endpoints.iter().find(|endpoint| {
+        endpoint
+            .get("name")
+            .and_then(Value::as_str)
+            .is_some_and(|name| name.eq_ignore_ascii_case("SystemVssConnection"))
+    })?;
+    endpoint
+        .get("authorization")?
+        .get("parameters")?
+        .as_object()?
+        .iter()
+        .find(|(name, value)| {
+            name.eq_ignore_ascii_case("AccessToken")
+                && value
+                    .as_str()
+                    .is_some_and(|token| !token.is_empty() && token != "***REDACTED***")
+        })
+        .and_then(|(_, value)| value.as_str())
+}
+
+fn redact_replay_credentials(value: &mut Value, exact_token: Option<&str>) {
+    fn redact(value: &mut Value, sensitive: bool, exact_token: Option<&str>) {
+        match value {
+            Value::Object(object) => {
+                let object_is_secret = object
+                    .get("isSecret")
+                    .and_then(Value::as_bool)
+                    .unwrap_or(false);
+                for (key, value) in object {
+                    let key_is_secret = key.eq_ignore_ascii_case("accessToken")
+                        || key.eq_ignore_ascii_case("access_token")
+                        || key.eq_ignore_ascii_case("token");
+                    redact(
+                        value,
+                        sensitive || object_is_secret || key_is_secret,
+                        exact_token,
+                    );
+                }
+            }
+            Value::Array(values) => {
+                for value in values {
+                    redact(value, sensitive, exact_token);
+                }
+            }
+            Value::String(text)
+                if sensitive
+                    || exact_token.is_some_and(|token| token == text)
+                    || looks_like_jwt(text) =>
+            {
+                *text = "***REDACTED***".to_owned();
+            }
+            _ => {}
+        }
+    }
+
+    redact(value, false, exact_token);
+}
+
+fn looks_like_jwt(value: &str) -> bool {
+    value.starts_with("eyJ") && value.split('.').count() == 3
+}
+
+fn redact_replay_text(value: &str, exact_token: Option<&str>) -> String {
+    exact_token.map_or_else(
+        || value.to_owned(),
+        |token| value.replace(token, "***REDACTED***"),
+    )
+}
+
+fn extract_replay_job_key(body: &Value) -> Option<(String, String)> {
+    let plan_id = ["planId", "workflow_run_backend_id"]
+        .iter()
+        .find_map(|key| body.get(*key).and_then(Value::as_str))
+        .filter(|value| !value.is_empty())?;
+    let job_id = ["jobId", "workflow_job_run_backend_id"]
+        .iter()
+        .find_map(|key| body.get(*key).and_then(Value::as_str))
+        .filter(|value| !value.is_empty())?;
+    Some((plan_id.to_owned(), job_id.to_owned()))
+}
+
+fn body_mentions_replay_job_identity(body: &Value) -> bool {
+    [
+        "planId",
+        "jobId",
+        "workflow_run_backend_id",
+        "workflow_job_run_backend_id",
+    ]
+    .iter()
+    .any(|key| body.get(*key).and_then(Value::as_str).is_some())
+}
+
+fn extract_oidc_job_key(path: &str) -> Option<(String, String)> {
+    let rest = path.split_once("/plans/")?.1;
+    let mut parts = rest.split('/');
+    let plan_id = parts.next()?.split('?').next()?.to_owned();
+    if parts.next()? != "jobs" {
+        return None;
+    }
+    let job_id = parts.next()?.split('?').next()?.to_owned();
+    (!plan_id.is_empty() && !job_id.is_empty()).then_some((plan_id, job_id))
+}
+
+fn reporting_plan_id(path: &str) -> Option<&str> {
+    if let Some(rest) = path.split_once("/_apis/v1/plans/").map(|(_, rest)| rest) {
+        return rest.split('/').next().filter(|id| !id.is_empty());
+    }
+    for prefix in [
+        "/_apis/v1/Timeline/",
+        "/_apis/v1/Logfiles/",
+        "/_apis/v1/TimeLineWebConsoleLog/",
+        "/_apis/v1/FinishJob/",
+    ] {
+        if let Some(rest) = path.split_once(prefix).map(|(_, rest)| rest) {
+            return rest.split('/').nth(2).filter(|id| !id.is_empty());
+        }
+    }
+    None
+}
+
+fn runtime_token_for_job_body<'a>(
+    body: Option<&Value>,
+    runtime_tokens: &'a ReplayRuntimeTokens,
+    path: &str,
+) -> anyhow::Result<&'a str> {
+    let key = body.and_then(extract_replay_job_key).ok_or_else(|| {
+        anyhow!("replay request {path} requires a plan/job runtime-token identity")
+    })?;
+    runtime_tokens
+        .by_job
+        .get(&key)
+        .map(String::as_str)
+        .ok_or_else(|| {
+            anyhow!(
+                "replay request {path} has no acquired runtime token for plan {} job {}",
+                key.0,
+                key.1
+            )
+        })
+}
+
+fn runtime_token_for_oidc_path<'a>(
+    path: &str,
+    runtime_tokens: &'a ReplayRuntimeTokens,
+) -> anyhow::Result<&'a str> {
+    let key = extract_oidc_job_key(path)
+        .ok_or_else(|| anyhow!("OIDC replay request {path} has no plan/job identity"))?;
+    runtime_tokens
+        .by_job
+        .get(&key)
+        .map(String::as_str)
+        .ok_or_else(|| anyhow!("OIDC replay request {path} has no acquired runtime token"))
+}
+
+fn runtime_token_for_twirp_body<'a>(
+    body: Option<&Value>,
+    runtime_tokens: &'a ReplayRuntimeTokens,
+    path: &str,
+) -> anyhow::Result<&'a str> {
+    if let Some(body) = body {
+        if let Some(key) = extract_replay_job_key(body) {
+            return runtime_tokens
+                .by_job
+                .get(&key)
+                .map(String::as_str)
+                .ok_or_else(|| {
+                    anyhow!("Results replay request {path} has no acquired runtime token")
+                });
+        }
+        if body_mentions_replay_job_identity(body) {
+            bail!("Results replay request {path} has an incomplete plan/job identity");
+        }
+    }
+    runtime_tokens
+        .active_token()
+        .ok_or_else(|| anyhow!("Results replay request {path} has no active runtime token"))
+}
+
+fn runtime_token_for_reporting_path<'a>(
+    path: &str,
+    runtime_tokens: &'a ReplayRuntimeTokens,
+) -> anyhow::Result<&'a str> {
+    if let Some(plan_id) = reporting_plan_id(path) {
+        return runtime_tokens
+            .token_for_plan(plan_id)
+            .ok_or_else(|| anyhow!("reporting replay request {path} has no runtime token"));
+    }
+    runtime_tokens
+        .active_token()
+        .ok_or_else(|| anyhow!("reporting replay request {path} has no active runtime token"))
+}
+
 fn sync_broker_job_id_map(
     official_broker_job_ids: &[String],
     preloop_broker_job_ids: &[String],
@@ -2583,12 +2856,57 @@ fn sync_broker_job_id_map(
 fn rewrite_replay_body(
     body: &mut Vec<u8>,
     broker_job_ids: &HashMap<String, String>,
+    plan_ids: &HashMap<String, String>,
+    plan_job_ids: &HashMap<(String, String), (String, String)>,
     replay_runner_id: i64,
 ) {
     let Ok(mut json_body) = serde_json::from_slice::<Value>(body) else {
         return;
     };
-    for key in ["jobMessageId", "jobId", "runnerRequestId"] {
+    // Broker lifecycle and Results requests carry a plan/job pair. Their
+    // jobId is the acquired agent job ID, not the runner request ID used by
+    // jobMessageId and runnerRequestId, so prefer the pair correlation.
+    if let (Some(official_plan), Some(official_job)) = (
+        json_body.get("planId").and_then(Value::as_str),
+        json_body.get("jobId").and_then(Value::as_str),
+    ) {
+        if let Some((local_plan, local_job)) =
+            plan_job_ids.get(&(official_plan.to_owned(), official_job.to_owned()))
+        {
+            json_body["planId"] = json!(local_plan);
+            json_body["jobId"] = json!(local_job);
+        }
+    }
+    if let (Some(official_plan), Some(official_job)) = (
+        json_body
+            .get("workflow_run_backend_id")
+            .and_then(Value::as_str),
+        json_body
+            .get("workflow_job_run_backend_id")
+            .and_then(Value::as_str),
+    ) {
+        if let Some((local_plan, local_job)) =
+            plan_job_ids.get(&(official_plan.to_owned(), official_job.to_owned()))
+        {
+            json_body["workflow_run_backend_id"] = json!(local_plan);
+            json_body["workflow_job_run_backend_id"] = json!(local_job);
+        }
+    }
+    for key in ["planId", "workflow_run_backend_id"] {
+        let Some(current) = json_body.get(key).and_then(Value::as_str) else {
+            continue;
+        };
+        let Some(rewritten) = plan_ids.get(current) else {
+            continue;
+        };
+        json_body[key] = json!(rewritten);
+    }
+    for key in [
+        "jobMessageId",
+        "jobId",
+        "runnerRequestId",
+        "workflow_job_run_backend_id",
+    ] {
         let Some(current) = json_body.get(key).and_then(Value::as_str) else {
             continue;
         };
@@ -2902,27 +3220,62 @@ fn rewrite_replay_session_ids(path: &str, session_ids: &HashMap<String, String>)
         })
 }
 
-fn synthesized_authorization<'a>(
+fn rewrite_replay_plan_ids(path: &str, plan_ids: &HashMap<String, String>) -> String {
+    plan_ids
+        .iter()
+        .fold(path.to_owned(), |rewritten, (official, local)| {
+            rewritten.replace(official, local)
+        })
+}
+
+fn replay_auth_token<'a>(
+    method: &str,
     path: &str,
+    body: Option<&Value>,
     bearer: &'a str,
     broker_token: &'a str,
+    runtime_tokens: &'a ReplayRuntimeTokens,
+) -> anyhow::Result<Option<&'a str>> {
+    if path == "/api/v3/actions/runner-registration" {
+        return Ok(None);
+    }
+    let listener_token = if broker_token.is_empty() {
+        bearer
+    } else {
+        broker_token
+    };
+    if path.starts_with("/broker/") {
+        if path.ends_with("/renewjob") || path.ends_with("/completejob") {
+            return runtime_token_for_job_body(body, runtime_tokens, path).map(Some);
+        }
+        return Ok(Some(listener_token));
+    }
+    if is_oidc_path(path) {
+        return runtime_token_for_oidc_path(path, runtime_tokens).map(Some);
+    }
+    if path.starts_with("/twirp/") {
+        return runtime_token_for_twirp_body(body, runtime_tokens, path).map(Some);
+    }
+    if is_reporting_path(path) {
+        return runtime_token_for_reporting_path(path, runtime_tokens).map(Some);
+    }
+    if is_listener_path(method, path) {
+        return Ok(Some(listener_token));
+    }
+    if path.starts_with("/runner/server/_apis/") || path.starts_with("/_apis/") {
+        return Ok(Some(bearer));
+    }
+    Ok(None)
+}
+
+fn synthesized_authorization<'a>(
+    path: &str,
+    auth_token: Option<&'a str>,
 ) -> Option<std::borrow::Cow<'a, str>> {
     if path == "/api/v3/actions/runner-registration" {
         Some(std::borrow::Cow::Borrowed("RemoteAuth replay-token"))
-    } else if path.starts_with("/broker/") {
-        let token = if broker_token.is_empty() {
-            bearer
-        } else {
-            broker_token
-        };
-        Some(std::borrow::Cow::Owned(format!("Bearer {token}")))
-    } else if path.starts_with("/runner/server/_apis/")
-        || path.starts_with("/_apis/")
-        || path.starts_with("/twirp/")
-    {
-        Some(std::borrow::Cow::Owned(format!("Bearer {bearer}")))
     } else {
-        None
+        auth_token.map(|token| std::borrow::Cow::Owned(format!("Bearer {token}")))
     }
 }
 
@@ -2930,29 +3283,41 @@ fn rewritten_header_value<'a>(
     name: &str,
     value: &'a str,
     path: &str,
-    bearer: &str,
-    broker_token: &str,
+    auth_token: Option<&str>,
 ) -> std::borrow::Cow<'a, str> {
-    if name.eq_ignore_ascii_case("authorization") && value == "***REDACTED***" {
+    if name.eq_ignore_ascii_case("authorization") {
         if path == "/api/v3/actions/runner-registration" {
             return std::borrow::Cow::Borrowed("RemoteAuth replay-token");
         }
-        if path.starts_with("/broker/") {
-            let token = if broker_token.is_empty() {
-                bearer
-            } else {
-                broker_token
-            };
+        if let Some(token) = auth_token {
             return std::borrow::Cow::Owned(format!("Bearer {token}"));
-        }
-        if path.starts_with("/runner/server/_apis/")
-            || path.starts_with("/_apis/")
-            || path.starts_with("/twirp/")
-        {
-            return std::borrow::Cow::Owned(format!("Bearer {bearer}"));
         }
     }
     std::borrow::Cow::Borrowed(value)
+}
+
+fn is_oidc_path(path: &str) -> bool {
+    path.contains("/oidctoken") || path.contains("/idtoken/")
+}
+
+fn is_listener_path(method: &str, path: &str) -> bool {
+    let endpoint = path.split('?').next().unwrap_or(path);
+    (endpoint.ends_with("/sessions") && method.eq_ignore_ascii_case("POST"))
+        || endpoint.contains("/sessions/")
+        || endpoint.contains("/messages")
+        || endpoint.contains("/v1/AgentRequest/")
+}
+
+fn is_reporting_path(path: &str) -> bool {
+    [
+        "/_apis/v1/Timeline/",
+        "/_apis/v1/Logfiles/",
+        "/_apis/v1/TimeLineWebConsoleLog/",
+        "/_apis/v1/plans/",
+        "/_apis/v1/FinishJob/",
+    ]
+    .iter()
+    .any(|prefix| path.contains(prefix))
 }
 fn should_skip_replay_path(host: &str, path: &str) -> bool {
     let is_control_plane =
@@ -3879,18 +4244,163 @@ mod tests {
     }
 
     #[test]
-    fn broker_replay_body_rewrites_captured_job_ids() {
-        let mut ids = HashMap::new();
-        ids.insert("official-job".to_string(), "preloop-job".to_string());
-        let mut body = br#"{"jobMessageId":"official-job","jobId":"official-job","runnerRequestId":"official-job","other":"kept"}"#.to_vec();
+    fn broker_replay_body_rewrites_captured_job_ids_and_result_ids() {
+        let ids = HashMap::from([("official-job".to_string(), "preloop-request".to_string())]);
+        let plans = HashMap::from([("official-plan".to_string(), "preloop-plan".to_string())]);
+        let plan_jobs = HashMap::from([(
+            ("official-plan".to_string(), "official-job".to_string()),
+            ("preloop-plan".to_string(), "preloop-job".to_string()),
+        )]);
+        let mut body = br#"{"jobMessageId":"official-job","jobId":"official-job","runnerRequestId":"official-job","planId":"official-plan","workflow_run_backend_id":"official-plan","workflow_job_run_backend_id":"official-job","other":"kept"}"#.to_vec();
 
-        rewrite_replay_body(&mut body, &ids, 1);
+        rewrite_replay_body(&mut body, &ids, &plans, &plan_jobs, 1);
 
         let body: Value = serde_json::from_slice(&body).unwrap();
-        assert_eq!(body["jobMessageId"], "preloop-job");
+        assert_eq!(body["jobMessageId"], "preloop-request");
         assert_eq!(body["jobId"], "preloop-job");
-        assert_eq!(body["runnerRequestId"], "preloop-job");
+        assert_eq!(body["runnerRequestId"], "preloop-request");
+        assert_eq!(body["planId"], "preloop-plan");
+        assert_eq!(body["workflow_run_backend_id"], "preloop-plan");
+        assert_eq!(body["workflow_job_run_backend_id"], "preloop-job");
         assert_eq!(body["other"], "kept");
+    }
+
+    #[test]
+    fn acquire_response_runtime_token_is_extracted_and_credentials_are_redacted() {
+        let mut response = json!({
+            "plan": {"planId": "local-plan"},
+            "jobId": "local-job",
+            "resources": {
+                "endpoints": [{
+                    "name": "SystemVssConnection",
+                    "authorization": {
+                        "parameters": {"AccessToken": "runtime-token"}
+                    }
+                }]
+            },
+            "variables": {
+                "system.github.token": {
+                    "value": "runtime-token",
+                    "isSecret": true
+                }
+            }
+        });
+
+        assert_eq!(
+            acquire_job_ids(&response),
+            Some(("local-plan", "local-job"))
+        );
+        assert_eq!(
+            extract_system_vss_access_token(&response),
+            Some("runtime-token")
+        );
+        redact_replay_credentials(&mut response, Some("runtime-token"));
+        assert_eq!(
+            response["resources"]["endpoints"][0]["authorization"]["parameters"]["AccessToken"],
+            "***REDACTED***"
+        );
+        assert_eq!(
+            response["variables"]["system.github.token"]["value"],
+            "***REDACTED***"
+        );
+        assert!(extract_system_vss_access_token(&response).is_none());
+    }
+
+    #[test]
+    fn replay_runtime_auth_routes_by_job_and_rejects_missing_tokens() {
+        let mut runtime_tokens = ReplayRuntimeTokens::default();
+        runtime_tokens.insert(
+            "local-plan".to_owned(),
+            "local-job".to_owned(),
+            "runtime-token".to_owned(),
+        );
+        let lifecycle_body = json!({"planId": "local-plan", "jobId": "local-job"});
+        let results_body = json!({
+            "workflow_run_backend_id": "local-plan",
+            "workflow_job_run_backend_id": "local-job"
+        });
+
+        assert_eq!(
+            replay_auth_token(
+                "POST",
+                "/broker/7/acquirejob",
+                None,
+                "native-token",
+                "listener-token",
+                &runtime_tokens,
+            )
+            .unwrap(),
+            Some("listener-token")
+        );
+        assert_eq!(
+            replay_auth_token(
+                "POST",
+                "/broker/7/renewjob",
+                Some(&lifecycle_body),
+                "native-token",
+                "listener-token",
+                &runtime_tokens,
+            )
+            .unwrap(),
+            Some("runtime-token")
+        );
+        assert_eq!(
+            replay_auth_token(
+                "POST",
+                "/twirp/results.services.receiver.Receiver/CreateStepLogsMetadata",
+                Some(&results_body),
+                "native-token",
+                "listener-token",
+                &runtime_tokens,
+            )
+            .unwrap(),
+            Some("runtime-token")
+        );
+        assert_eq!(
+            replay_auth_token(
+                "GET",
+                "/runner/server/_apis/distributedtask/hubs/actions/plans/local-plan/jobs/local-job/oidctoken",
+                None,
+                "native-token",
+                "listener-token",
+                &runtime_tokens,
+            )
+            .unwrap(),
+            Some("runtime-token")
+        );
+        assert_eq!(
+            replay_auth_token(
+                "GET",
+                "/runner/server/_apis/distributedtask/pools/1/messages?waitSeconds=0",
+                None,
+                "native-token",
+                "listener-token",
+                &runtime_tokens,
+            )
+            .unwrap(),
+            Some("listener-token")
+        );
+        assert_eq!(
+            replay_auth_token(
+                "DELETE",
+                "/runner/server/_apis/distributedtask/pools/1/sessions",
+                None,
+                "native-token",
+                "listener-token",
+                &runtime_tokens,
+            )
+            .unwrap(),
+            Some("native-token")
+        );
+        assert!(replay_auth_token(
+            "POST",
+            "/broker/7/completejob",
+            Some(&json!({"planId": "other-plan", "jobId": "other-job"})),
+            "native-token",
+            "listener-token",
+            &runtime_tokens,
+        )
+        .is_err());
     }
 
     #[test]
