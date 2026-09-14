@@ -21,7 +21,11 @@ jobs:
       - uses: actions/checkout@08c6903cd8c0fde910a37f88322edcfb5dd907a8 # v5.0.0
         with:
           persist-credentials: false
-          lfs: true
+          # `.runner-watch/golden/**` is the only LFS-tracked path in the repo
+          # and this job never reads it: `runner-conformance.py --mode light`
+          # works off `benchmarks/compatibility/runner/behavior`. `lfs: true`
+          # fetched the 365 MB corpus on every pull request for nothing.
+          lfs: false
       - name: Validate runner status responses
         run: python3 benchmarks/real-world/runner-conformance.py --mode light
       - name: Upload light report
@@ -45,7 +49,9 @@ jobs:
       - uses: actions/checkout@08c6903cd8c0fde910a37f88322edcfb5dd907a8 # v5.0.0
         with:
           persist-credentials: false
-          lfs: true
+          # Same as the light job: the deep batch replays live runners, not the
+          # committed golden captures.
+          lfs: false
       - name: Build current PR runner for smolVM
         run: cargo zigbuild -p preloop-runner --release --target x86_64-unknown-linux-musl
       - name: Run deep runner conformance
