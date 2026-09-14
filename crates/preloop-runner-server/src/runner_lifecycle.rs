@@ -357,7 +357,7 @@ pub(crate) async fn delete_session(
             "registration tokens cannot delete sessions",
         ));
     }
-    let snapshot = {
+    {
         let mut inner = shared.state.inner.lock().await;
         if let crate::auth::AdminCaller::Runner(runner_id) = caller {
             match inner.runner_id_for_session(&session_id) {
@@ -377,9 +377,9 @@ pub(crate) async fn delete_session(
     if let Err(error) = persist_full_state(&shared).await {
         tracing::warn!(?error, "failed to persist deleted runner session");
     }
+    shared.state.message_notify.notify_waiters();
     Ok(StatusCode::NO_CONTENT)
 }
-
 /// DELETE /runner/server/_apis/distributedtask/pools/:pool_id/agents/:agent_id
 /// Agent deregistration is idempotent for the management credential; a live
 /// runner listen token may only purge its own identity.
@@ -412,7 +412,7 @@ pub(crate) async fn purge_runner_identity_guarded(
     caller: crate::auth::AdminCaller,
     agent_id: i64,
 ) -> Result<(), ApiError> {
-    let snapshot = {
+    {
         let mut inner = shared.state.inner.lock().await;
         match caller {
             crate::auth::AdminCaller::System => {}
@@ -438,19 +438,18 @@ pub(crate) async fn purge_runner_identity_guarded(
             }
         }
         purge_runner_identity_locked(&mut inner, &shared.state, agent_id);
-        crate::store::StoreSnapshot::from_inner(&inner)
-    };
+    }
     // Persist before waking pollers: a restart between notify and persist
-    // would let the old snapshot restore the deleted runner. Notify is still
-    // unconditional so waiters observe the in-memory deletion even when the
-    // store write fails.
-    if let Err(error) = shared.state.store.store_inner(&snapshot).await {
+    // would let the old snapshot restore the deleted runner. The shared
+    // snapshot gate captures the latest state after this mutation, so a
+    // concurrent registration cannot be overwritten by this delete.
+    // Notify is still unconditional when the store write fails.
+    if let Err(error) = persist_full_state(shared).await {
         tracing::warn!(?error, "failed to persist deleted runner identity");
     }
     shared.state.message_notify.notify_waiters();
     Ok(())
 }
-
 /// Remove every trace of a runner identity: keys, client ids, sessions and
 /// assignments. Shared by agent deregistration and pool machine teardown.
 pub(crate) async fn purge_runner_identity(shared: &Arc<SharedState>, runner_id: i64) {
@@ -462,7 +461,7 @@ fn purge_runner_identity_locked(
     inner: &mut crate::state::InnerState,
     state: &AppState,
     runner_id: i64,
-) {
+) -> bool {
     if inner.runners.remove(&runner_id).is_none()
         && inner.runner_client_ids.values().all(|id| *id != runner_id)
     {
@@ -566,6 +565,10 @@ fn purge_runner_identity_locked(
                 .or_insert_with(std::time::SystemTime::now);
         }
     }
+    state
+        .queue_depth
+        .store(inner.queue.len(), std::sync::atomic::Ordering::Release);
+    runtime_scheduling::sync_next_job_labels(inner, &state.next_job_runs_on);
     true
 }
 
@@ -575,34 +578,29 @@ async fn purge_runner_identity_with_phantom_check(
     runner_id: i64,
     only_if_phantom: bool,
 ) -> bool {
-    let mut inner = shared.state.inner.lock().await;
-    if only_if_phantom {
-        let has_session = inner
-            .sessions
-            .values()
-            .any(|session| session.runner_id == runner_id)
-            || inner
-                .broker_session_runners
+    {
+        let mut inner = shared.state.inner.lock().await;
+        if only_if_phantom {
+            let has_session = inner
+                .sessions
                 .values()
-                .any(|id| *id == runner_id);
-        if has_session {
-            tracing::info!(
-                runner_id,
-                "runner established session before phantom purge; skipping cleanup"
-            );
+                .any(|session| session.runner_id == runner_id)
+                || inner
+                    .broker_session_runners
+                    .values()
+                    .any(|id| *id == runner_id);
+            if has_session {
+                tracing::info!(
+                    runner_id,
+                    "runner established session before phantom purge; skipping cleanup"
+                );
+                return false;
+            }
+        }
+        if !purge_runner_identity_locked(&mut inner, &shared.state, runner_id) {
             return false;
         }
     }
-    if !purge_runner_identity_locked(&mut inner, runner_id) {
-        return false;
-    }
-    shared
-        .state
-        .queue_depth
-        .store(inner.queue.len(), std::sync::atomic::Ordering::Release);
-    runtime_scheduling::sync_next_job_labels(&inner, &shared.state.next_job_runs_on);
-    let snapshot = crate::store::StoreSnapshot::from_inner(&inner);
-    drop(inner);
     if let Err(error) = persist_full_state(shared).await {
         tracing::warn!(
             runner_id,
@@ -616,10 +614,6 @@ async fn purge_runner_identity_with_phantom_check(
 
 pub(crate) async fn purge_phantom_runner(shared: &Arc<SharedState>, runner_id: i64) -> bool {
     purge_runner_identity_with_phantom_check(shared, runner_id, true).await
-}
-
-pub(crate) async fn purge_runner_identity(shared: &Arc<SharedState>, runner_id: i64) {
-    let _ = purge_runner_identity_with_phantom_check(shared, runner_id, false).await;
 }
 
 /// A server restart destroys every process-owned ephemeral VM. Their durable
@@ -639,16 +633,12 @@ pub(crate) async fn purge_restored_ephemeral_runners(shared: &Arc<SharedState>) 
         return;
     }
 
-    let mut inner = shared.state.inner.lock().await;
-    for runner_id in &runner_ids {
-        purge_runner_identity_locked(&mut inner, *runner_id);
+    {
+        let mut inner = shared.state.inner.lock().await;
+        for runner_id in &runner_ids {
+            purge_runner_identity_locked(&mut inner, &shared.state, *runner_id);
+        }
     }
-    shared
-        .state
-        .queue_depth
-        .store(inner.queue.len(), std::sync::atomic::Ordering::Release);
-    runtime_scheduling::sync_next_job_labels(&inner, &shared.state.next_job_runs_on);
-    drop(inner);
     if let Err(error) = persist_full_state(shared).await {
         tracing::warn!(
             count = runner_ids.len(),
@@ -661,7 +651,6 @@ pub(crate) async fn purge_restored_ephemeral_runners(shared: &Arc<SharedState>) 
         "purged restored ephemeral runner identities"
     );
     shared.state.message_notify.notify_waiters();
-    snapshot
 }
 
 /// DELETE /runner/server/_apis/distributedtask/pools/:pool_id/sessions (no session_id)

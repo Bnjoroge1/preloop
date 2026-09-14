@@ -4136,16 +4136,24 @@ async fn run_one_runner<P: VmProvider + 'static>(
             let result = match pair.0 {
                 Ok(Ok(())) => Ok(()),
                 Ok(Err(error)) => {
-                    record_slot_failure(config, "guest_exit");
+                    // `run_until_exit` turns a non-zero guest exit into this
+                    // exact command error. Provider launch/transport failures
+                    // and task panics are engine failures, not guest exits.
+                    if matches!(
+                        error,
+                        VmError::Command {
+                            operation: "run",
+                            ..
+                        }
+                    ) {
+                        record_slot_failure(config, "guest_exit");
+                    }
                     Err(OrchestratorError::Pool(error.to_string()))
                 }
                 // The runner task panicked (sender dropped without a value).
-                Err(_) => {
-                    record_slot_failure(config, "guest_exit");
-                    Err(OrchestratorError::Pool(
-                        "runner task ended without a result".into(),
-                    ))
-                }
+                Err(_) => Err(OrchestratorError::Pool(
+                    "runner task ended without a result".into(),
+                )),
             };
             (result, pair.1)
         },
@@ -6326,7 +6334,9 @@ chmod +x "$dest/bin/node"
                     .unwrap();
             }
             if self.fail_run && argv.iter().any(|arg| arg == "run") {
-                return Err(test_error("run-failure"));
+                // `exec_stream` returns the guest process exit code; transport
+                // failures are represented by `Err(VmError)` instead.
+                return Ok(1);
             }
             Ok(0)
         }
@@ -7080,7 +7090,9 @@ chmod +x "$dest/bin/node"
         )
         .await
         .expect_err("runner failure must propagate");
-        assert!(error.to_string().contains("run-failure"));
+        assert!(error
+            .to_string()
+            .contains("guest runner exited with code 1"));
         assert!(!error.to_string().contains("delete-failure"));
     }
 

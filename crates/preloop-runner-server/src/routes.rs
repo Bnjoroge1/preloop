@@ -223,57 +223,6 @@ pub(crate) fn build_app(
     // official runner deletes its own session and deregisters its own agent
     // through these routes, so a system-token-only guard would 401 the
     // runner's shutdown path.
-    let protected_admin_apis = Router::new()
-        .route(
-            "/runner/server/_apis/distributedtask/pools/:pool_id/agents/:agent_id",
-            delete(delete_agent),
-        )
-        .route(
-            "/_apis/distributedtask/pools/:pool_id/agents/:agent_id",
-            delete(delete_agent),
-        )
-        .route(
-            "/runner/server/_apis/distributedtask/pools/:pool_id/sessions",
-            delete(delete_sessions_for_pool),
-        )
-        .route(
-            "/_apis/distributedtask/pools/:pool_id/sessions",
-            delete(delete_sessions_for_pool),
-        )
-        .route(
-            "/runner/server/_apis/distributedtask/pools/:pool_id/sessions/:session_id",
-            delete(delete_session),
-        )
-        .route(
-            "/_apis/distributedtask/pools/:pool_id/sessions/:session_id",
-            delete(delete_session),
-        )
-        .route(
-            "/:org/_apis/v1/AgentSession/:pool_id/:session_id",
-            delete(delete_session_org),
-        )
-        .route(
-            "/runner/server/_apis/v1/AgentSession/:pool_id/:session_id",
-            delete(delete_session),
-        )
-        .route(
-            "/_apis/v1/AgentSession/:pool_id/:session_id",
-            delete(delete_session),
-        )
-        .route_layer(middleware::from_fn_with_state(
-            shared.clone(),
-            require_runner_admin_bearer,
-        ));
-
-    // Runner/session/agent administration. Split out of the protocol router
-    // because `require_protocol_bearer` accepts any valid local JWT — a job's
-    // own `ACTIONS_RUNTIME_TOKEN` included — which let workflow code
-    // deregister runners and delete other runners' sessions. The
-    // guard here admits only the system token or a registered runner's listen
-    // token, and each handler additionally requires self-ownership: the
-    // official runner deletes its own session and deregisters its own agent
-    // through these routes, so a system-token-only guard would 401 the
-    // runner's shutdown path.
     // Pool-wide session deletion has no caller-owned target. Keep it
     // administrator-only; runner listen tokens may delete only one of their
     // own sessions through the per-session routes below.
