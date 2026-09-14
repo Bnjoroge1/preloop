@@ -88,18 +88,16 @@ impl TrustTier {
 ///
 /// Every job-facing authority decision is derived from one call to
 /// [`job_authorization`]: whether stored secrets are injected, what
-/// `GITHUB_TOKEN` permission set the runner-visible wire variable and the
-/// GitHub App installation-token request carry, and whether `id-token: write`
-/// yields an OIDC request URL and token grant. Nothing downstream re-derives
-/// the tier ad hoc, so a handler special case cannot drift from this policy.
+/// repository permissions the GITHUB_TOKEN wire variable and GitHub App
+/// installation-token request carry, and whether `id-token: write` yields an
+/// OIDC request URL and token grant. Nothing downstream re-derives the tier
+/// ad hoc, so a handler special case cannot drift from this policy.
 pub(crate) struct JobAuthorization {
     /// Stored repository secrets may be injected into the job.
     pub(crate) allows_secrets: bool,
-    /// The runner-visible `GITHUB_TOKEN` permission set (the
-    /// `system.github.token.permissions` wire variable). `id-token` appears
-    /// here only for trusted tiers, where the declared `IdToken: write` is
-    /// the metadata that accompanies the separately granted OIDC request
-    /// URL; fork-restricted tiers never advertise it.
+    /// The resolved policy permission set in workflow spelling. It retains
+    /// Actions-only declarations for the dedicated OIDC decision; the wire
+    /// renderer removes those from `GITHUB_TOKEN Permissions`.
     pub(crate) token_permissions: BTreeMap<String, String>,
     /// The permission set sent to the GitHub App installation-token mint.
     /// Excludes the Actions-only scopes (`id-token`, `models`) that the
@@ -204,10 +202,9 @@ pub(crate) async fn ensure_cache_write_allowed(
 /// For fork-restricted tiers the declared (or default) permission set is
 /// clamped to GitHub's fork profile: every scope is held at `read` and write
 /// never survives, `id-token` — a special workflow permission with write/none
-/// semantics, not a repository read permission — is dropped from the wire set
-/// rather than advertised as `read`, `id-token: write` produces no OIDC
-/// grant, and stored secrets stay denied. All other tiers keep the declared
-/// set verbatim.
+/// semantics, not a repository read permission — remains only in the internal
+/// policy decision, `id-token: write` produces no OIDC grant, and stored
+/// secrets stay denied. All other tiers keep the declared set verbatim.
 pub(crate) fn job_authorization(
     tier: Option<TrustTier>,
     declared_permissions: Option<&BTreeMap<String, String>>,

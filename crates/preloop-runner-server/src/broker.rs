@@ -307,6 +307,9 @@ pub(crate) async fn next_message_broker_ref(
         .get("waitSeconds")
         .and_then(|value| value.parse::<u64>().ok())
         .unwrap_or(50);
+    let runner_busy = params
+        .get("status")
+        .is_some_and(|status| status.eq_ignore_ascii_case("busy"));
 
     loop {
         let mut inner = shared.state.inner.lock().await;
@@ -349,10 +352,31 @@ pub(crate) async fn next_message_broker_ref(
                 }
 
                 if request.result.is_none() {
-                    return Ok(Json(broker_job_ref(request, runner_id)).into_response());
+                    if !runner_busy {
+                        return Ok(Json(broker_job_ref(request, runner_id)).into_response());
+                    }
+                } else {
+                    inner.session_active_requests.remove(&session_id);
                 }
+            } else {
+                inner.session_active_requests.remove(&session_id);
             }
-            inner.session_active_requests.remove(&session_id);
+        }
+        if runner_busy {
+            drop(inner);
+            if wait_seconds == 0 {
+                return Ok((StatusCode::ACCEPTED, Json(serde_json::Value::Null)).into_response());
+            }
+            if tokio::time::timeout(
+                Duration::from_secs(wait_seconds),
+                shared.state.message_notify.notified(),
+            )
+            .await
+            .is_err()
+            {
+                return Ok((StatusCode::ACCEPTED, Json(serde_json::Value::Null)).into_response());
+            }
+            continue;
         }
 
         let runner = inner.runner_capabilities_for_session(&session_id);
@@ -1019,19 +1043,31 @@ pub(crate) async fn broker_acquire_job(
                             .map(|(scope, level)| (wire_scope_to_kebab(&scope), level))
                             .collect::<BTreeMap<_, _>>()
                     });
-                    // `system.github.token.permissions` carries the effective
-                    // set (defaults substituted when nothing was declared).
-                    // Passing it as the declared set is faithful: for a
-                    // declared job it is exactly the job's set, and for an
-                    // undeclared job `job_authorization` treats a set equal
-                    // to the default identically to `None`. The fork case is
-                    // safe too — the wire variable was restated to the fork
-                    // profile at build, and clamping it again is idempotent.
+                    // The wire variable carries repository-token scopes only;
+                    // the OIDC grant is persisted in the job's endpoint
+                    // metadata. Fall back to the old wire marker so jobs
+                    // queued before this renderer change can still recover.
+                    let id_token_granted = inner
+                        .id_token_grants
+                        .get(&(record.run_id, record.job_id.clone()))
+                        .copied()
+                        .unwrap_or_else(|| {
+                            wire_permissions
+                                .as_ref()
+                                .and_then(|permissions| permissions.get("id-token"))
+                                .is_some_and(|level| level == "write")
+                                || message.resources.endpoints.iter().any(|endpoint| {
+                                    endpoint
+                                        .data
+                                        .get("GenerateIdTokenUrl")
+                                        .is_some_and(|url| !url.is_empty())
+                                })
+                        });
                     let declared = wire_permissions.clone();
                     let policy = crate::events::trust_tier::job_authorization(
                         tier,
                         declared.as_ref(),
-                        false,
+                        id_token_granted,
                     );
                     Some((
                         crate::models::GitHubTokenRequest {
@@ -1203,15 +1239,14 @@ pub(crate) struct MintedGitHubToken {
     pub(crate) effective_permissions: Option<BTreeMap<String, String>>,
 }
 
-/// Apply a freshly minted dispatch token to the job message: inject the
-/// three secret variables (`system.github.token`, `github_token`,
-/// `GITHUB_TOKEN`), restate the narrowed permission set, and patch the
-/// minted token into the `github` context so `${{ github.token }}` inputs
-/// (checkout's token, persist-credentials config) authenticate. Shared by
-/// the normal mint path and the re-derived-request fallback, which had
-/// already diverged (the fallback lost the success log). `re_derived` only
-/// tailors the log wording: the derived path historically logged no
-/// success line.
+/// Apply a freshly minted dispatch token to the job message: inject the two
+/// secret variables (`system.github.token`, `github_token`), restate the
+/// narrowed permission set, and patch the minted token into the `github`
+/// context so `${{ github.token }}` inputs (checkout's token,
+/// persist-credentials config) authenticate. Shared by the normal mint path
+/// and the re-derived-request fallback, which had already diverged (the
+/// fallback lost the success log). `re_derived` only tailors the log wording:
+/// the derived path historically logged no success line.
 fn apply_minted_token_to_message(
     message: &mut azdo::AgentJobRequestMessage,
     minted: &MintedGitHubToken,
@@ -1226,37 +1261,14 @@ fn apply_minted_token_to_message(
         "github_token".to_owned(),
         preloop_gha_protocol::azdo::VariableValue::secret(token.clone()),
     );
-    // The build-time message also injects the token as `GITHUB_TOKEN` (the
-    // `${{ secrets.GITHUB_TOKEN }}` alias). It must follow the minted token
-    // too, or a fork job's hostile step code could read the stale local
-    // runtime token from `secrets.GITHUB_TOKEN` while `github.token` already
-    // carries the scoped mint.
-    message.variables.insert(
-        "GITHUB_TOKEN".to_owned(),
-        preloop_gha_protocol::azdo::VariableValue::secret(token.clone()),
-    );
-    // Restate what the token carries when the installation could not grant
-    // everything. The message was built with the requested set, and leaving
-    // it would print authority the token does not have in the runner's
-    // `GITHUB_TOKEN Permissions` group — sending anyone debugging the
-    // resulting 403 to the wrong place. The narrowed grant replaces only
-    // App-scoped entries: Actions-only metadata (`IdToken: write` for a
-    // trusted job whose OIDC grant is still live) is preserved from the
-    // build-time wire set, and a fork-restricted job's wire set has no
-    // IdToken to preserve.
+    // Restate only repository-token scopes when an installation narrowed the
+    // mint. OIDC and other Actions-only capabilities have dedicated protocol
+    // fields and never belong in `GITHUB_TOKEN Permissions`.
     if let Some(effective) = &minted.effective_permissions {
-        let merged = merge_narrowed_wire_permissions(
-            message
-                .variables
-                .get("system.github.token.permissions")
-                .and_then(|variable| variable.value.as_deref()),
-            effective,
-        );
+        let perms_json = preloop_gha_parser::job_builder::token_permissions_wire_json(effective);
         message.variables.insert(
             "system.github.token.permissions".to_owned(),
-            preloop_gha_protocol::azdo::VariableValue::new(
-                preloop_gha_parser::job_builder::token_permissions_wire_json(&merged),
-            ),
+            preloop_gha_protocol::azdo::VariableValue::new(perms_json),
         );
     }
     // The workflow's `github` context is built at submission time, before
@@ -1557,43 +1569,6 @@ pub(crate) async fn mint_dispatch_github_token(
     Ok(minted)
 }
 
-/// Merge a minted token's effective (App-scoped) permission set into the
-/// runner-visible wire permissions.
-///
-/// `original_wire` is the `system.github.token.permissions` variable the
-/// message carried at claim time — the policy set built in
-/// `build_job_artifacts`. The effective grant is authoritative for App
-/// repository scopes (a scope the installation dropped disappears from the
-/// wire, so the runner's `GITHUB_TOKEN Permissions` group never overstates
-/// the token), but Actions-only scopes (`id-token`, `models`) never appear
-/// in an installation grant, so their build-time metadata is preserved:
-/// a trusted job declared `id-token: write` keeps `IdToken: write` while its
-/// OIDC grant is live, and a fork-restricted job's wire set has no IdToken
-/// entry to preserve. Never reconstructs from broader defaults: a missing or
-/// unparseable original wire set degrades to the effective grant alone.
-fn merge_narrowed_wire_permissions(
-    original_wire: Option<&str>,
-    effective: &BTreeMap<String, String>,
-) -> BTreeMap<String, String> {
-    let mut merged: BTreeMap<String, String> = effective.clone();
-    let Some(original_wire) = original_wire else {
-        return merged;
-    };
-    let Ok(original) = serde_json::from_str::<BTreeMap<String, String>>(original_wire) else {
-        return merged;
-    };
-    for (scope, level) in original {
-        let scope = wire_scope_to_kebab(&scope);
-        if crate::github_app::ACTIONS_ONLY_SCOPES.contains(&scope.as_str()) {
-            // Keyed kebab-case so the merged map stays consistent with the
-            // effective grant, whose keys come from the requested set;
-            // `token_permissions_wire_json` pascal-cases them for the wire.
-            merged.insert(scope, level);
-        }
-    }
-    merged
-}
-
 /// `Checks` → `checks`, `PullRequests` → `pull-requests`: the workflow
 /// (kebab-case) spelling of a PascalCase wire permission scope.
 ///
@@ -1846,76 +1821,6 @@ mod tests {
         assert_eq!(
             execution_status_from_runner_result("Abandoned"),
             Some(ExecutionStatus::Failure)
-        );
-    }
-
-    #[test]
-    fn narrowed_grants_preserve_trusted_actions_only_metadata() {
-        // Trusted job declared `checks: write` + `id-token: write`; the
-        // installation granted only `pull-requests: read`. The effective
-        // grant replaces App-scoped entries (checks disappears — the token
-        // does not carry it) while `IdToken: write` metadata survives.
-        let merged = merge_narrowed_wire_permissions(
-            Some(r#"{"Checks":"write","IdToken":"write"}"#),
-            &BTreeMap::from([("pull-requests".to_owned(), "read".to_owned())]),
-        );
-        assert_eq!(
-            merged,
-            BTreeMap::from([
-                ("pull-requests".to_owned(), "read".to_owned()),
-                ("id-token".to_owned(), "write".to_owned()),
-            ]),
-            "App scopes come from the effective grant; Actions-only metadata is preserved"
-        );
-    }
-
-    #[test]
-    fn narrowed_grants_never_add_actions_metadata_to_a_fork() {
-        // Fork job's build-time wire set has no IdToken; the merge must not
-        // invent one. The installation lacks `checks`, so the wire loses it.
-        let merged = merge_narrowed_wire_permissions(
-            Some(r#"{"Checks":"read","PullRequests":"read"}"#),
-            &BTreeMap::from([("pull-requests".to_owned(), "read".to_owned())]),
-        );
-        assert_eq!(
-            merged,
-            BTreeMap::from([("pull-requests".to_owned(), "read".to_owned())]),
-            "fork wire keeps no IdToken and drops ungranted App scopes"
-        );
-    }
-
-    #[test]
-    fn narrowed_grants_lower_declared_writes_to_the_granted_level() {
-        let merged = merge_narrowed_wire_permissions(
-            Some(r#"{"Contents":"write","IdToken":"write"}"#),
-            &BTreeMap::from([
-                ("contents".to_owned(), "read".to_owned()),
-                ("metadata".to_owned(), "read".to_owned()),
-            ]),
-        );
-        assert_eq!(
-            merged,
-            BTreeMap::from([
-                ("contents".to_owned(), "read".to_owned()),
-                ("metadata".to_owned(), "read".to_owned()),
-                ("id-token".to_owned(), "write".to_owned()),
-            ]),
-            "declared write is lowered to the granted read; metadata survives"
-        );
-    }
-
-    #[test]
-    fn missing_or_unparseable_original_wire_degrades_to_the_effective_grant() {
-        let effective = BTreeMap::from([("metadata".to_owned(), "read".to_owned())]);
-        assert_eq!(
-            merge_narrowed_wire_permissions(None, &effective),
-            effective,
-            "no original wire set: nothing to preserve"
-        );
-        assert_eq!(
-            merge_narrowed_wire_permissions(Some("not json"), &effective),
-            effective,
-            "unparseable wire set must not reconstruct from broader defaults"
         );
     }
 

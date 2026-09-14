@@ -1,8 +1,12 @@
 name: 213-oidc-token-claims
 on: workflow_dispatch
+permissions:
+  id-token: write
+  contents: read
 jobs:
   oidc:
     runs-on: self-hosted
+    environment: production
     steps:
 
 

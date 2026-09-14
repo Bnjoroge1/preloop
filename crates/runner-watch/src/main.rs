@@ -3156,9 +3156,13 @@ fn normalize_request_path(_method: &str, path: &str) -> String {
     if path == "/actions/runner-registration" {
         return "/api/v3/actions/runner-registration".to_string();
     }
-    if let Some(pos) = path.find("/_apis/oauth2/token/") {
-        let _ = pos;
-        return "/runner/server/_apis/v1/oauth2/token".to_string();
+    // Runner 2.336 included a client GUID after this path; 2.337 does not.
+    // Normalize both forms (and preserve neither credential-bearing suffix).
+    if let Some(pos) = path.find("/_apis/oauth2/token") {
+        let suffix = &path[pos + "/_apis/oauth2/token".len()..];
+        if suffix.is_empty() || suffix.starts_with('/') || suffix.starts_with('?') {
+            return "/runner/server/_apis/v1/oauth2/token".to_string();
+        }
     }
     if let Some(pos) = path.find("/_apis/connectionData") {
         return format!("/runner/server{}", &path[pos..]);
@@ -4196,6 +4200,17 @@ mod tests {
         assert_eq!(
             normalize_request_path("GET", "/my-org/_apis/v1/AgentRequest/1/2?api-version=6.0"),
             "/_apis/v1/AgentRequest/1/2?api-version=6.0"
+        );
+        assert_eq!(
+            normalize_request_path("POST", "/my-org/_apis/oauth2/token"),
+            "/runner/server/_apis/v1/oauth2/token"
+        );
+        assert_eq!(
+            normalize_request_path(
+                "POST",
+                "/my-org/_apis/oauth2/token/00000000-0000-0000-0000-000000000000"
+            ),
+            "/runner/server/_apis/v1/oauth2/token"
         );
         assert_eq!(
             normalize_request_path("GET", "/runner/server/_apis/connectionData"),

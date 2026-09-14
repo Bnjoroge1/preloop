@@ -2224,17 +2224,6 @@ pub(crate) fn build_job_artifacts(
         "github_token".to_owned(),
         preloop_gha_protocol::azdo::VariableValue::secret(github_token.clone()),
     );
-    // GitHub's dispatcher injects the job token into the `secrets` context
-    // under the name `GITHUB_TOKEN` — that is what `${{ secrets.GITHUB_TOKEN }}`
-    // resolves to. The runner builds `secrets` from `isSecret` variables keyed
-    // by name, so without this exact key the single most common token
-    // reference in real workflows (cargo-dist's release.yml, supply-chain
-    // gates, action scaffolding) resolves empty on this control plane while
-    // working on GitHub.
-    agent_msg.variables.insert(
-        "GITHUB_TOKEN".to_owned(),
-        preloop_gha_protocol::azdo::VariableValue::secret(github_token.clone()),
-    );
     agent_msg.variables.insert(
         "actions_runner_allow_artifacts_file".to_owned(),
         preloop_gha_protocol::azdo::VariableValue::new("false"),

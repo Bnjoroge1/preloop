@@ -4941,6 +4941,30 @@ async fn current_runner_registration_to_broker_job_e2e() {
     let body: Value = serde_json::from_str(broker_ref["body"].as_str().unwrap()).unwrap();
     assert_eq!(body["should_acknowledge"], true);
     let runner_request_id = body["runner_request_id"].as_str().unwrap();
+    // A Busy runner must not receive the same request again or claim a
+    // successor while its worker is still draining.
+    let busy_response = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method(Method::GET)
+                .uri(format!(
+                    "/runner/server/_apis/distributedtask/pools/1/messages?sessionId={session_id}&status=Busy&waitSeconds=0"
+                ))
+                .header(header::AUTHORIZATION, "Bearer preloop-system-token")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(busy_response.status(), StatusCode::ACCEPTED);
+    let busy_body: Value = serde_json::from_slice(
+        &to_bytes(busy_response.into_body(), usize::MAX)
+            .await
+            .unwrap(),
+    )
+    .unwrap();
+    assert_eq!(busy_body, Value::Null);
 
     let acquired_response = app
             .clone()
@@ -5042,13 +5066,12 @@ async fn current_runner_registration_to_broker_job_e2e() {
     assert_eq!(response.status(), StatusCode::NO_CONTENT);
 }
 
-/// GitHub's dispatcher injects the job token into the `secrets` context under
-/// the name `GITHUB_TOKEN` — that is what `${{ secrets.GITHUB_TOKEN }}` in a
-/// workflow's `env:` resolves to. Without this exact key the most common
-/// token reference in real workflows (cargo-dist's release.yml, supply-chain
-/// gates) comes through empty on this control plane while working on GitHub.
+/// GitHub's dispatcher injects the job token through the lower-case
+/// `github_token` variable. The runner exposes that built-in value to
+/// `${{ secrets.GITHUB_TOKEN }}`; the wire must not add a second, non-official
+/// uppercase variable.
 #[tokio::test]
-async fn job_message_carries_github_token_as_a_secret() {
+async fn job_message_carries_the_official_github_token_variable() {
     let temp = tempfile::tempdir().unwrap();
     let state = AppState::new(temp.path().to_path_buf()).await.unwrap();
     let app = app(state.clone(), CancellationToken::new());
@@ -5122,14 +5145,18 @@ async fn job_message_carries_github_token_as_a_secret() {
         azdo::message_type::RUNNER_JOB_REQUEST
     );
 
-    let token_secret = &acquired["variables"]["GITHUB_TOKEN"];
+    let token_secret = &acquired["variables"]["github_token"];
     assert_eq!(
         token_secret["isSecret"], true,
-        "GITHUB_TOKEN must be marked secret so the runner masks it: {acquired}"
+        "github_token must be marked secret so the runner masks it: {acquired}"
     );
     assert_eq!(
         token_secret["value"], acquired["variables"]["system.github.token"]["value"],
-        "secrets.GITHUB_TOKEN must be the job token the engine minted"
+        "github_token must be the job token the engine minted"
+    );
+    assert!(
+        acquired["variables"].get("GITHUB_TOKEN").is_none(),
+        "uppercase GITHUB_TOKEN is not part of the official acquire schema"
     );
 }
 
@@ -9310,7 +9337,7 @@ async fn the_wire_token_permissions_match_the_declared_policy() {
         ("permissions: {}\n", "{}"),
         (
             "permissions:\n  contents: read\n  pull-requests: write\n",
-            r#"{"Contents":"read","PullRequests":"write"}"#,
+            r#"{"Contents":"read","Metadata":"read","PullRequests":"write"}"#,
         ),
     ] {
         let temp = tempfile::tempdir().unwrap();
@@ -9415,7 +9442,7 @@ async fn fork_pr_jobs_are_downgraded_to_read_only_and_oidc_denied() {
     let fork_message = queued_message_for(&inner, &fork_run_id);
     assert_eq!(
         variable_value(&fork_message, "system.github.token.permissions"),
-        Some(r#"{"Checks":"read"}"#),
+        Some(r#"{"Checks":"read","Metadata":"read"}"#),
         "fork PR: declared checks write must be clamped to read, and id-token \
          must not be advertised as a read permission"
     );
@@ -9470,7 +9497,7 @@ async fn fork_pr_jobs_are_downgraded_to_read_only_and_oidc_denied() {
     let trusted_message = queued_message_for(&inner, &trusted_run_id);
     assert_eq!(
         variable_value(&trusted_message, "system.github.token.permissions"),
-        Some(r#"{"Checks":"write","IdToken":"write"}"#),
+        Some(r#"{"Checks":"write","Metadata":"read"}"#),
         "trusted job keeps the declared write profile"
     );
     let trusted_endpoint = trusted_message
@@ -9508,7 +9535,7 @@ async fn fork_pr_jobs_are_downgraded_to_read_only_and_oidc_denied() {
     let target_message = queued_message_for(&inner, &target_run_id);
     assert_eq!(
         variable_value(&target_message, "system.github.token.permissions"),
-        Some(r#"{"Checks":"write","IdToken":"write"}"#),
+        Some(r#"{"Checks":"write","Metadata":"read"}"#),
         "pull_request_target keeps base-repo trust"
     );
     drop(inner);
@@ -9629,13 +9656,12 @@ async fn untrusted_job_mint_failure_never_falls_back_to_the_pat() {
 }
 
 /// The broker claim swaps the build-time token for the minted App token.
-/// Every runner-visible alias must follow coherently — `system.github.token`
-/// (the `${{ github.token }}` variable), `github_token`, the
-/// `${{ secrets.GITHUB_TOKEN }}` alias, and the `github` context's `token`
-/// entry — or workflow code would read a stale local runtime token from one
-/// alias while the others carry the scoped mint.
+/// Every official runner-visible wire alias must follow coherently —
+/// `system.github.token` (the `${{ github.token }}` variable), `github_token`,
+/// and the `github` context's `token` entry. The runner maps `github_token` to
+/// `${{ secrets.GITHUB_TOKEN }}` locally; the uppercase name is not wire data.
 #[tokio::test]
-async fn broker_claim_patches_every_token_alias_with_the_minted_token() {
+async fn broker_claim_patches_every_official_token_alias_with_the_minted_token() {
     use crate::github_app::{GitHubAppCredentials, MintFailurePolicy};
     use axum::routing::{get, post};
 
@@ -9739,7 +9765,7 @@ async fn broker_claim_patches_every_token_alias_with_the_minted_token() {
         &runner_token,
     )
     .await;
-    for name in ["system.github.token", "github_token", "GITHUB_TOKEN"] {
+    for name in ["system.github.token", "github_token"] {
         assert_eq!(
             acquired["variables"][name]["value"], "ghs_minted_alias_token",
             "{name} must carry the minted App token after the claim"
@@ -9749,6 +9775,10 @@ async fn broker_claim_patches_every_token_alias_with_the_minted_token() {
             "{name} must stay marked secret"
         );
     }
+    assert!(
+        acquired["variables"].get("GITHUB_TOKEN").is_none(),
+        "uppercase GITHUB_TOKEN is not part of the official acquire schema"
+    );
     // `${{ github.token }}` in the workflow context must see the same mint.
     let context_pairs = acquired["contextData"]["github"]["d"].as_array().unwrap();
     let context_token = context_pairs
@@ -9760,23 +9790,21 @@ async fn broker_claim_patches_every_token_alias_with_the_minted_token() {
         context_token["v"], "ghs_minted_alias_token",
         "the github context token must be the minted App token"
     );
-    // No narrowing occurred, so the wire permissions keep the declared set
-    // (including the OIDC metadata for this trusted job).
+    // No narrowing occurred, so the wire permissions keep the declared
+    // repository set; the OIDC grant is carried by the endpoint metadata.
     assert_eq!(
         acquired["variables"]["system.github.token.permissions"]["value"],
-        r#"{"Checks":"write","IdToken":"write"}"#,
+        r#"{"Checks":"write","Metadata":"read"}"#,
         "an un-narrowed mint leaves the declared wire permissions intact"
     );
 }
 
 /// When the App installation grants fewer repository permissions than the
 /// job requested, the broker narrows the mint and must restate the wire
-/// permissions: App-scoped entries come from the effective grant (a scope
-/// the installation lacks disappears), while a trusted job's Actions-only
-/// metadata (`IdToken: write`, whose OIDC grant is still live) survives.
-/// A fork-restricted job's wire set has no IdToken and must not gain one.
+/// permissions from the effective repository-token grant. The OIDC grant
+/// remains available through its dedicated endpoint metadata.
 #[tokio::test]
-async fn broker_claim_merges_narrowed_grants_with_actions_only_metadata() {
+async fn broker_claim_restates_narrowed_repository_permissions() {
     use crate::github_app::{GitHubAppCredentials, MintFailurePolicy};
     use axum::routing::{get, post};
     use std::sync::atomic::{AtomicUsize, Ordering};
@@ -9930,14 +9958,14 @@ async fn broker_claim_merges_narrowed_grants_with_actions_only_metadata() {
     }
 
     // Trusted job first (claim 1): declared writes are clamped to the
-    // installation's grant, `checks` disappears entirely, and `IdToken: write`
-    // survives because the OIDC grant is still live.
+    // installation's grant, `checks` disappears entirely, and the OIDC grant
+    // remains available through the dedicated endpoint metadata.
     submit(None).await;
     let trusted = claim_and_return(&app, runner_id, &runner_token).await;
     assert_eq!(
         trusted["variables"]["system.github.token.permissions"]["value"],
-        r#"{"IdToken":"write","PullRequests":"read"}"#,
-        "trusted wire keeps the OIDC metadata and reflects the narrowed App grant"
+        r#"{"Metadata":"read","PullRequests":"read"}"#,
+        "trusted wire reflects the narrowed App grant without Actions-only scopes"
     );
     let trusted_endpoint = trusted["resources"]["endpoints"]
         .as_array()
@@ -9960,13 +9988,14 @@ async fn broker_claim_merges_narrowed_grants_with_actions_only_metadata() {
         "trusted job carries the minted token"
     );
 
-    // Fork job (claim 3): same declared workflow, but the fork profile never
-    // carried IdToken — the narrowed restatement must not invent one.
+    // Fork job (claim 3): the narrowed restatement contains repository
+    // permissions only and never invents OIDC metadata.
     submit(Some("untrusted-fork-pull-request")).await;
     let fork = claim_and_return(&app, runner_id, &runner_token).await;
     assert_eq!(
-        fork["variables"]["system.github.token.permissions"]["value"], r#"{"PullRequests":"read"}"#,
-        "fork wire reflects the narrowed grant with no IdToken metadata"
+        fork["variables"]["system.github.token.permissions"]["value"],
+        r#"{"Metadata":"read","PullRequests":"read"}"#,
+        "fork wire reflects the narrowed grant without Actions-only metadata"
     );
     assert!(
         !fork["variables"]["system.github.token.permissions"]["value"]
@@ -10560,13 +10589,17 @@ async fn fork_job_never_receives_the_configured_pat_override() {
     let inner = state.inner.lock().await;
     let fork_message = queued_message_for(&inner, &fork_run_id);
     let runtime_token = state.mint_runtime_token(&fork_message.plan.plan_id, &fork_message.job_id);
-    for name in ["system.github.token", "github_token", "GITHUB_TOKEN"] {
+    for name in ["system.github.token", "github_token"] {
         assert_eq!(
             variable_value(&fork_message, name),
             Some(runtime_token.as_str()),
             "fork job must carry the local runtime token, not the PAT ({name})"
         );
     }
+    assert!(
+        variable_value(&fork_message, "GITHUB_TOKEN").is_none(),
+        "uppercase GITHUB_TOKEN is not part of the official acquire schema"
+    );
     assert_ne!(
         variable_value(&fork_message, "system.github.token"),
         Some(pat.as_str()),
@@ -10686,8 +10719,8 @@ async fn fork_pull_request_webhook_jobs_are_downgraded_and_secrets_denied() {
     let message = queued_message_for(&inner, &run_id);
     assert_eq!(
         variable_value(&message, "system.github.token.permissions"),
-        Some(r#"{"Checks":"read"}"#),
-        "webhook-delivered fork PR job is downgraded to read-only with no IdToken metadata"
+        Some(r#"{"Checks":"read","Metadata":"read"}"#),
+        "webhook-delivered fork PR job is downgraded to read-only without Actions-only metadata"
     );
     let endpoint = message
         .resources
@@ -10731,8 +10764,8 @@ async fn fork_pull_request_webhook_jobs_are_downgraded_and_secrets_denied() {
     );
     assert_eq!(
         variable_value(&trusted_message, "system.github.token.permissions"),
-        Some(r#"{"Checks":"write"}"#),
-        "trusted jobs keep declared writes"
+        Some(r#"{"Checks":"write","Metadata":"read"}"#),
+        "trusted jobs keep declared writes and implicit metadata"
     );
 }
 
