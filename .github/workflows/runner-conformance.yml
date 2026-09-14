@@ -14,26 +14,40 @@ on:
 
 jobs:
   runner-light:
-    name: Runner light conformance
+    name: Runner light local conformance
     runs-on: [self-hosted, preloop-cpane]
-    timeout-minutes: 10
+    timeout-minutes: 30
     steps:
-      - uses: actions/checkout@08c6903cd8c0fde910a37f88322edcfb5dd907a8 # v5.0.0
+      - uses: actions/checkout@08c6903cd8c0fde910a37f88322edcfb5dd907a # v5.0.0
         with:
           persist-credentials: false
-          # `.runner-watch/golden/**` is the only LFS-tracked path in the repo
-          # and this job never reads it: `runner-conformance.py --mode light`
-          # works off `benchmarks/compatibility/runner/behavior`. `lfs: true`
-          # fetched the 365 MB corpus on every pull request for nothing.
           lfs: false
-      - name: Validate runner status responses
-        run: python3 benchmarks/real-world/runner-conformance.py --mode light
+      - uses: dtolnay/rust-toolchain@6bed0761d98439e5a578e2877258200ad565ba87 # stable
+      - name: Build local runner and server
+        run: cargo build --locked -p preloop-runner-server -p preloop-runner -p preloop-runner-client
+      - name: Run current runner against local Preloop
+        run: |
+          rm -f benchmarks/compatibility/runner/behavior/conformance-preloop.jsonl
+          python3 benchmarks/real-world/local-runner-conformance.py \
+            --server-binary target/debug/preloop-server \
+            --runner-binary target/debug/preloop-runner \
+            --client-binary target/debug/preloop-runner-client \
+            --official benchmarks/compatibility/runner/behavior/conformance-official.jsonl \
+            --output benchmarks/compatibility/runner/behavior/conformance-preloop.jsonl
+      - name: Validate local runner outcomes
+        run: |
+          python3 benchmarks/real-world/runner-conformance.py \
+            --mode local \
+            --preloop benchmarks/compatibility/runner/behavior/conformance-preloop.jsonl \
+            --output benchmarks/compatibility/runner/behavior/RUNNER-CONFORMANCE-REPORT.md
       - name: Upload light report
         if: always()
         uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
         with:
           name: runner-light-conformance
-          path: benchmarks/compatibility/runner/behavior/RUNNER-CONFORMANCE-REPORT.md
+          path: |
+            benchmarks/compatibility/runner/behavior/RUNNER-CONFORMANCE-REPORT.md
+            benchmarks/compatibility/runner/behavior/conformance-preloop.jsonl
           if-no-files-found: error
 
   runner-deep:

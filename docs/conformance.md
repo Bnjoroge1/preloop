@@ -98,6 +98,40 @@ schemas for jobs and annotations, and
 `acquirejob` response schemas byte-for-byte; anything volatile (timing,
 tokens) is normalized before comparison.
 
+## Local runner-light execution
+
+The runner conformance PR gate does not contact GitHub. It builds the current
+`preloop-runner`, `preloop-server`, and native client, submits the checked-in
+scenario workflows to a throwaway local server, runs the current runner against
+that server, and validates that every workflow reaches a structured terminal
+workflow/job/step result:
+
+```sh
+cargo build --locked -p preloop-runner-server -p preloop-runner -p preloop-runner-client
+python3 benchmarks/real-world/local-runner-conformance.py \
+  --server-binary target/debug/preloop-server \
+  --runner-binary target/debug/preloop-runner \
+  --client-binary target/debug/preloop-runner-client \
+  --official benchmarks/compatibility/runner/behavior/conformance-official.jsonl \
+  --output benchmarks/compatibility/runner/behavior/conformance-preloop.jsonl
+python3 benchmarks/real-world/runner-conformance.py --mode local
+```
+
+This catches runner execution regressions that a request replay cannot see:
+step dispatch, completion reporting, matrix expansion, environment/file
+commands, and local action execution. The separate `light`/`deep` profiles
+remain available for comparing captured GitHub results when a live campaign
+has produced records. Local execution deliberately does not treat GitHub
+conclusions as an oracle: infrastructure-dependent fixtures can legitimately
+change conclusion on a local host.
+
+The v2.337.0 campaign is included in both gates. The server-light replay
+targets the `gh-official` cell through `benchmarks/conformance/targets.toml`;
+`experiments/mitm/bin/reconstruct_scenario.py` reconstructed the 27 workflow
+manifests under `experiments/mitm/scenarios/201-*` through `227-*`. The local
+runner harness discovers those manifests automatically, so the PR gate runs
+the current runner through the v2.337.0 scenarios without contacting GitHub.
+
 ## Tracking new official runner versions
 
 The pinned target is `versions.toml` (`runner_version = "2.336.0"`), and
