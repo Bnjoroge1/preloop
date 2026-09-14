@@ -68,21 +68,23 @@ jobs:
       PROPTEST_CASES: "8"
       RUST_TEST_THREADS: "6"
       RUSTFLAGS: "-C link-arg=-fuse-ld=lld"
-      GITHUB_TOKEN: ${{ github.token }}
     steps:
       - uses: actions/checkout@08c6903cd8c0fde910a37f88322edcfb5dd907a8 # v5.0.0
         with:
           persist-credentials: false
       - name: Materialize conformance goldens
         run: |
-          # Exactly one workspace test reads goldens at test time
-          # (`test_golden_acquirejob_payloads_parsing`), and only the v2.335.1
-          # scenarios — 9.5 MB. `--include=".runner-watch/golden/**"` also
-          # fetched the v2.336.0 and v2.337.0 corpora (337 MB) that only the
+          # The only workspace tests that read goldens at test time
+          # (`test_golden_acquirejob_payloads_parsing` and runner-watch's
+          # scenario-07 replay) read the pinned runner version's scenarios
+          # (~10 MB). Derive the version from versions.toml so this stays in
+          # lockstep with those tests. The old `--include=".runner-watch/golden/**"`
+          # also fetched the other runner corpora (hundreds of MB) that only the
           # conformance workflows replay, on every shard.
+          version=$(python3 -c 'import tomllib; print(tomllib.load(open("versions.toml", "rb"))["runner_version"])')
           git lfs install --local
-          git lfs pull --include=".runner-watch/golden/v2.335.1/**"
-          fixture=".runner-watch/golden/v2.335.1/06-multi-step/flows.jsonl"
+          git lfs pull --include=".runner-watch/golden/v${version}/**"
+          fixture=".runner-watch/golden/v${version}/06-multi-step/flows.jsonl"
           test -s "$fixture"
           if grep -q '^version https://git-lfs.github.com/spec/' "$fixture"; then
             echo "LFS fixture was not materialized: $fixture" >&2

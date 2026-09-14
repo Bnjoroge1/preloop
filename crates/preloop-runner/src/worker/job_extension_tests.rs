@@ -1401,10 +1401,29 @@ fn test_golden_acquirejob_payloads_parsing() {
     }
 }
 
+/// Golden corpus version the workspace tests read, taken from `versions.toml`'s
+/// `runner_version` so the fixtures track the shipped runner instead of a
+/// hardcoded version that silently rots when the pin moves.
+fn golden_runner_version() -> String {
+    let text = std::fs::read_to_string("../../versions.toml")
+        .expect("read ../../versions.toml for runner_version");
+    for line in text.lines() {
+        if let Some(rest) = line.trim_start().strip_prefix("runner_version") {
+            if let Some((_, value)) = rest.split_once('=') {
+                return value.trim().trim_matches('"').to_owned();
+            }
+        }
+    }
+    panic!("runner_version not found in ../../versions.toml");
+}
+
 fn load_golden_acquirejob(scenario: &str) -> Option<serde_json::Value> {
     use std::fs::File;
     use std::io::{BufRead, BufReader};
-    let path = format!("../../.runner-watch/golden/v2.335.1/{scenario}/flows.jsonl");
+    let path = format!(
+        "../../.runner-watch/golden/v{}/{scenario}/flows.jsonl",
+        golden_runner_version()
+    );
     let file = File::open(path).ok()?;
     let reader = BufReader::new(file);
     for line in reader.lines() {

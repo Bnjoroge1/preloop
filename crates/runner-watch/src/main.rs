@@ -4013,7 +4013,10 @@ mod tests {
     fn replay_workflow_submissions_materializes_scenario_07_workflow() {
         let workspace_root = Path::new(env!("CARGO_MANIFEST_DIR")).join("../..");
         let scenario_root = workspace_root.join("experiments/mitm/scenarios");
-        let golden_root = workspace_root.join(".runner-watch/golden/v2.335.1/07-step-failure");
+        let golden_root = workspace_root.join(format!(
+            ".runner-watch/golden/v{}/07-step-failure",
+            golden_runner_version()
+        ));
         let submissions = replay_workflow_submissions(&golden_root, &scenario_root)
             .expect("checked-in scenario 07 replay metadata should be readable");
 
@@ -4054,7 +4057,10 @@ mod tests {
             std::process::id()
         ));
         let error = replay_workflow_submissions(
-            Path::new(".runner-watch/golden/v2.335.1/07-step-failure"),
+            Path::new(&format!(
+                ".runner-watch/golden/v{}/07-step-failure",
+                golden_runner_version()
+            )),
             &missing_root,
         )
         .expect_err("missing scenario metadata must not fall back to synthetic jobs");
@@ -4063,6 +4069,23 @@ mod tests {
             error.to_string().contains("read replay scenario manifest"),
             "unexpected missing-metadata error: {error:#}"
         );
+    }
+
+    /// Golden corpus version these tests read, taken from `versions.toml`'s
+    /// `runner_version` so fixtures track the shipped runner instead of a
+    /// hardcoded version that rots when the pin moves.
+    fn golden_runner_version() -> String {
+        let path = Path::new(env!("CARGO_MANIFEST_DIR")).join("../../versions.toml");
+        let text = std::fs::read_to_string(&path)
+            .unwrap_or_else(|error| panic!("read {}: {error}", path.display()));
+        for line in text.lines() {
+            if let Some(rest) = line.trim_start().strip_prefix("runner_version") {
+                if let Some((_, value)) = rest.split_once('=') {
+                    return value.trim().trim_matches('"').to_owned();
+                }
+            }
+        }
+        panic!("runner_version not found in {}", path.display());
     }
 
     /// Minimal isolated temp directory (runner-watch has no tempfile dev-dep;
