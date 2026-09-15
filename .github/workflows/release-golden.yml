@@ -207,6 +207,14 @@ jobs:
           mkdir -p "$HOME/.local/bin"
           ln -sf "$HOME/.smolvm/smolvm" "$HOME/.local/bin/smolvm"
           echo "$HOME/.local/bin" >> "$GITHUB_PATH"
+      - name: Grant hosted runner KVM access
+        run: |
+          set -euo pipefail
+          test -e /dev/kvm
+          sudo chmod a+rw /dev/kvm
+          test -r /dev/kvm
+          test -w /dev/kvm
+
 
       - name: Pack Golden MicroVM Artifact
         env:
