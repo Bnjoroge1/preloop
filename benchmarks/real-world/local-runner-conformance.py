@@ -163,29 +163,109 @@ def semantic_result(run: dict[str, Any]) -> dict[str, Any]:
     return {"conclusion": conclusion, "jobs": jobs}
 
 
-def scenario_workflow(scenario: Path) -> tuple[Path, int]:
+def scenario_plan(scenario: Path) -> tuple[Path, int, list[dict[str, Any]]]:
     manifest = scenario / "scenario.toml"
     import tomllib
 
     metadata = tomllib.loads(manifest.read_text())
-    steps = metadata.get("steps", [])
+    steps = [
+        step
+        for step in metadata.get("steps", [])
+        if isinstance(step, dict)
+    ]
     submit_steps = [step for step in steps if step.get("kind") == "submit_workflow"]
     if len(submit_steps) != 1:
         raise RuntimeError(f"{manifest}: expected exactly one submit_workflow step")
     workflow = scenario / str(submit_steps[0]["path"])
     if not workflow.is_file():
         raise RuntimeError(f"{manifest}: workflow does not exist: {workflow}")
-    return workflow, int(metadata.get("duration_seconds_max", 300))
+    return workflow, int(metadata.get("duration_seconds_max", 300)), steps
+
+
+def cancel_run(client: Path, server_url: str, token: str, run_id: str) -> None:
+    env = os.environ.copy()
+    env["PRELOOP_SYSTEM_TOKEN"] = token
+    command_output(
+        [str(client), "--server", server_url, "cancel", run_id],
+        env=env,
+    )
+
+
+def wait_until(
+    server_url: str,
+    token: str,
+    run_id: str,
+    predicate,
+    timeout_seconds: int,
+    label: str,
+) -> dict[str, Any]:
+    deadline = time.monotonic() + timeout_seconds
+    last: dict[str, Any] = {}
+    while time.monotonic() < deadline:
+        last = http_json(f"{server_url}/api/v1/runs/{run_id}", token)
+        if predicate(last):
+            return last
+        time.sleep(0.5)
+    raise RuntimeError(
+        f"run {run_id} did not reach {label} within {timeout_seconds}s; last={last}"
+    )
+
+
+def drive_manifest_actions(
+    client: Path,
+    server_url: str,
+    token: str,
+    run_id: str,
+    steps: list[dict[str, Any]],
+) -> None:
+    """Execute post-submit scenario actions (cancel, waits) from scenario.toml."""
+    for step in steps:
+        kind = step.get("kind")
+        if kind == "submit_workflow":
+            continue
+        if kind == "wait_seconds":
+            time.sleep(float(step.get("n") or 0))
+            continue
+        if kind == "cancel_workflow":
+            cancel_run(client, server_url, token, run_id)
+            continue
+        if kind == "wait_for_event":
+            event = str(step.get("event") or "")
+            timeout = int(step.get("timeout") or 120)
+            if event == "job_assigned":
+                wait_until(
+                    server_url,
+                    token,
+                    run_id,
+                    lambda run: bool(run.get("jobs_list"))
+                    or str(run.get("status") or "") in {"in_progress", "completed"}
+                    or run.get("conclusion") is not None,
+                    timeout,
+                    "job_assigned",
+                )
+            elif event == "job_completed":
+                wait_until(
+                    server_url,
+                    token,
+                    run_id,
+                    lambda run: run.get("conclusion") is not None,
+                    timeout,
+                    "job_completed",
+                )
+            else:
+                raise RuntimeError(f"unsupported wait_for_event: {event!r}")
+            continue
+        raise RuntimeError(f"unsupported scenario step kind: {kind!r}")
 
 
 def prepare_scenario_workspace(
     scenario: Path, temp_root: Path
-) -> tuple[Path, Path, int]:
+) -> tuple[Path, Path, int, list[dict[str, Any]]]:
     """Expose fixture-local reusable workflows through the client convention."""
-    workflow, duration = scenario_workflow(scenario)
+    workflow, duration, steps = scenario_plan(scenario)
     workflows = scenario / "workflows"
     if not workflows.is_dir():
-        return workflow, scenario, duration
+        return workflow, scenario, duration, steps
 
     workspace = temp_root / "workspaces" / scenario.name
     shutil.copytree(scenario, workspace)
@@ -195,7 +275,8 @@ def prepare_scenario_workspace(
         if reusable.is_file():
             shutil.copy2(reusable, github_workflows / reusable.name)
 
-    return workspace / workflow.relative_to(scenario), workspace, duration
+    return workspace / workflow.relative_to(scenario), workspace, duration, steps
+
 
 def wait_for_run(
     server_url: str,
@@ -388,11 +469,14 @@ def main() -> int:
             records: list[dict[str, Any]] = []
             for scenario_name in scenarios:
                 scenario = args.scenarios_root / scenario_name
-                workflow, workspace, duration = prepare_scenario_workspace(
+                workflow, workspace, duration, steps = prepare_scenario_workspace(
                     scenario, temp_root
                 )
                 run_id = submit(
                     args.client_binary, server_url, token, workflow, workspace
+                )
+                drive_manifest_actions(
+                    args.client_binary, server_url, token, run_id, steps
                 )
                 run = wait_for_run(
                     server_url,

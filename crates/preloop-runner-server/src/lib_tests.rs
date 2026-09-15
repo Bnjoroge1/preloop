@@ -11601,6 +11601,20 @@ async fn liveness_sweep_requeues_job_of_deaf_runner() {
             !inner.agent_job_requests.contains_key(&old_agent_job_id),
             "the abandoned runtime identity must be revoked"
         );
+        assert!(
+            inner.job_steps.contains_key(&old_agent_job_id),
+            "abandoned attempt step manifest must remain for log-blob mapping"
+        );
+        assert!(
+            inner.job_steps.contains_key(&request.agent_job_id),
+            "retry identity must receive a fresh step manifest"
+        );
+        assert!(
+            inner
+                .live_log_closed
+                .contains(&old_agent_job_id.to_string()),
+            "abandoned attempt live-log feed must close so followers exit"
+        );
         assert_eq!(
             inner.agent_job_requests.get(&request.agent_job_id),
             Some(&request_id),

@@ -36,7 +36,7 @@ jobs:
             --client-binary target/debug/preloop-runner-client \
             --official benchmarks/compatibility/runner/behavior/conformance-official.jsonl \
             --exclude-prefix 2 \
-            --exclude-prefix 16 \
+            --exclude-prefix 16-container \
             --exclude-prefix 17 \
             --exclude-prefix 30 \
             --exclude-prefix 31 \

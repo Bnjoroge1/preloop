@@ -113,8 +113,20 @@ python3 benchmarks/real-world/local-runner-conformance.py \
   --runner-binary target/debug/preloop-runner \
   --client-binary target/debug/preloop-runner-client \
   --official benchmarks/compatibility/runner/behavior/conformance-official.jsonl \
+  --exclude-prefix 2 \
+  --exclude-prefix 16-container \
+  --exclude-prefix 17 \
+  --exclude-prefix 30 \
+  --exclude-prefix 31 \
+  --exclude-prefix 32 \
+  --exclude-prefix 33 \
+  --exclude-prefix 34 \
+  --exclude-prefix 35 \
+  --exclude-prefix 36 \
   --output benchmarks/compatibility/runner/behavior/conformance-preloop.jsonl
-python3 benchmarks/real-world/runner-conformance.py --mode local
+python3 benchmarks/real-world/runner-conformance.py --mode local \
+  --preloop benchmarks/compatibility/runner/behavior/conformance-preloop.jsonl \
+  --output benchmarks/compatibility/runner/behavior/RUNNER-CONFORMANCE-REPORT.md
 ```
 
 This catches runner execution regressions that a request replay cannot see:

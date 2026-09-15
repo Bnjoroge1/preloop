@@ -1787,6 +1787,25 @@ async fn git_diff_text() -> anyhow::Result<String> {
     Ok(String::from_utf8_lossy(&output.stdout).to_string())
 }
 
+/// Runner version advertised on replay registration, from root `versions.toml`.
+fn pinned_runner_version() -> String {
+    let path = Path::new(env!("CARGO_MANIFEST_DIR")).join("../../versions.toml");
+    let text = fs::read_to_string(&path).unwrap_or_default();
+    for line in text.lines() {
+        if let Some(rest) = line.trim_start().strip_prefix("runner_version") {
+            if let Some((_, value)) = rest.split_once('=') {
+                let version = value.trim().trim_matches('"');
+                if !version.is_empty() {
+                    return version.to_owned();
+                }
+            }
+        }
+    }
+    // Last-resort fallback keeps offline tooling runnable if versions.toml is
+    // missing; production checkouts always have the pin.
+    "2.336.0".to_owned()
+}
+
 fn sorted_files(dir: &Path, ext: &str) -> anyhow::Result<Vec<PathBuf>> {
     if !dir.exists() {
         return Ok(Vec::new());
@@ -2107,7 +2126,7 @@ async fn replay_flows_to_preloop_inner(
             .header("Authorization", format!("Bearer {native_token}"))
             .json(&json!({
                 "name": "runner-watch-replay",
-                "version": "2.335.1",
+                "version": pinned_runner_version(),
                 "osDescription": "runner-watch",
                 "authorization": {
                     "publicKey": {
@@ -4607,17 +4626,7 @@ mod tests {
     /// `runner_version` so fixtures track the shipped runner instead of a
     /// hardcoded version that rots when the pin moves.
     fn golden_runner_version() -> String {
-        let path = Path::new(env!("CARGO_MANIFEST_DIR")).join("../../versions.toml");
-        let text = std::fs::read_to_string(&path)
-            .unwrap_or_else(|error| panic!("read {}: {error}", path.display()));
-        for line in text.lines() {
-            if let Some(rest) = line.trim_start().strip_prefix("runner_version") {
-                if let Some((_, value)) = rest.split_once('=') {
-                    return value.trim().trim_matches('"').to_owned();
-                }
-            }
-        }
-        panic!("runner_version not found in {}", path.display());
+        pinned_runner_version()
     }
 
     /// Minimal isolated temp directory (runner-watch has no tempfile dev-dep;
