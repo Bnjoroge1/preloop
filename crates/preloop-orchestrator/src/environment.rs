@@ -159,7 +159,7 @@ impl ToolchainLayer {
                            aarch64|arm64) RUST_ARCH=aarch64 ;;\n\
                            *) echo \"unsupported arch: $arch\" >&2; exit 1 ;;\n\
                          esac\n\
-                         export RUSTUP_HOME=/home/runner/.rustup CARGO_HOME=/home/runner/.cargo\n\
+                         export RUSTUP_HOME=/usr/local/rustup CARGO_HOME=/usr/local/cargo\n\
                          curl -fsSL \"https://static.rust-lang.org/rustup/archive/{}/$RUST_ARCH-unknown-linux-gnu/rustup-init\" -o /tmp/rustup-init\n\
                          chmod +x /tmp/rustup-init\n\
                          /tmp/rustup-init -y --profile minimal --default-toolchain {} --component rustfmt,clippy\n\
@@ -171,9 +171,17 @@ impl ToolchainLayer {
                 vec![
                     "sh".into(),
                     "-c".into(),
-                    // The toolchain is installed as the runner user, so
-                    // StepContext adds `/home/runner/.cargo/bin` to PATH.
-                    "true".into(),
+                    // Run steps execute with `bash --noprofile --norc`, so
+                    // profile.d PATH exports are never sourced. The toolchain
+                    // lives at the fixed system addresses exported by
+                    // `guest_env_prefix` (RUSTUP_HOME / CARGO_HOME above):
+                    // the bake runs as root while job steps run as the
+                    // unprivileged runner user, and rustup obeys those
+                    // variables verbatim, so a $HOME-derived location is
+                    // simply unreachable across that boundary (/root is
+                    // 0700). Symlink the shims into /usr/local/bin so they
+                    // resolve on the default system PATH for every step.
+                    "ln -sf /usr/local/cargo/bin/cargo /usr/local/bin/cargo; ln -sf /usr/local/cargo/bin/cargo-fmt /usr/local/bin/cargo-fmt; ln -sf /usr/local/cargo/bin/cargo-clippy /usr/local/bin/cargo-clippy; ln -sf /usr/local/cargo/bin/rustc /usr/local/bin/rustc; ln -sf /usr/local/cargo/bin/rustdoc /usr/local/bin/rustdoc; ln -sf /usr/local/cargo/bin/rustup /usr/local/bin/rustup".into(),
                 ],
             ],
             Self::Python(version) => {
@@ -208,17 +216,18 @@ impl ToolchainLayer {
                          [ -n \"$VERSION\" ] || {{ echo \"no go release matching $WANT\" >&2; exit 1; }}\n\
                          arch=$(uname -m)\n\
                          case \"$arch\" in aarch64) arch=arm64 ;; x86_64) arch=amd64 ;; esac\n\
-                         curl -fsSL \"https://go.dev/dl/$VERSION.linux-$arch.tar.gz\" | tar -C /home/runner -xzf -",
+                         curl -fsSL \"https://go.dev/dl/$VERSION.linux-$arch.tar.gz\" | tar -C /usr/local -xzf -",
                         safe_component(version)
                     ),
                 ],
                 vec![
                     "sh".into(),
                     "-c".into(),
-                    // The Go tarball is installed as the runner user at
-                    // `/home/runner/go`; StepContext adds its bin directory
-                    // to PATH for subsequent steps.
-                    "true".into(),
+                    // The Go tarball extracts to /usr/local/go/bin, which is
+                    // not on the default system PATH. Step shells run with
+                    // `bash --noprofile --norc`, so profile.d exports never
+                    // apply; symlink the binaries like the Rust layer does.
+                    "ln -sf /usr/local/go/bin/go /usr/local/bin/go; ln -sf /usr/local/go/bin/gofmt /usr/local/bin/gofmt".into(),
                 ],
             ],
         }
@@ -243,7 +252,7 @@ impl ToolchainLayer {
             Self::Rust(channel) => {
                 let channel = safe_component(channel);
                 format!(
-                    "export RUSTUP_HOME=/home/runner/.rustup CARGO_HOME=/home/runner/.cargo PATH=/home/runner/.cargo/bin:$PATH && \
+                    "export RUSTUP_HOME=/usr/local/rustup CARGO_HOME=/usr/local/cargo && \
                      command -v cargo >/dev/null && \
                      rustup run {channel} rustc --version >/dev/null && \
                      rustup run {channel} cargo-fmt --version >/dev/null && \
@@ -251,7 +260,7 @@ impl ToolchainLayer {
                 )
             }
             Self::Go(_) => {
-                "export PATH=/home/runner/go/bin:$PATH && command -v go >/dev/null".to_owned()
+                "export PATH=/usr/local/go/bin:$PATH && command -v go >/dev/null".to_owned()
             }
             _ => format!("command -v {} >/dev/null", self.verify_binary()),
         }
@@ -540,7 +549,19 @@ mod tests {
     fn rust_layer_puts_rustdoc_on_default_path() {
         let commands = ToolchainLayer::Rust("stable".into()).install_commands();
         let script = commands[1].join(" ");
-        assert_eq!(script, "sh -c true");
+        for binary in [
+            "cargo",
+            "cargo-fmt",
+            "cargo-clippy",
+            "rustc",
+            "rustdoc",
+            "rustup",
+        ] {
+            assert!(
+                script.contains(&format!("/usr/local/bin/{binary}")),
+                "{binary} must be linked onto the default PATH: {script}"
+            );
+        }
     }
 
     #[test]
@@ -549,18 +570,20 @@ mod tests {
         let script = commands[0].join(" ");
         assert!(script.contains("go.dev/dl/?mode=json"));
         assert!(script.contains("$VERSION.linux"));
-        assert!(script.contains("tar -C /home/runner -xzf -"));
+        assert!(script.contains("tar -C /usr/local -xzf -"));
         assert!(!script.contains("go1.24.linux")); // never a raw minimum
     }
 
     #[test]
     fn go_layer_puts_binary_on_default_path() {
-        // The Go tarball is installed in the runner-owned home; the runner
-        // adds its bin directory to each step's PATH.
+        // The Go tarball extracts to /usr/local/go/bin, which is not on the
+        // default PATH of `bash --noprofile --norc` step shells, so `go` and
+        // `gofmt` would be unresolvable in job steps without the symlinks.
         let commands = ToolchainLayer::Go("1.24".into()).install_commands();
         assert_eq!(commands.len(), 2);
         let script = commands[1].join(" ");
-        assert_eq!(script, "sh -c true");
+        assert!(script.contains("ln -sf /usr/local/go/bin/go /usr/local/bin/go"));
+        assert!(script.contains("ln -sf /usr/local/go/bin/gofmt /usr/local/bin/gofmt"));
     }
 
     #[test]
@@ -673,9 +696,9 @@ mod tests {
         let command = ToolchainLayer::Rust("1.97".into()).verify_command();
         assert!(
             command.starts_with(
-                "export RUSTUP_HOME=/home/runner/.rustup CARGO_HOME=/home/runner/.cargo PATH=/home/runner/.cargo/bin:$PATH && "
+                "export RUSTUP_HOME=/usr/local/rustup CARGO_HOME=/usr/local/cargo && "
             ),
-            "verification must resolve the runner-owned toolchain homes: {command}"
+            "verification must resolve the baked system homes, not $HOME: {command}"
         );
         assert!(command.contains("rustup run 1.97 rustc --version"));
     }
