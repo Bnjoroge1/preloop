@@ -197,7 +197,6 @@ def prepare_scenario_workspace(
 
     return workspace / workflow.relative_to(scenario), workspace, duration
 
-
 def wait_for_run(
     server_url: str,
     token: str,
