@@ -189,6 +189,24 @@ def compare(
 
     return issues
 
+def allowed_local_conclusions(workflow: str) -> set[str]:
+    """Expected workflow conclusions for local runner-light validation.
+
+    Local mode does not compare against GitHub, but still rejects a silent
+    regression that turns a green fixture red (or a cancel fixture into
+    success). Name-based expectations keep the gate deterministic without
+    requiring per-scenario oracle files.
+    """
+    name = workflow.lower()
+    if "cancel" in name:
+        return {"cancelled"}
+    if "fail" in name or "timeout" in name:
+        return {"failure"}
+    if "continue-on-error" in name:
+        return {"success", "failure"}
+    return {"success"}
+
+
 def validate_local(records: dict[str, dict[str, Any]]) -> list[str]:
     """Validate a local runner execution without pretending it is GitHub."""
     issues: list[str] = []
@@ -201,9 +219,16 @@ def validate_local(records: dict[str, dict[str, Any]]) -> list[str]:
         if not isinstance(result, dict):
             issues.append(f"{number}: local response has no result object")
             continue
-        conclusion = str(result.get("conclusion") or "")
+        workflow_name = str(record.get("workflow") or number)
+        conclusion = str(result.get("conclusion") or record.get("conclusion") or "")
         if conclusion not in terminal:
             issues.append(f"{number}: local workflow conclusion={conclusion or '(empty)'}")
+        allowed = allowed_local_conclusions(workflow_name)
+        if conclusion in terminal and conclusion not in allowed:
+            issues.append(
+                f"{number}: local workflow conclusion={conclusion!r} "
+                f"not in expected {sorted(allowed)} for {workflow_name}"
+            )
         raw_jobs = result.get("jobs")
         if not isinstance(raw_jobs, list) or not raw_jobs:
             issues.append(f"{number}: local response has no jobs")

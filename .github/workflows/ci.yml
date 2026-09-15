@@ -72,24 +72,35 @@ jobs:
       - uses: actions/checkout@08c6903cd8c0fde910a37f88322edcfb5dd907a8 # v5.0.0
         with:
           persist-credentials: false
+          lfs: false
       - name: Materialize conformance goldens
         run: |
-          # The only workspace tests that read goldens at test time
-          # (`test_golden_acquirejob_payloads_parsing` and runner-watch's
-          # scenario-07 replay) read the pinned runner version's scenarios
-          # (~10 MB). Derive the version from versions.toml so this stays in
-          # lockstep with those tests. The old `--include=".runner-watch/golden/**"`
-          # also fetched the other runner corpora (hundreds of MB) that only the
-          # conformance workflows replay, on every shard.
+          # Only these nine captures are read by workspace tests:
+          # eight acquirejob parser fixtures plus runner-watch's scenario-07
+          # replay metadata. Fetch each flow directly instead of the complete
+          # pinned corpus (which also contains 100+ MB container captures).
           version=$(python3 -c 'import tomllib; print(tomllib.load(open("versions.toml", "rb"))["runner_version"])')
-          git lfs install --local
-          git lfs pull --include=".runner-watch/golden/v${version}/**"
-          fixture=".runner-watch/golden/v${version}/06-multi-step/flows.jsonl"
-          test -s "$fixture"
-          if grep -q '^version https://git-lfs.github.com/spec/' "$fixture"; then
-            echo "LFS fixture was not materialized: $fixture" >&2
-            exit 1
-          fi
+          git lfs install --local --force
+          includes=""
+          for scenario in \
+            06-multi-step 07-step-failure 08-job-outputs-needs \
+            10-uses-checkout 11-cache-roundtrip 12-artifact \
+            13-composite-action 14-annotations 15-oidc-id-token; do
+            path=".runner-watch/golden/v${version}/${scenario}/flows.jsonl"
+            includes="${includes:+$includes,}$path"
+          done
+          git lfs pull --include="$includes"
+          for scenario in \
+            06-multi-step 07-step-failure 08-job-outputs-needs \
+            10-uses-checkout 11-cache-roundtrip 12-artifact \
+            13-composite-action 14-annotations 15-oidc-id-token; do
+            fixture=".runner-watch/golden/v${version}/${scenario}/flows.jsonl"
+            test -s "$fixture"
+            if grep -q '^version https://git-lfs.github.com/spec/' "$fixture"; then
+              echo "LFS fixture was not materialized: $fixture" >&2
+              exit 1
+            fi
+          done
       - uses: dtolnay/rust-toolchain@6bed0761d98439e5a578e2877258200ad565ba87 # stable
         with:
           toolchain: "1.97"

@@ -2852,6 +2852,10 @@ pub(crate) fn settle_request(inner: &mut InnerState, request_id: i64, status: Ex
 /// records, but remove the dead owner before requeueing: the old runner is
 /// then rejected until a replacement session claims the request, and that
 /// replacement can renew and complete it normally.
+///
+/// The abandoned attempt keeps its step manifest (log-blob mapping) and its
+/// live-log feed is closed so `logs -f` followers exit. The retry identity is
+/// seeded with a fresh pending manifest from the queued message.
 pub(crate) fn release_request_for_retry(inner: &mut InnerState, request_id: i64) {
     inner
         .session_active_requests
@@ -2887,12 +2891,34 @@ pub(crate) fn release_request_for_retry(inner: &mut InnerState, request_id: i64)
     inner
         .agent_job_requests
         .insert(new_agent_job_id, request_id);
-    inner.job_steps.remove(&old_agent_job_id);
-    inner.job_steps_revision.remove(&old_agent_job_id);
-    if let Some(steps) = retry_steps {
+
+    // Abandoned attempt stays addressable for its log blobs. Do not delete
+    // `job_steps[old]`; only seed the replacement identity.
+    let steps_for_retry = retry_steps.or_else(|| {
+        inner.job_steps.get(&old_agent_job_id).map(|steps| {
+            steps
+                .iter()
+                .filter(|step| step.kind == crate::models::StepKind::Workflow)
+                .enumerate()
+                .map(|(index, step)| {
+                    crate::models::StepRecord::workflow(
+                        step.id.clone(),
+                        step.workflow_index.unwrap_or(index),
+                        step.name.clone(),
+                        step.context_name.clone(),
+                    )
+                })
+                .collect::<Vec<_>>()
+        })
+    });
+    if let Some(steps) = steps_for_retry.filter(|steps| !steps.is_empty()) {
         inner.job_steps.insert(new_agent_job_id, steps);
         inner.job_steps_revision.insert(new_agent_job_id, 0);
     }
+
+    // Close followers on the abandoned attempt's feed. The retry uses a new
+    // agent_job_id key, so it gets a fresh channel when it streams.
+    crate::live_logs::close_live_log(inner, &old_agent_job_id.to_string());
 
     if let Some(record) = inner.job_requests.get_mut(&request_id) {
         record.agent_job_id = new_agent_job_id;

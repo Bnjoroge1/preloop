@@ -113,8 +113,20 @@ python3 benchmarks/real-world/local-runner-conformance.py \
   --runner-binary target/debug/preloop-runner \
   --client-binary target/debug/preloop-runner-client \
   --official benchmarks/compatibility/runner/behavior/conformance-official.jsonl \
+  --exclude-prefix 2 \
+  --exclude-prefix 16-container \
+  --exclude-prefix 17 \
+  --exclude-prefix 30 \
+  --exclude-prefix 31 \
+  --exclude-prefix 32 \
+  --exclude-prefix 33 \
+  --exclude-prefix 34 \
+  --exclude-prefix 35 \
+  --exclude-prefix 36 \
   --output benchmarks/compatibility/runner/behavior/conformance-preloop.jsonl
-python3 benchmarks/real-world/runner-conformance.py --mode local
+python3 benchmarks/real-world/runner-conformance.py --mode local \
+  --preloop benchmarks/compatibility/runner/behavior/conformance-preloop.jsonl \
+  --output benchmarks/compatibility/runner/behavior/RUNNER-CONFORMANCE-REPORT.md
 ```
 
 This catches runner execution regressions that a request replay cannot see:
@@ -125,12 +137,14 @@ has produced records. Local execution deliberately does not treat GitHub
 conclusions as an oracle: infrastructure-dependent fixtures can legitimately
 change conclusion on a local host.
 
-The v2.337.0 campaign is included in both gates. The server-light replay
-targets the `gh-official` cell through `benchmarks/conformance/targets.toml`;
-`experiments/mitm/bin/reconstruct_scenario.py` reconstructed the 27 workflow
-manifests under `experiments/mitm/scenarios/201-*` through `227-*`. The local
-runner harness discovers those manifests automatically, so the PR gate runs
-the current runner through the v2.337.0 scenarios without contacting GitHub.
+The v2.337.0 campaign is retained as comparison material, but is not part of
+the required CI gates: its reconstructed workflows are incomplete and their
+acquirejob payloads are not equivalent provenance to the v2.336.0 captures.
+The server-light replay targets only the shipped runner version through
+`benchmarks/conformance/targets.toml`. The local runner harness excludes the
+reconstructed `2xx-*` manifests plus VM-only container/service manifests; the
+latter belong to the VM-backed deep profile. All remain available for explicit
+campaign runs.
 
 ## Tracking new official runner versions
 
@@ -205,9 +219,10 @@ the reconstruction and replay gate: its 27 captures all contain a populated
 not silently presented as official-runner provenance.
 
 `benchmarks/conformance/targets.toml` is the single CI target list. The
-conformance workflow starts one replay server and iterates that list, currently
-replaying v2.336.0 plus the recovered v2.337.0 `gh-official` cell. Adding a
-future version is one target entry, not another workflow job.
+conformance workflow starts one replay server and currently iterates only the
+shipped v2.336.0 target. The recovered v2.337.0 cell is intentionally omitted
+until its reconstructed workflows have protocol-equivalent provenance. Adding
+a future verified version is one target entry, not another workflow job.
 
 `experiments/mitm/bin/reconstruct_scenario.py` decodes the first populated
 `acquirejob` response and emits the workflow plus the standard submit/wait

@@ -82,6 +82,13 @@ fn every_required_check_is_produced_by_a_workflow() {
 
 #[test]
 fn live_main_ruleset_matches_required_checks() {
+    // Opt-in only: default `cargo test` must not hit the network. CI/ops can
+    // set PRELOOP_LIVE_RULESET_CHECK=1 when intentionally reconciling the
+    // live GitHub ruleset against REQUIRED_CHECKS.
+    if std::env::var_os("PRELOOP_LIVE_RULESET_CHECK").is_none() {
+        eprintln!("skipping live ruleset check (set PRELOOP_LIVE_RULESET_CHECK=1 to run)");
+        return;
+    }
     let api_url =
         std::env::var("GITHUB_API_URL").unwrap_or_else(|_| "https://api.github.com".to_owned());
     let url = format!("{api_url}/repos/preloopdev/preloop/rulesets/20594250");
