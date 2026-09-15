@@ -133,7 +133,6 @@ pub(crate) struct RunResponse {
 #[openapi(
     info(
         title = "preloop Native API",
-        version = "0.2.0",
         description = "Native control-plane API for workflow submission, inspection, artifacts, cache, and debugging. Runner-compatible protocol routes (`/_apis/…`, `/broker/…`, `/twirp/…`) are intentionally excluded — they are governed by the official actions/runner protocol."
     ),
     tags(

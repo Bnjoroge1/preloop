@@ -1,6 +1,6 @@
 [package]
 name = "preloop-runner-server"
-version = "0.2.0"
+version.workspace = true
 edition.workspace = true
 # FSL-1.1-MIT: source-available, converts to MIT on the second anniversary
 # of each release (see LICENSE in this crate). The rest of the workspace is
