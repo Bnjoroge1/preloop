@@ -9,6 +9,65 @@ Releases before v0.27.0 predate the changelog.
 
 ## [Unreleased]
 
+### Added
+
+- **AgentENV is now a first-class VM substrate, opt-in on KVM hosts.**
+  `crates/preloop-vm/src/agentenv.rs` implements `VmProvider` over the `aenv`
+  CLI (Firecracker + overlaybd + ublk), selected with
+  `PRELOOP_VM_BACKEND=agentenv` on a host with Linux ≥ 6.8 and `/dev/kvm`;
+  `PRELOOP_VM_BACKEND=smolvm|agentenv` overrides, and an unrecognized value is
+  a hard error rather than a silent fallback. macOS is unchanged (SmolVM is the
+  only libkrun-capable runtime there). AgentENV is faster at every VM lifecycle
+  operation the pool performs (boot, fork, pause, resume); guest CPU is
+  identical and guest I/O trades in both directions. Rationale, mapping, and
+  operational caveats in `docs/vm-substrates.md`; harnesses in
+  `benchmarks/substrates/`.
+- `VmProvider::capabilities()` reports what a backend can express
+  (`live_host_volumes`, `socket_mounts`, `file_packs`), defaulting to SmolVM's
+  behaviour so existing providers need no change. The orchestrator branches on
+  it instead of assuming: a backend whose packs are not host files no longer
+  builds, downloads, or relocates an artifact — it prepares its golden directly
+  from the base image and forks per job.
+- The engine manages its own AgentENV egress exception: with the AgentENV
+  backend selected, pool startup reconciles the surgical node deny-list
+  complement and the ordered host firewall rules from `PRELOOP_RUNNER_URL`
+  (verify-first, mutate only on drift, restart `aenv` only on config change).
+  Narrow `sudoers` scope, `PRELOOP_AENV_MANAGE_EGRESS=0|dry-run` escape hatches,
+  and `PRELOOP_AENV_ENGINE_IP` override in `docs/vm-substrates.md`.
+
+### Changed
+
+- `preloop shell` and `preloop debug` reach guests through the resolved backend
+  (`guest_exec_command` / `guest_upload_command` / `guest_shell_command`)
+  instead of spawning `smolvm` directly. On AgentENV they resolve the
+  server-assigned sandbox id from the engine's registry
+  (`$PRELOOP_HOME/agentenv-machines.json`) and report a clear error when it is
+  missing, rather than failing obscurely.
+- On the AgentENV backend `preloop serve` forces the TCP control transport
+  (`control_socket = None`): AgentENV cannot forward a host Unix socket into a
+  guest. `PRELOOP_RUNNER_URL` must therefore be guest-reachable.
+- **Debugging is explicit on AgentENV, and unattached debug VMs suspend.**
+  `preloop run --debug` is the opt-in for a live debug session (wire field
+  `preloopDebugOnFailure`); with no flags an AgentENV failed job is cleaned up
+  instead of parking a paid sandbox — SmolVM keeps its terminal-attached
+  default for compatibility, and `--preserve-on-failure` remains the
+  shell-only hold. The orchestrator suspends an unattached AgentENV debug
+  sandbox after 15 s (`aenv pause`, measured 0.19 s) and resumes it when
+  `preloop debug`/`preloop shell` attaches (measured 0.09 s), gated on the new
+  `VmProvider::capabilities().preserves_runtime_state_on_suspend` so backends
+  whose stop is a real shutdown are never parked mid-session. `preloop shell`
+  exit now demotes its marker instead of deleting it, holding the VM for the
+  remaining 10-minute idle window; the engine renews the AgentENV TTL
+  keepalive on attach and re-suspends on detach.
+  Verified live on a KVM host: real Firecracker debug sessions suspend after
+  15 s unattached and resume for attach/verdict (same-VM retry passed
+  end-to-end). Hardening that fell out of the live run: the guest
+  provisioning wrapper now survives base images without `sudo` (missing
+  `/etc/sudoers.d`, `useradd` off the exec PATH — the bare `ubuntu:24.04`
+  sandbox broke configure), and `preloop debug`/`preloop shell` poll for
+  envd readiness after `aenv resume` instead of racing its proxy ("410
+  Gone: sandbox is not proxyable").
+
 ### Fixed
 
 - Runner teardown now releases stale job bindings immediately, status snapshots
@@ -24,6 +83,43 @@ Releases before v0.27.0 predate the changelog.
   left `in_progress` with nothing executing it raises a
   `run_in_progress_without_execution` condition instead of vanishing from the
   operator's view.
+- `preloop run` declared its change set as known even when path derivation had
+  not run, so an empty list read as "nothing changed" and every `paths:` filter
+  rejected the run with a 400. The flag now mirrors whether derivation actually
+  produced a list.
+- Every path that attaches a controller — the REPL, the inline failure prompt,
+  `preloop debug --verdict`, and `preloop shell` — now holds the same attach
+  marker for as long as it may act. Previously a one-shot verdict claimed no
+  marker at all, so the orchestrator could suspend the VM under the controller,
+  and the marker was demoted before the watcher observed it. Marker release
+  after a verdict now waits for the worker's session transition, which is what
+  lets the watcher resume the VM and re-acquire the pool concurrency permit;
+  without it a resumed job's slot stayed released.
+- `AgentEnvProvider::exec_with_secret_env` returned success for a guest command
+  that exited non-zero, so a failing secret-bearing step reported as passed.
+  The exit status now propagates while the secret payload is still removed.
+- The substrate benchmark harnesses purged sandboxes they did not own: both
+  `benchmarks/substrates/e2e-bench.sh` and `benchmarks/substrates/project-bench.sh` swept every AgentENV sandbox on the
+  host instead of the ids in their own `$PRELOOP_HOME` registry. They now read
+  their registry and tolerate ids that are already gone.
+- `benchmarks/substrates/aenv-egress-allow-host.sh` is idempotent and sets its
+  firewall exception up in an order that survives an `aenv` restart: a second
+  run no longer appends a duplicate deny-list complement, and the engine-port
+  `ACCEPT` rules are re-inserted at the head of `INPUT` after the service
+  re-adds its blanket veth `REJECT`.
+- Debug attach no longer strands a live heartbeat when the guest resume fails:
+  `DebugAttach::claim` resumes before writing ACTIVE, and `preloop debug
+  --export` holds the same attach guard as every other controller path.
+- The AgentENV provider no longer leaks sandboxes on partial startup (the id
+  is recorded before readiness probes run), orphans clones on retried forks
+  (duplicate names are rejected), or lets a failed pause cancel the TTL
+  keepalive out from under a live session (cancelled only on success; transient
+  keepalive failures retry). Unenforceable specs (`Restricted` network,
+  per-sandbox `dns`, zero storage) are rejected at create time instead of
+  silently substituted.
+- On-demand pool slots honor the packed-golden fallback like warm slots, and a
+  loopback `PRELOOP_RUNNER_URL` with the AgentENV backend fails pool startup
+  with the fix — loopback is the guest itself there, so every job would starve.
 
 ## [0.32.9] - 2026-09-15
 
