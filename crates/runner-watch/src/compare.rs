@@ -468,7 +468,14 @@ pub enum ValueGate {
 pub struct GatePolicy {
     /// Endpoint substrings whose status mismatches are ignored (un-replayable).
     pub status_ignore: Vec<String>,
-    /// Endpoint substrings whose response-schema removals are gated (acquirejob).
+    /// Endpoint substrings whose response-schema removals are gated.
+    ///
+    /// Matched against the normalized endpoint key built by `group_flows`
+    /// (`"{method} {normalize_path(path)}"`). Raw golden acquirejob paths are
+    /// `/{pool}/acquirejob` → `POST /{n}/acquirejob`. Live `conform` replay
+    /// first prefixes `/broker` (`normalize_request_path`), so the same
+    /// endpoint becomes `POST /broker/{n}/acquirejob`. Gating on `acquirejob`
+    /// matches both shapes.
     pub response_schema_gate: Vec<String>,
     /// Value-gate mode (finding #4).
     pub value_gate: ValueGate,
@@ -478,7 +485,7 @@ impl Default for GatePolicy {
     fn default() -> Self {
         Self {
             status_ignore: vec!["/oauth2/token".to_owned(), "/messages".to_owned()],
-            response_schema_gate: vec!["/broker/{n}/acquirejob".to_owned()],
+            response_schema_gate: vec!["acquirejob".to_owned()],
             value_gate: ValueGate::Off,
         }
     }
@@ -1413,6 +1420,48 @@ mod tests {
         );
         let fails = analyze_dirs(&l, &r).failures(&GatePolicy::default());
         assert!(fails.iter().any(|f| f.kind == FailureKind::ResponseSchema));
+    }
+
+    /// Raw goldens record `/<pool>/acquirejob` (`POST /{n}/acquirejob` after
+    /// `normalize_path`). `conform` replay rewrites that to `/broker/{n}/…`
+    /// first, so a `/broker/` substring *does* fire there — but `analyze` on
+    /// un-rewritten captures would miss it. Gating on `acquirejob` covers both.
+    #[test]
+    fn gate_catches_field_drop_on_golden_shaped_acquirejob_path() {
+        let golden_flow = |response: Value| {
+            serde_json::json!({
+                "method": "POST",
+                "path": "/190/acquirejob",
+                "status": 200,
+                "request_body_json": {"runnerId": 7},
+                "response_body_json": response,
+                "duration_ms": 1.0,
+            })
+        };
+        let l = tmp_capture(
+            "gdl",
+            &[golden_flow(
+                serde_json::json!({"job": {"id": "g", "steps": ["a"]}}),
+            )],
+        );
+        let r = tmp_capture(
+            "gdr",
+            &[golden_flow(serde_json::json!({"job": {"id": "g"}}))],
+        );
+        let report = analyze_dirs(&l, &r);
+        assert!(
+            report
+                .endpoints
+                .iter()
+                .any(|e| e.key == "POST /{n}/acquirejob"),
+            "golden acquirejob path must normalize to the un-prefixed key: {:?}",
+            report.endpoints.iter().map(|e| &e.key).collect::<Vec<_>>()
+        );
+        let fails = report.failures(&GatePolicy::default());
+        assert!(
+            fails.iter().any(|f| f.kind == FailureKind::ResponseSchema),
+            "dropped acquirejob field must be gated on the golden path shape: {fails:?}"
+        );
     }
 
     #[test]
