@@ -2,6 +2,9 @@ name: runner-conformance
 permissions:
   contents: read
 
+env:
+  RUSTUP_HOME: /home/runner/.rustup
+
 on:
   push:
     branches: [main]

@@ -2,6 +2,9 @@ name: server-conformance
 permissions:
   contents: read
 
+env:
+  RUSTUP_HOME: /home/runner/.rustup
+
 on:
   pull_request:
     paths-ignore:

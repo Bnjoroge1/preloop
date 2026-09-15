@@ -2,6 +2,9 @@ name: ci
 permissions:
   contents: read
 
+env:
+  RUSTUP_HOME: /home/runner/.rustup
+
 on:
   push:
     branches: [main]
