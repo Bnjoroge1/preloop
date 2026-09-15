@@ -25,6 +25,21 @@ Releases before v0.27.0 predate the changelog.
   `run_in_progress_without_execution` condition instead of vanishing from the
   operator's view.
 
+## [0.32.8] - 2026-09-15
+
+### Fixed
+
+- Rust and Go toolchains are baked into the same homes the runner exports to
+  jobs (`/usr/local/rustup`, `/usr/local/cargo`, `/usr/local/go`). Installing
+  to `$HOME` while exporting the system paths left `rustup toolchain install`
+  writing to a root-owned directory it could not create, failing every Rust
+  job with `could not create home directory`. Both layers also restore their
+  `/usr/local/bin` shims, which step shells need because `bash --noprofile
+  --norc` never sources `profile.d`.
+- `preloop-cli` and `preloop-runner-server` share one workspace version, so
+  `--version` and `preloop status`'s `service.version` both identify the
+  deployed build instead of reporting stale, unrelated numbers.
+
 ## [0.32.7] - 2026-09-10
 
 ### Fixed
