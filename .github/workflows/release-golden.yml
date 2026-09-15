@@ -216,43 +216,19 @@ jobs:
           set -euo pipefail
           mkdir -p dist
           rm -f "dist/$GOLDEN_NAME"
-          IMAGE_TAR="$(pwd)/base-image.tar"
-          if [ ! -s "$IMAGE_TAR" ]; then
-            echo "Pulling base image via host Docker daemon..."
-            docker pull "$BASE_IMAGE"
-            echo "Saving base image to $IMAGE_TAR..."
-            docker save "$BASE_IMAGE" -o "$IMAGE_TAR"
-          fi
-          test -s "$IMAGE_TAR"
-
           export PRELOOP_REQUIRE_BASE_DIGEST=1
-          export PRELOOP_RUNNER_BASE_IMAGE="$IMAGE_TAR"
+          export PRELOOP_RUNNER_BASE_IMAGE="$BASE_IMAGE"
           export PRELOOP_RUNNER_STORAGE_GB=120
           export PRELOOP_RUNNER_OVERLAY_GB=120
-          # The runner-large base archive is ~17 GiB uncompressed, over
-          # smolvm's 8 GiB default local-archive cap. Without this the bake
-          # fails every attempt at `smolvm create` before extracting a byte.
+          # The runner-large image is too large for a Docker save on the
+          # hosted runner's filesystem. SmolVM's registry export path streams
+          # the digest-pinned image without materializing a second 17 GiB tar.
           export SMOLVM_MAX_IMAGE_BYTES=34359738368
-          export PRELOOP_GOLDEN_NAME_PREFIX="preloop-release-golden-${GITHUB_RUN_ID}"
-          builder="preloop-release-golden-${GITHUB_RUN_ID}-builder"
-          need_mib=6144
+          export PRELOOP_GOLDEN_NAME_PREFIX="preloop-release-golden-${GITHUB_RUN_ID}-x86_64"
+          builder="${PRELOOP_GOLDEN_NAME_PREFIX}-builder"
           attempts=3
-          headroom() { awk '/^MemAvailable:/ { print int($2 / 1024) }' /proc/meminfo; }
           for attempt in $(seq 1 "$attempts"); do
-            for _ in $(seq 1 45); do
-              waiting="$(headroom)"
-              if [ "$waiting" -ge "$need_mib" ]; then break; fi
-              echo "waiting for host headroom: ${waiting} MiB < ${need_mib} MiB"
-              sleep 60
-            done
-            available="$(headroom)"
-            if [ "$available" -lt "$need_mib" ]; then
-              echo "host never freed ${need_mib} MiB (last ${available} MiB)" >&2
-              exit 1
-            fi
-            echo "attempt ${attempt}/${attempts} with ${available} MiB available"
-            smolvm machine delete --name "$builder" \
-              --force --cascade >/dev/null 2>&1 || true
+            smolvm machine delete --name "$builder" --force --cascade >/dev/null 2>&1 || true
             if ./target/release/preloop build-golden \
                 --runner-bundle "target/$RUNNER_TARGET/release" \
                 --output "dist/$GOLDEN_NAME"; then
@@ -262,8 +238,8 @@ jobs:
               echo "build-golden failed after ${attempts} attempts" >&2
               exit 1
             fi
-            echo "build-golden failed; backing off before retry"
             rm -f "dist/$GOLDEN_NAME"
+            echo "build-golden failed; backing off before retry"
             sleep $((attempt * 120))
           done
           test -s "dist/$GOLDEN_NAME"
@@ -470,19 +446,34 @@ jobs:
           GOLDEN_NAME: preloop-ubuntu-24.04-aarch64
           GODEBUG: http2client=0
         run: |
+          set -euo pipefail
           mkdir -p dist
           rm -f "dist/$GOLDEN_NAME"
-
           export PRELOOP_REQUIRE_BASE_DIGEST=1
           export PRELOOP_RUNNER_BASE_IMAGE="$BASE_IMAGE"
           export PRELOOP_RUNNER_STORAGE_GB=120
           export PRELOOP_RUNNER_OVERLAY_GB=120
-          # See the x86_64 twin: the pinned runner-large base exceeds
-          # smolvm's 8 GiB default local-archive cap.
+          # The runner-large image exceeds smolvm's default local archive
+          # limit; keep the registry path so smolvm streams it directly.
           export SMOLVM_MAX_IMAGE_BYTES=34359738368
-          ./target/release/preloop build-golden \
-            --runner-bundle "target/$RUNNER_TARGET/release" \
-            --output "dist/$GOLDEN_NAME"
+          export PRELOOP_GOLDEN_NAME_PREFIX="preloop-release-golden-${GITHUB_RUN_ID}-aarch64"
+          builder="${PRELOOP_GOLDEN_NAME_PREFIX}-builder"
+          attempts=3
+          for attempt in $(seq 1 "$attempts"); do
+            smolvm machine delete --name "$builder" --force --cascade >/dev/null 2>&1 || true
+            if ./target/release/preloop build-golden \
+                --runner-bundle "target/$RUNNER_TARGET/release" \
+                --output "dist/$GOLDEN_NAME"; then
+              break
+            fi
+            if [ "$attempt" -eq "$attempts" ]; then
+              echo "build-golden failed after ${attempts} attempts" >&2
+              exit 1
+            fi
+            rm -f "dist/$GOLDEN_NAME"
+            echo "build-golden failed; backing off before retry"
+            sleep $((attempt * 120))
+          done
           test -s "dist/$GOLDEN_NAME"
           shasum -a 256 "dist/$GOLDEN_NAME" > "dist/$GOLDEN_NAME.sha256"
 
