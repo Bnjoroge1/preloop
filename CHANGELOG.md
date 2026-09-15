@@ -25,7 +25,7 @@ Releases before v0.27.0 predate the changelog.
   `run_in_progress_without_execution` condition instead of vanishing from the
   operator's view.
 
-## [0.32.8] - 2026-09-15
+## [0.32.9] - 2026-09-15
 
 ### Fixed
 
