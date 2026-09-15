@@ -381,6 +381,10 @@ pub fn normalize_value(v: &Value) -> Value {
 /// right are tolerated. Inputs must already be [`to_schema_value`] shapes.
 fn schema_drops_fields(left: &Value, right: &Value) -> bool {
     match (left, right) {
+        // Optional TemplateToken fields are encoded as null by the official
+        // runner and as an empty typed token by preloop. The candidate's
+        // richer representation is an addition, not a dropped field.
+        (Value::String(kind), Value::Object(_)) if kind == "null" => false,
         (Value::Object(l), Value::Object(r)) => l.iter().any(|(k, lv)| match r.get(k) {
             Some(rv) => schema_drops_fields(lv, rv),
             None => {
@@ -1416,6 +1420,11 @@ mod tests {
         let reference = to_schema_value(&serde_json::json!({"items": [{"name": "x"}]}));
         let candidate = to_schema_value(&serde_json::json!({"items": []}));
         assert!(!schema_drops_fields(&reference, &candidate));
+        let official_null = to_schema_value(&serde_json::json!({"matrix": null}));
+        let preloop_empty_token = to_schema_value(&serde_json::json!({
+            "matrix": {"d": [], "t": "number"}
+        }));
+        assert!(!schema_drops_fields(&official_null, &preloop_empty_token));
     }
 
     #[test]

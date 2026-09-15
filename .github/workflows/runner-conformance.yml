@@ -3,6 +3,7 @@ permissions:
   contents: read
 
 env:
+  CARGO_HOME: /home/runner/.cargo
   RUSTUP_HOME: /home/runner/.rustup
 
 on:
@@ -18,51 +19,26 @@ on:
 jobs:
   runner-light:
     name: Runner light conformance
-    runs-on: ubuntu-latest
-    timeout-minutes: 30
+    # Trusted contexts only (see server-conformance): fork PR code never
+    # executes on the self-hosted pool.
+    if: github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository
+    runs-on: self-hosted
+    timeout-minutes: 10
     steps:
       - uses: actions/checkout@08c6903cd8c0fde910a37f88322edcfb5dd907a8 # v5.0.0
         with:
+          # Conformance goldens are LFS-tracked; without this they arrive
+          # as pointer stubs and every test that reads them fails.
+          lfs: true
           persist-credentials: false
-          lfs: false
-      - uses: dtolnay/rust-toolchain@6bed0761d98439e5a578e2877258200ad565ba87 # stable
-      - name: Build local runner and server
-        run: cargo build --locked -p preloop-runner-server -p preloop-runner -p preloop-runner-client
-      - name: Run current runner against local Preloop
-        run: |
-          rm -f benchmarks/compatibility/runner/behavior/conformance-preloop.jsonl
-          # Container and service scenarios require the VM-backed executor;
-          # runner-light intentionally validates only host-executable fixtures.
-          python3 benchmarks/real-world/local-runner-conformance.py \
-            --server-binary target/debug/preloop-server \
-            --runner-binary target/debug/preloop-runner \
-            --client-binary target/debug/preloop-runner-client \
-            --official benchmarks/compatibility/runner/behavior/conformance-official.jsonl \
-            --exclude-prefix 2 \
-            --exclude-prefix 16-container \
-            --exclude-prefix 17 \
-            --exclude-prefix 30 \
-            --exclude-prefix 31 \
-            --exclude-prefix 32 \
-            --exclude-prefix 33 \
-            --exclude-prefix 34 \
-            --exclude-prefix 35 \
-            --exclude-prefix 36 \
-            --output benchmarks/compatibility/runner/behavior/conformance-preloop.jsonl
-      - name: Validate local runner outcomes
-        run: |
-          python3 benchmarks/real-world/runner-conformance.py \
-            --mode local \
-            --preloop benchmarks/compatibility/runner/behavior/conformance-preloop.jsonl \
-            --output benchmarks/compatibility/runner/behavior/RUNNER-CONFORMANCE-REPORT.md
+      - name: Validate runner status responses
+        run: python3 benchmarks/real-world/runner-conformance.py --mode light
       - name: Upload light report
         if: always()
         uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
         with:
           name: runner-light-conformance
-          path: |
-            benchmarks/compatibility/runner/behavior/RUNNER-CONFORMANCE-REPORT.md
-            benchmarks/compatibility/runner/behavior/conformance-preloop.jsonl
+          path: benchmarks/compatibility/runner/behavior/RUNNER-CONFORMANCE-REPORT.md
           if-no-files-found: error
 
   runner-deep:

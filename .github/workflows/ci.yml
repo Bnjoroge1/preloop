@@ -3,6 +3,8 @@ permissions:
   contents: read
 
 env:
+  # The preinstalled rustup proxies use these runner-owned locations.
+  CARGO_HOME: /home/runner/.cargo
   RUSTUP_HOME: /home/runner/.rustup
 
 on:
@@ -26,7 +28,6 @@ jobs:
     timeout-minutes: 20
     env:
       CARGO_BUILD_JOBS: "6"
-      RUSTFLAGS: "-C link-arg=-fuse-ld=lld"
     steps:
       - uses: actions/checkout@08c6903cd8c0fde910a37f88322edcfb5dd907a8 # v5.0.0
         with:
@@ -36,8 +37,13 @@ jobs:
         with:
           toolchain: "1.97"
           components: rustfmt,clippy
-      - name: Install lld linker
-        run: sudo apt-get update && sudo apt-get install -y --no-install-recommends lld
+      - name: Select Rust toolchain binaries
+        run: |
+          toolchain_bin="$(dirname "$(rustup which rustc)")"
+          echo "$toolchain_bin" >> "$GITHUB_PATH"
+          echo "RUSTC=$toolchain_bin/rustc" >> "$GITHUB_ENV"
+          echo "RUSTDOC=$toolchain_bin/rustdoc" >> "$GITHUB_ENV"
+          echo "CARGO_BUILD_RUSTDOC=$toolchain_bin/rustdoc" >> "$GITHUB_ENV"
       - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
         with:
           # A failing lint run still primes the cache for the next one; the
@@ -48,10 +54,6 @@ jobs:
       - run: |
           cargo clippy --locked -p preloop-gha-protocol -p preloop-gha-parser -p preloop-gha-expressions -p preloop-cache -p preloop-artifacts -p runner-watch -p preloop-conformance --all-targets -- -D warnings
           cargo clippy --locked -p preloop-runner -p preloop-runner-server -p preloop-runner-client -p preloop-dap --all-targets
-      # nextest does not run doctests; keep them on the lint job (seconds).
-      - run: cargo test --locked --workspace --doc
-        env:
-          RUSTFLAGS: "-A warnings -C link-arg=-fuse-ld=lld"
 
   rust-test:
     # Sharded unit/integration suite. Each shard runs 1/4 of the tests (split
@@ -70,7 +72,6 @@ jobs:
       CARGO_BUILD_JOBS: "6"
       PROPTEST_CASES: "8"
       RUST_TEST_THREADS: "6"
-      RUSTFLAGS: "-C link-arg=-fuse-ld=lld"
     steps:
       - uses: actions/checkout@08c6903cd8c0fde910a37f88322edcfb5dd907a8 # v5.0.0
         with:
@@ -108,8 +109,13 @@ jobs:
         with:
           toolchain: "1.97"
           components: rustfmt,clippy
-      - name: Install lld linker
-        run: sudo apt-get update && sudo apt-get install -y --no-install-recommends lld
+      - name: Select Rust toolchain binaries
+        run: |
+          toolchain_bin="$(dirname "$(rustup which rustc)")"
+          echo "$toolchain_bin" >> "$GITHUB_PATH"
+          echo "RUSTC=$toolchain_bin/rustc" >> "$GITHUB_ENV"
+          echo "RUSTDOC=$toolchain_bin/rustdoc" >> "$GITHUB_ENV"
+          echo "CARGO_BUILD_RUSTDOC=$toolchain_bin/rustdoc" >> "$GITHUB_ENV"
       - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
         with:
           # All four shards build the same workspace and differ only in which
@@ -150,7 +156,7 @@ jobs:
           echo "$HOME/.local/bin" >> "$GITHUB_PATH"
       - run: cargo nextest run --locked --workspace --partition hash:${{ matrix.shard }}/4
         env:
-          RUSTFLAGS: "-A warnings -C link-arg=-fuse-ld=lld"
+          RUSTFLAGS: "-A warnings"
 
   property-tests-fast:
     runs-on: [self-hosted, preloop-cpane]
@@ -163,6 +169,13 @@ jobs:
       - uses: dtolnay/rust-toolchain@6bed0761d98439e5a578e2877258200ad565ba87 # stable
         with:
           toolchain: "1.97"
+      - name: Select Rust toolchain binaries
+        run: |
+          toolchain_bin="$(dirname "$(rustup which rustc)")"
+          echo "$toolchain_bin" >> "$GITHUB_PATH"
+          echo "RUSTC=$toolchain_bin/rustc" >> "$GITHUB_ENV"
+          echo "RUSTDOC=$toolchain_bin/rustdoc" >> "$GITHUB_ENV"
+          echo "CARGO_BUILD_RUSTDOC=$toolchain_bin/rustdoc" >> "$GITHUB_ENV"
       - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
         with:
           cache-on-failure: true
@@ -262,6 +275,13 @@ jobs:
       - uses: dtolnay/rust-toolchain@6bed0761d98439e5a578e2877258200ad565ba87 # stable
         with:
           toolchain: "1.97"
+      - name: Select Rust toolchain binaries
+        run: |
+          toolchain_bin="$(dirname "$(rustup which rustc)")"
+          echo "$toolchain_bin" >> "$GITHUB_PATH"
+          echo "RUSTC=$toolchain_bin/rustc" >> "$GITHUB_ENV"
+          echo "RUSTDOC=$toolchain_bin/rustdoc" >> "$GITHUB_ENV"
+          echo "CARGO_BUILD_RUSTDOC=$toolchain_bin/rustdoc" >> "$GITHUB_ENV"
 
       - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
         with:

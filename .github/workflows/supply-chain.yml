@@ -3,6 +3,7 @@ permissions:
   contents: read
 
 env:
+  CARGO_HOME: /home/runner/.cargo
   RUSTUP_HOME: /home/runner/.rustup
 
 on:

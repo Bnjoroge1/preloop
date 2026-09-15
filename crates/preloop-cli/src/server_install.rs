@@ -226,8 +226,10 @@ fn install(args: InstallArgs) -> Result<()> {
     // The service must be able to execute the binary the unit points at. An
     // exe under a 0700 /home/<user> or /root is unreachable for the same
     // traversal reason as the state dir, and the unit would restart-loop.
+    // Dry-run does not install a unit, so a development executable under the
+    // runner's protected home must still be inspectable.
     #[cfg(any(target_os = "linux", test))]
-    if !args.user && home_blocked_by_protect_home(&exe) {
+    if !args.user && !args.dry_run && home_blocked_by_protect_home(&exe) {
         bail!(
             "the running executable {} is under a directory the `{SERVICE_USER}` service \
              account cannot traverse, so the unit could never start it. Install the \
