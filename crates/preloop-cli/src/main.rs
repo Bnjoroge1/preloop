@@ -971,7 +971,7 @@ async fn cmd_build_golden(args: BuildGoldenArgs) -> anyhow::Result<()> {
         control_origin: None,
         control_socket: None,
         control_upstream: None,
-        dns: std::env::var("PRELOOP_RUNNER_DNS").ok(),
+        dns: Some(runner_dns()),
         registration_token_env: TOKEN_ENV.into(),
         labels: vec![
             "self-hosted".into(),
@@ -1980,7 +1980,7 @@ fn local_runner_pool_config(
         control_origin,
         control_socket,
         control_upstream,
-        dns: std::env::var("PRELOOP_RUNNER_DNS").ok(),
+        dns: Some(runner_dns()),
         registration_token_env: "PRELOOP_SYSTEM_TOKEN".into(),
         labels: runner_pool_labels(),
         cpus,
@@ -2081,6 +2081,15 @@ fn runner_storage_gib() -> u32 {
         .and_then(|raw| raw.trim().parse::<u32>().ok())
         .filter(|value| *value > 0)
         .unwrap_or(RUNNER_STORAGE_GIB)
+}
+/// Guest DNS resolver. The host's `/etc/resolv.conf` is commonly a loopback
+/// systemd-resolved stub, which is unreachable from a microVM; use the
+/// operator override when supplied and otherwise a public resolver.
+fn runner_dns() -> String {
+    std::env::var("PRELOOP_RUNNER_DNS")
+        .ok()
+        .filter(|value| !value.trim().is_empty())
+        .unwrap_or_else(|| "75.75.75.75".to_owned())
 }
 
 /// Resident memory an idle runner VM actually holds, in MiB.
