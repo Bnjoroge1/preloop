@@ -580,16 +580,12 @@ pub fn build_agent_job_message_with_normalized_context(
     ]);
     context_data.insert("job".to_owned(), PipelineContextData::Dict(job_ctx));
 
-    let matrix_ctx = if plan.matrix.is_empty() {
-        PipelineContextData::Null
-    } else {
-        PipelineContextData::Dict(
-            plan.matrix
-                .iter()
-                .map(|(k, v)| (k.clone(), PipelineContextData::from_json(v)))
-                .collect(),
-        )
-    };
+    let matrix_ctx = PipelineContextData::Dict(
+        plan.matrix
+            .iter()
+            .map(|(k, v)| (k.clone(), PipelineContextData::from_json(v)))
+            .collect(),
+    );
     context_data.insert("matrix".to_owned(), matrix_ctx);
     context_data.insert(
         "needs".to_owned(),

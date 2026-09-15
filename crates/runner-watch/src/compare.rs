@@ -382,10 +382,25 @@ pub fn normalize_value(v: &Value) -> Value {
 fn schema_drops_fields(left: &Value, right: &Value) -> bool {
     match (left, right) {
         (Value::Object(l), Value::Object(r)) => l.iter().any(|(k, lv)| match r.get(k) {
-            None => true,
             Some(rv) => schema_drops_fields(lv, rv),
+            None => {
+                // TemplateToken uses a tagged union: literal inputs carry
+                // `lit`, expression inputs carry `expr`. Either field is a
+                // complete representation, so switching variants is not a
+                // field drop.
+                let alternate_token_field = matches!(
+                    (k.as_str(), l.get("type"), l.get("expr"), l.get("lit")),
+                    ("expr", Some(Value::String(_)), Some(Value::String(_)), _)
+                ) && r.contains_key("lit")
+                    || matches!(
+                        (k.as_str(), l.get("type"), l.get("expr"), l.get("lit")),
+                        ("lit", Some(Value::String(_)), _, Some(Value::String(_)))
+                    ) && r.contains_key("expr");
+                !alternate_token_field
+            }
         }),
         (Value::Object(_), _) => true,
+        (Value::Array(_), Value::Array(r)) if r.is_empty() => false,
         (Value::Array(l), Value::Array(r)) => l
             .iter()
             .any(|lv| !r.iter().any(|rv| !schema_drops_fields(lv, rv))),
@@ -1384,6 +1399,23 @@ mod tests {
         // Right changes `a` from number to object → flagged.
         let changed = to_schema_value(&serde_json::json!({"a": {"n": 1}, "b": "x"}));
         assert!(schema_drops_fields(&left, &changed));
+    }
+
+    #[test]
+    fn schema_drops_accepts_union_variants_and_empty_arrays() {
+        let expression = to_schema_value(&serde_json::json!({
+            "type": 3,
+            "expr": "format('x')"
+        }));
+        let literal = to_schema_value(&serde_json::json!({
+            "type": 0,
+            "lit": "x"
+        }));
+        assert!(!schema_drops_fields(&expression, &literal));
+
+        let reference = to_schema_value(&serde_json::json!({"items": [{"name": "x"}]}));
+        let candidate = to_schema_value(&serde_json::json!({"items": []}));
+        assert!(!schema_drops_fields(&reference, &candidate));
     }
 
     #[test]
