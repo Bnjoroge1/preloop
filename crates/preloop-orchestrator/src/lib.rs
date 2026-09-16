@@ -1573,8 +1573,12 @@ fn base_install_commands() -> Vec<Vec<String>> {
 /// Start the container engine, if one is installed.
 ///
 /// Runs per machine rather than in the golden: a daemon captured mid-flight by
-/// a fork would wake up with stale state and a socket it does not own. Machines
-/// are pre-provisioned, so this sits off the critical path of any job.
+/// a fork would wake up with stale state and a socket it does not own. It runs
+/// as a background task from provisioning (overlapping runner registration),
+/// never gating readiness: the 5-15 s cold boot sits off the starting path,
+/// and the worker waits for the daemon before container setup, so neither
+/// declared (`container:`/`services:`) nor ad-hoc (`docker run` steps)
+/// container use can observe a half-started engine.
 ///
 /// Never fatal. A pool without a working container engine still runs every job
 /// that does not use `container:` or `services:`.
@@ -4968,6 +4972,28 @@ async fn provision_runner<P: VmProvider + 'static>(
             }
         }
     }
+    // Start the container engine in the background while `configure`
+    // registers the runner: the 5-15 s dockerd cold boot overlaps
+    // registration instead of gating readiness. The worker waits for the
+    // daemon before container setup (and it is up long before step 1 for
+    // ad-hoc `docker` steps), so nothing observes a half-started engine.
+    // Fire-and-forget: a failure only warns here; container setup reports
+    // the missing daemon against the job it actually blocks.
+    {
+        let provider = std::sync::Arc::clone(provider);
+        let name = name.clone();
+        let start_command = docker_start_command();
+        tokio::spawn(async move {
+            if let Err(error) = provider.exec(&name, &start_command).await {
+                warn!(
+                    machine = name.as_str(),
+                    %error,
+                    "background container engine start failed; container setup will report it"
+                );
+            }
+        });
+    }
+
     let configure_result = provider
         .exec_with_secret_env(name, &as_runner_user(config, &configure), &secrets)
         .await;
@@ -4988,17 +5014,6 @@ async fn provision_runner<P: VmProvider + 'static>(
         let _ = std::fs::remove_file(path);
     }
     configure_result?;
-
-    // Bring the container engine up before the runner accepts work, so a job
-    // declaring `container:` or `services:` does not race the daemon. Failure
-    // is not fatal — only container jobs depend on it.
-    if let Err(error) = provider.exec(name, &docker_start_command()).await {
-        warn!(
-            machine = name.as_str(),
-            %error,
-            "container engine did not start; `container:` and `services:` jobs will fail"
-        );
-    }
 
     info!(machine = name.as_str(), "ephemeral runner ready");
     let mut run = guest_env_prefix(config, name);
