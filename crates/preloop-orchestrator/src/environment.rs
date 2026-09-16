@@ -347,8 +347,22 @@ impl EnvironmentSpec {
         Self::from_parts(self.base.clone(), self.toolchains.clone(), self.curated)
     }
 
-    /// Select the default Ubuntu image from GitHub runner labels.
-    pub fn default_base(runs_on: &[String]) -> String {
+    /// Resolve a queued job's base image from its `runs-on` labels.
+    ///
+    /// Only a label that *names* a hosted Ubuntu image selects a stock pin.
+    /// Everything else — `[self-hosted, preloop-cpane]`, `[self-hosted,
+    /// runner-sync]`, any private label set — keeps `configured`, the image
+    /// this pool was built around.
+    ///
+    /// Falling back to the stock pin instead is what wedged production: a
+    /// self-hosted-only label set resolved to stock Ubuntu, which is
+    /// `curated`, so every slot tried to bake the full hosted apt baseline
+    /// against the live Ubuntu archive. That bake fails whenever the archive
+    /// has moved past the pinned versions (observed: `libatk1.0-0t64`,
+    /// clang-16/17/18, gcc-13/14 all unlocatable), so slots burned on
+    /// doomed bakes and the pool served one runner instead of three while
+    /// the configured golden sat ready and forkable.
+    pub fn base_for_labels(runs_on: &[String], configured: &str) -> String {
         if runs_on.iter().any(|label| {
             let label = label.to_ascii_lowercase();
             label.contains("ubuntu-24.04") || label.contains("ubuntu-latest")
@@ -361,7 +375,7 @@ impl EnvironmentSpec {
         {
             return UBUNTU_22_04_PIN.into();
         }
-        UBUNTU_24_04_PIN.into()
+        configured.to_owned()
     }
 
     fn from_parts(base: String, mut toolchains: Vec<ToolchainLayer>, curated: bool) -> Self {
@@ -430,24 +444,36 @@ mod tests {
     use super::*;
     use std::collections::BTreeSet;
 
+    /// Hosted labels select a stock pin; a self-hosted label set keeps the
+    /// pool's own image. The last case is the production wedge: resolving
+    /// `[self-hosted, …]` to stock Ubuntu sent every slot into a curated
+    /// apt bake that the rolling archive can no longer satisfy.
     #[test]
-    fn default_base_returns_digest_pinned_images() {
+    fn labels_select_hosted_pins_and_otherwise_keep_the_configured_image() {
+        const CONFIGURED: &str = "ghcr.io/preloopdev/runner-images:ubuntu24-runner-large-latest@sha256:4f7e4be438e4eb9c0f23bebdec12cf1d25520876ad2052412ba18580919b7795";
         assert_eq!(
-            EnvironmentSpec::default_base(&["ubuntu-latest".into()]),
+            EnvironmentSpec::base_for_labels(&["ubuntu-latest".into()], CONFIGURED),
             UBUNTU_24_04_PIN
         );
         assert_eq!(
-            EnvironmentSpec::default_base(&["ubuntu-24.04".into()]),
+            EnvironmentSpec::base_for_labels(&["ubuntu-24.04".into()], CONFIGURED),
             UBUNTU_24_04_PIN
         );
         assert_eq!(
-            EnvironmentSpec::default_base(&["ubuntu-22.04".into()]),
+            EnvironmentSpec::base_for_labels(&["ubuntu-22.04".into()], CONFIGURED),
             UBUNTU_22_04_PIN
         );
-        assert_eq!(
-            EnvironmentSpec::default_base(&["self-hosted".into()]),
-            UBUNTU_24_04_PIN
-        );
+        for labels in [
+            vec!["self-hosted".to_owned()],
+            vec!["self-hosted".to_owned(), "preloop-cpane".to_owned()],
+            vec!["self-hosted".to_owned(), "runner-sync".to_owned()],
+        ] {
+            assert_eq!(
+                EnvironmentSpec::base_for_labels(&labels, CONFIGURED),
+                CONFIGURED,
+                "{labels:?} must not be rebased onto a stock pin"
+            );
+        }
     }
 
     #[test]

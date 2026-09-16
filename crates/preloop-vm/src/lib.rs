@@ -1322,6 +1322,17 @@ impl VmProvider for SmolVmProvider {
         if let Some(no_proxy) = &self.pack_no_proxy {
             args.extend(["--no-proxy".into(), no_proxy.clone()]);
         }
+        // Stage beside the output, not in smolvm's cache dir.
+        //
+        // `pack create` re-pulls the base inside its own export VM and
+        // flushes the extracted layers, the merged layer, the agent rootfs
+        // and an ext4 template to the staging dir: tens of GiB for a
+        // runner-scale image. The default is the smolvm cache dir, which on
+        // CI hosts sits on the small root filesystem — the golden bake died
+        // there with `flushing extracted layers to disk failed (out of
+        // space?)` while the output directory had room to spare. TMPDIR
+        // below does not cover it; smolvm honours `--staging-dir` only.
+        args.extend(["--staging-dir".into(), staging_dir.display().to_string()]);
         args.extend(["-o".into(), output.display().to_string()]);
         self.exclusive_with_staging("pack", &args, staging_dir)
             .await

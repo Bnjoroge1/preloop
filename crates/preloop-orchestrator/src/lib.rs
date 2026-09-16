@@ -56,6 +56,13 @@ const DEBUG_POLL_INTERVAL: Duration = Duration::from_secs(10);
 /// Must exceed the CLI heartbeat interval.
 const DEBUG_HEARTBEAT_WINDOW: Duration = Duration::from_secs(30);
 
+/// First wait after a failed environment-golden bake, and the ceiling the
+/// geometric backoff reaches. A slot that cannot build the golden its queued
+/// job asks for must not re-attempt in a tight loop: every attempt boots a
+/// VM and runs the full package bake.
+const GOLDEN_RETRY_MIN: Duration = Duration::from_millis(500);
+const GOLDEN_RETRY_MAX: Duration = Duration::from_secs(60);
+
 /// Debug marker contents written by the orchestrator when it parks a failed VM.
 pub const DEBUG_MARKER_IDLE: &str = "preserved";
 /// Debug marker contents written by `preloop shell` while a session is live.
@@ -3658,11 +3665,7 @@ async fn run_on_demand_slot<P: VmProvider + 'static>(
         let env_base = match &config.next_job_runs_on {
             Some(lock) => {
                 let labels = lock.read().map(|g| g.clone()).unwrap_or_default();
-                if labels.is_empty() {
-                    config.base_image.clone()
-                } else {
-                    EnvironmentSpec::default_base(&labels)
-                }
+                EnvironmentSpec::base_for_labels(&labels, &config.base_image)
             }
             None => config.base_image.clone(),
         };
@@ -3806,6 +3809,7 @@ async fn run_slot<P: VmProvider + 'static>(
     } = handles;
     let mut generation: u64 = 0;
     let mut spare: Option<ReadyRunner> = None;
+    let mut golden_backoff: Option<Duration> = None;
 
     while !shutdown.is_cancelled() {
         // Warm mode cleared the pool's preparing flag once the golden bake
@@ -3827,11 +3831,7 @@ async fn run_slot<P: VmProvider + 'static>(
             let env_base = match &config.next_job_runs_on {
                 Some(lock) => {
                     let labels = lock.read().map(|g| g.clone()).unwrap_or_default();
-                    if labels.is_empty() {
-                        config.base_image.clone()
-                    } else {
-                        EnvironmentSpec::default_base(&labels)
-                    }
+                    EnvironmentSpec::base_for_labels(&labels, &config.base_image)
                 }
                 None => config.base_image.clone(),
             };
@@ -3860,12 +3860,33 @@ async fn run_slot<P: VmProvider + 'static>(
                 })
                 .await
             {
-                Ok(name) => Some(name),
+                Ok(name) => {
+                    golden_backoff = None;
+                    Some(name)
+                }
                 Err(error) => {
-                    warn!(%error, %fingerprint, "failed to prepare requested environment golden; leaving job queued");
+                    // A bake failure is usually deterministic (a stock apt
+                    // pin the archive dropped, a registry the guest cannot
+                    // resolve), so a fixed 500 ms retry meant this slot
+                    // rebuilt the same doomed golden ~100 times an hour --
+                    // each attempt boots a VM and runs apt -- while the
+                    // queue it was meant to drain starved. Back off
+                    // geometrically, capped, so a slot costs one attempt per
+                    // minute at worst and recovers immediately once the
+                    // environment becomes buildable again.
+                    let wait = golden_backoff.map_or(GOLDEN_RETRY_MIN, |last: Duration| {
+                        (last * 2).min(GOLDEN_RETRY_MAX)
+                    });
+                    golden_backoff = Some(wait);
+                    warn!(
+                        %error,
+                        %fingerprint,
+                        retry_in_ms = wait.as_millis(),
+                        "failed to prepare requested environment golden; leaving job queued"
+                    );
                     tokio::select! {
                         _ = shutdown.cancelled() => break,
-                        _ = tokio::time::sleep(Duration::from_millis(500)) => {}
+                        _ = tokio::time::sleep(wait) => {}
                     }
                     continue;
                 }
@@ -4077,7 +4098,9 @@ async fn wait_for_environment_change(
             .read()
             .map(|labels| labels.clone())
             .unwrap_or_default();
-        if !labels.is_empty() && EnvironmentSpec::default_base(&labels) != current_base {
+        if !labels.is_empty()
+            && EnvironmentSpec::base_for_labels(&labels, &config.base_image) != current_base
+        {
             mismatch_checks += 1;
             if mismatch_checks >= REAP_GRACE_CHECKS {
                 return;

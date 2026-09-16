@@ -216,6 +216,22 @@ jobs:
           test -w /dev/kvm
 
 
+      - name: Reclaim runner disk for layer staging
+        run: |
+          set -euo pipefail
+          # `pack create` stages the extracted layers, the merged layer, the
+          # agent rootfs and an ext4 template next to the output — tens of
+          # GiB for a runner-scale base. release-golden #73 died there with
+          # `flushing extracted layers to disk failed (out of space?)`.
+          # Hosted images ship ~30 GiB of toolchains this bake never touches.
+          df -h /
+          sudo rm -rf /usr/share/dotnet /usr/local/lib/android /opt/ghc \
+            /usr/local/share/boost /usr/share/swift "$AGENT_TOOLSDIRECTORY" || true
+          sudo docker image prune --all --force >/dev/null 2>&1 || true
+          df -h /
+        env:
+          AGENT_TOOLSDIRECTORY: ${{ env.AGENT_TOOLSDIRECTORY }}
+
       - name: Pack Golden MicroVM Artifact
         env:
           GOLDEN_NAME: preloop-ubuntu-24.04-${{ env.GOLDEN_ARCH }}
@@ -240,23 +256,18 @@ jobs:
           # SmolVM machine names allow only ASCII alphanumerics and hyphens.
           export PRELOOP_GOLDEN_NAME_PREFIX="preloop-release-golden-${GITHUB_RUN_ID}-x86-64"
           builder="${PRELOOP_GOLDEN_NAME_PREFIX}-builder"
+          # Answer the guest directly instead of through the NAT DNS proxy
+          # (100.96.0.1), which has never resolved ghcr.io from a bake VM on
+          # a hosted runner: release-golden #68/#69/#70 burned 9/9 attempts
+          # on `crane manifest ... lookup ghcr.io ... i/o timeout`, and #73
+          # proved the same run pulls fine the moment this is set. Trying the
+          # broken default first only costs an attempt and a backoff.
+          export PRELOOP_RUNNER_DNS=1.1.1.1
           need_mib=6144
           attempts=3
           headroom() { awk '/^MemAvailable:/ { print int($2 / 1024) }' /proc/meminfo; }
           for attempt in $(seq 1 "$attempts"); do
-            if [ "$attempt" -eq 1 ]; then
-              echo "attempt 1/${attempts}: default guest resolvers"
-            else
-              # The default path answers through the NAT DNS proxy
-              # (100.96.0.1), which cannot resolve ghcr.io on hosted runners
-              # (release-golden #68/#69/#70: `crane manifest ... lookup
-              # ghcr.io ... i/o timeout`, 9/9 attempts). Answer the guest
-              # directly instead (`smolvm --dns`, via PRELOOP_RUNNER_DNS).
-              # Attempt 1 runs first so a healthy default path never pays
-              # for this deviation.
-              export PRELOOP_RUNNER_DNS=1.1.1.1
-              echo "attempt ${attempt}/${attempts}: direct guest DNS (PRELOOP_RUNNER_DNS=$PRELOOP_RUNNER_DNS)"
-            fi
+            echo "attempt ${attempt}/${attempts}: guest DNS $PRELOOP_RUNNER_DNS"
             for _ in $(seq 1 45); do
               waiting="$(headroom)"
               if [ "$waiting" -ge "$need_mib" ]; then break; fi

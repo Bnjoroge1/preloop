@@ -526,6 +526,10 @@ exit 0
                 "create".to_owned(),
                 "--from-vm".to_owned(),
                 "runner".to_owned(),
+                // Large layer staging follows the output, not smolvm's cache
+                // dir on the root filesystem.
+                "--staging-dir".to_owned(),
+                directory.path().display().to_string(),
                 "-o".to_owned(),
                 directory.path().join("runner").display().to_string(),
             ]
@@ -569,6 +573,8 @@ exit 0
                 "http://192.168.1.10:18080".to_owned(),
                 "--no-proxy".to_owned(),
                 "localhost,127.0.0.1,.internal".to_owned(),
+                "--staging-dir".to_owned(),
+                directory.path().display().to_string(),
                 "-o".to_owned(),
                 output.display().to_string(),
             ]
