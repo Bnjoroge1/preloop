@@ -37,6 +37,21 @@ use tracing::{debug, error, info, warn};
 
 const GUEST_CONTROL_DIR: &str = "/run/preloop-control";
 const GUEST_CONTROL_SOCKET: &str = "/run/preloop-control/engine.sock";
+/// Rust toolchain homes inside the guest.
+///
+/// rustup obeys `RUSTUP_HOME`/`CARGO_HOME` verbatim — no fallback to `$HOME`,
+/// no search for a writable candidate — so these fixed system addresses are a
+/// contract, not a hint. Every party MUST agree: the bake installs here
+/// (`ToolchainLayer::Rust`), `runner_account_script` chowns them to the runner
+/// uid, `guest_env_prefix` exports them, `guest_runner_path` puts
+/// `$CARGO_HOME/bin` on PATH, and `verify_toolchain_homes` refuses to register
+/// a runner whose golden disagrees. A `$HOME`-derived location instead would
+/// split root's copy from the runner's: `/root` is 0700, so the runner gets
+/// EACCES statting it, and a second writable home silently shadows the baked
+/// toolchain with a fresh `stable` download.
+const GUEST_RUSTUP_HOME: &str = "/usr/local/rustup";
+const GUEST_CARGO_HOME: &str = "/usr/local/cargo";
+
 const GUEST_FAILURE_MARKER: &str = "/home/runner/.preloop-job-failed";
 /// Written by the worker while a job is paused in a debug session and removed
 /// when the session closes. The pool probes it to release the slot's
@@ -1826,9 +1841,10 @@ async fn write_bake_manifest<P: VmProvider>(
 /// (nodejs/ci: `EACCES: permission denied, stat '/root/.cargo/bin/git'`).
 /// Absent directories cost nothing.
 pub fn guest_runner_path(_config: &RunnerPoolConfig) -> String {
-    "/usr/local/cargo/bin:/usr/local/go/bin:/usr/local/sbin:/usr/local/bin:\
-     /usr/sbin:/usr/bin:/sbin:/bin"
-        .to_owned()
+    format!(
+        "{GUEST_CARGO_HOME}/bin:/usr/local/go/bin:/usr/local/sbin:/usr/local/bin:\
+          /usr/sbin:/usr/bin:/sbin:/bin"
+    )
 }
 
 /// `env` prefix for guest runner invocations, empty when nothing needs setting.
@@ -1876,8 +1892,8 @@ fn guest_env_prefix(config: &RunnerPoolConfig, name: &MachineName) -> Vec<String
     // are exported here so every user resolves the identical toolchain.
     // Order is irrelevant (env entries are independent); they sit last so
     // the historical PATH/MACHINE_NAME-first prefix is undisturbed.
-    env.push("RUSTUP_HOME=/usr/local/rustup".to_owned());
-    env.push("CARGO_HOME=/usr/local/cargo".to_owned());
+    env.push(format!("RUSTUP_HOME={GUEST_RUSTUP_HOME}"));
+    env.push(format!("CARGO_HOME={GUEST_CARGO_HOME}"));
     if !env.is_empty() {
         env.insert(0, "/usr/bin/env".to_owned());
     }
