@@ -8,6 +8,7 @@ pub mod node_externals;
 
 use crate::environment::{
     curated_toolchains, is_stock_base_image, EnvironmentSpec, ToolchainLayer,
+    APT_INDICES_MARKER_PATH,
 };
 use crate::keys::{KeyPool, StagedKey};
 use preloop_gha_protocol::RUNNER_BUSY_SENTINEL;
@@ -3077,6 +3078,30 @@ impl<P: VmProvider + 'static> RunnerPool<P> {
                 )));
             }
         }
+        // Stamp apt-index freshness into the image. Provisioning reads this
+        // back to log the pack's age and warn past the versions.toml policy;
+        // the weekly apt-indices-refresh workflow rebuilds stale packs. The
+        // policy travels in the marker so a running engine never needs the
+        // policy compiled in — only the bake-time CLI does. Never fail the
+        // bake for telemetry: a missing marker just means "stale", which is
+        // today's behavior (full refresh) everywhere.
+        if stock_base {
+            let stamp = format!(
+                "mkdir -p /etc/preloop && printf '%s\\n%s\\n' \"$(date -u +%F)\" \"{}\" > /etc/preloop/apt-indices-baked-at",
+                crate::APT_INDICES_MAX_AGE_DAYS
+            );
+            if let Err(error) = self
+                .provider
+                .exec(&name, &["sh".to_owned(), "-c".to_owned(), stamp])
+                .await
+            {
+                warn!(
+                    machine = name.as_str(),
+                    %error,
+                    "apt-index freshness stamp failed; pack will read as stale"
+                );
+            }
+        }
         // Bake the externals *pointer*, not the externals: the packed rootfs
         // gets `<root>/externals -> /opt/preloop/bin/externals` so node rides
         // the runner-bundle mount instead of being baked into the image or
@@ -4801,6 +4826,51 @@ async fn provision_runner<P: VmProvider + 'static>(
                     warn!(
                     machine = name.as_str(),
                         %error, "apt list refresh failed; workflow apt installs may not resolve"
+                    );
+                }
+            }
+            // Log the pack's apt-index age from the freshness marker baked
+            // with it. A missing marker just means "stale" (packs predating
+            // the stamp, or env-golden forks that boot bare) — the refresh
+            // above already ran, so behavior is unchanged; only the warning
+            // is new, and the weekly apt-indices-refresh rebuilds stale packs.
+            match provider
+                .exec(
+                    name,
+                    &["cat".to_owned(), APT_INDICES_MARKER_PATH.to_owned()],
+                )
+                .await
+            {
+                Ok(output) if output.exit_code == 0 => {
+                    let today_days = std::time::SystemTime::now()
+                        .duration_since(std::time::UNIX_EPOCH)
+                        .map(|elapsed| elapsed.as_secs() / 86_400)
+                        .unwrap_or(0);
+                    let text = String::from_utf8_lossy(&output.stdout);
+                    match crate::environment::apt_marker_age_days(&text, today_days) {
+                        Some((age_days, max_age_days)) if age_days > max_age_days => {
+                            warn!(
+                                machine = name.as_str(),
+                                age_days,
+                                max_age_days,
+                                "pack apt indices are stale; refresh ran but consider rebuilding the golden"
+                            );
+                        }
+                        Some((age_days, _)) => {
+                            info!(machine = name.as_str(), age_days, "pack apt indices fresh");
+                        }
+                        None => {
+                            debug!(
+                                machine = name.as_str(),
+                                "pack has no parseable apt-index marker"
+                            );
+                        }
+                    }
+                }
+                _ => {
+                    debug!(
+                        machine = name.as_str(),
+                        "pack has no apt-index marker; treating as stale"
                     );
                 }
             }
