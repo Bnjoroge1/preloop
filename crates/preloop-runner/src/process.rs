@@ -828,15 +828,15 @@ mod tests {
     #[tokio::test]
     async fn cancellation_interrupts_background_child_after_shell_exit() {
         // The shell exits within a millisecond, so cancellation always lands
-        // after the leader has been reaped, and the backgrounded child ignores
-        // both graceful signals — SIGKILL against the group is the only thing
-        // that can reap it. Assert the child actually died rather than
-        // trusting the error string: a survivor is reparented to init and
-        // silently outlives the job.
+        // after the leader has been reaped. Ignore SIGHUP from that shell exit
+        // as well as both graceful cancellation signals; SIGKILL against the
+        // group must be the only thing that can reap the child. Assert the
+        // child actually died rather than trusting the error string: a
+        // survivor is reparented to init and silently outlives the job.
         let dir = tempfile::tempdir().expect("tempdir");
         let pid_path = dir.path().join("background.pid");
         let script = format!(
-            "(trap '' TERM INT; while :; do sleep 1; done) & echo $! > {}; echo ready",
+            "(trap '' HUP TERM INT; while :; do sleep 1; done) & echo $! > {}; echo ready",
             pid_path.display()
         );
 
