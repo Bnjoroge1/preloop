@@ -137,7 +137,7 @@ jobs:
       - name: Install configured smolvm
         run: |
           set -euo pipefail
-          SMOLVM_VERSION="$(grep '^smolvm_golden_version' versions.toml | cut -d'"' -f2)"
+          SMOLVM_VERSION="$(grep -E '^[[:space:]]*smolvm_golden_version[[:space:]]*=' versions.toml | cut -d'"' -f2 || true)"
           [ -n "$SMOLVM_VERSION" ] || { echo "smolvm_golden_version missing from versions.toml" >&2; exit 1; }
           ARCHIVE="smolvm-${SMOLVM_VERSION}-linux-x86_64.tar.gz"
           BASE="https://github.com/smol-machines/smolvm/releases/download/v${SMOLVM_VERSION}"
@@ -396,7 +396,7 @@ jobs:
       - name: Install compatible smolvm
         run: |
           set -euo pipefail
-          SMOLVM_VERSION="$(grep '^smolvm_golden_version' versions.toml | cut -d'"' -f2)"
+          SMOLVM_VERSION="$(grep -E '^[[:space:]]*smolvm_golden_version[[:space:]]*=' versions.toml | cut -d'"' -f2 || true)"
           [ -n "$SMOLVM_VERSION" ] || { echo "smolvm_golden_version missing from versions.toml" >&2; exit 1; }
           ARCHIVE="smolvm-${SMOLVM_VERSION}-darwin-arm64.tar.gz"
           BASE="https://github.com/smol-machines/smolvm/releases/download/v${SMOLVM_VERSION}"
