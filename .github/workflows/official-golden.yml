@@ -233,8 +233,11 @@ jobs:
           # pull). Streaming keeps every copy off the host filesystem.
           export PRELOOP_REQUIRE_BASE_DIGEST=1
           export PRELOOP_RUNNER_BASE_IMAGE="$BASE_IMAGE"
-          export PRELOOP_RUNNER_STORAGE_GB=120
-          export PRELOOP_RUNNER_OVERLAY_GB=120
+          # Guest disk must hold extracted layers + merged layer + pack
+          # staging. 120G died at `pack binary: tar error: No space left
+          # on device` (35267336773); sparse on host, so 200G is safe.
+          export PRELOOP_RUNNER_STORAGE_GB=200
+          export PRELOOP_RUNNER_OVERLAY_GB=200
           # The runner-large base archive is ~17 GiB uncompressed, over
           # smolvm's 8 GiB default local-archive cap. Without this the bake
           # fails every attempt at `smolvm create` before extracting a byte.
@@ -493,10 +496,11 @@ jobs:
           set -euo pipefail
           mkdir -p dist
           rm -f "dist/$GOLDEN_NAME"
-          export PRELOOP_REQUIRE_BASE_DIGEST=1
-          export PRELOOP_RUNNER_BASE_IMAGE="$BASE_IMAGE"
-          export PRELOOP_RUNNER_STORAGE_GB=120
-          export PRELOOP_RUNNER_OVERLAY_GB=120
+          # Guest disk must hold extracted layers + merged layer + pack
+          # staging. 120G died at `pack binary: tar error: No space left
+          # on device` (35267336773); sparse on host, so 200G is safe.
+          export PRELOOP_RUNNER_STORAGE_GB=200
+          export PRELOOP_RUNNER_OVERLAY_GB=200
           # The runner-large image exceeds smolvm's default local archive
           # limit; keep the registry path so smolvm streams it directly.
           export SMOLVM_MAX_IMAGE_BYTES=34359738368
