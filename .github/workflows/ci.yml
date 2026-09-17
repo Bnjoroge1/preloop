@@ -24,7 +24,7 @@ on:
 
 jobs:
   rust-lint:
-    name: Rust lint (fmt + clippy)
+    name: rust-lint
     runs-on: [self-hosted, preloop-cpane]
     timeout-minutes: 20
     env:
@@ -62,7 +62,7 @@ jobs:
     # clock is setup + slowest shard instead of setup + everything.
     # NOTE: these display names are load-bearing — the `main` ruleset gates
     # on them. Renaming a shard name requires updating the ruleset to match.
-    name: Rust tests shard ${{ matrix.shard }} of 4
+    name: rust shard ${{ matrix.shard }} of 4
     runs-on: [self-hosted, preloop-cpane]
     timeout-minutes: 60
     strategy:
@@ -160,7 +160,7 @@ jobs:
           RUSTFLAGS: "-A warnings"
 
   property-tests-fast:
-    name: Property tests light
+    name: property-tests-fast
     runs-on: [self-hosted, preloop-cpane]
     timeout-minutes: 30
     if: github.event_name != 'schedule'
