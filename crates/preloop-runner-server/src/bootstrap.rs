@@ -1249,6 +1249,35 @@ fn build_operational_snapshot_sync(
                 &webhook,
                 crate::webhook_status::now_us(),
             ));
+            // Host memory pressure from a fresh sample (microseconds of
+            // /proc reads on a path that already blocks for worse).
+            // Thresholds are RAM fractions; swap counts as pressure via its
+            // own warning, never as headroom against the critical line.
+            let host = preloop_observability::vm_telemetry::sample_host();
+            let ram_used = host.ram_used_fraction().unwrap_or(0.0);
+            let swap_used = host.swap_used_fraction().unwrap_or(0.0);
+            if ram_used >= 0.93 {
+                conditions.push(Condition {
+                    code: "host_memory_critical".to_owned(),
+                    severity: "error".to_owned(),
+                    message: format!(
+                        "host RAM {:.0}% consumed; OOM kills are imminent, shed load",
+                        ram_used * 100.0
+                    ),
+                    exemplars: Vec::new(),
+                });
+            } else if ram_used >= 0.85 || swap_used >= 0.25 {
+                conditions.push(Condition {
+                    code: "host_memory_pressure".to_owned(),
+                    severity: "warning".to_owned(),
+                    message: format!(
+                        "host memory pressure: RAM {:.0}% consumed, swap {:.0}% consumed",
+                        ram_used * 100.0,
+                        swap_used * 100.0
+                    ),
+                    exemplars: Vec::new(),
+                });
+            }
             conditions
         },
     }
@@ -1350,20 +1379,30 @@ async fn run_state_sampler(
                 publish_snapshot(&shared, &store_backend, false).await;
                 // Record pool/queue gauges into OTel instruments so `/metrics`
                 // has a single exposition source (the SDK renderer).
-                {
-                    let s = shared.state.status_snapshot.read();
-                    shared.state.observability.metrics().pool.record(
-                        s.service.uptime_seconds,
-                        s.pool.desired as u64,
-                        s.pool.preparing,
-                        s.pool.idle as u64,
-                        s.pool.busy as u64,
-                        s.jobs.ready as u64,
-                        s.jobs.claimable as u64,
-                        s.jobs.unclaimable as u64,
-                        s.jobs.dependency_blocked as u64,
-                    );
-                }
+                 {
+                     let s = shared.state.status_snapshot.read();
+                     shared.state.observability.metrics().pool.record(
+                         s.service.uptime_seconds,
+                         s.pool.desired as u64,
+                         s.pool.preparing,
+                         s.pool.idle as u64,
+                         s.pool.busy as u64,
+                         s.jobs.ready as u64,
+                         s.jobs.claimable as u64,
+                         s.jobs.unclaimable as u64,
+                         s.jobs.dependency_blocked as u64,
+                     );
+                     // Host memory reality on the same cadence: a /proc scan
+                     // is microseconds next to everything else on this tick.
+                     // Recorded even when nothing else changed so OOM
+                     // proximity is a continuous signal, not a sampled one.
+                     shared
+                         .state
+                         .observability
+                         .metrics()
+                         .host
+                         .record(&preloop_observability::vm_telemetry::sample_host());
+                 }
             }
             _ = shared.shutdown.cancelled() => {
                 // Publish one last snapshot with the shutdown flag set so
