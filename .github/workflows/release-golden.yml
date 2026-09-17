@@ -401,25 +401,23 @@ jobs:
           split -b 4G -d "dist/$GOLDEN_NAME" "dist/$GOLDEN_NAME.part."
           sha256sum "dist/$GOLDEN_NAME.part."* > "dist/$GOLDEN_NAME.parts.sha256"
 
-  build-and-publish-golden-macos:
-    name: Build & Publish aarch64 Golden (macOS)
+  build-and-publish-golden-arm64:
+    name: Build & Publish aarch64 Golden (ARM64 Linux)
     if: (github.event_name == 'workflow_dispatch' && !inputs.reuse_previous_goldens) || github.event_name == 'release'
-    # Hosted Apple Silicon builds this golden: macos-14 produced the last
-    # working aarch64 golden (v0.29.6, 2026-08-09). 7f18e8a0 then repointed
-    # it at a self-hosted Mac that was never registered, so every run since
-    # sat unassigned until GitHub's 24h ceiling.
+    # Hosted Apple Silicon can no longer build this golden. GitHub's macOS
+    # runners are themselves VMs (kern.hv_vmm_present=1), and hv_vm_create
+    # fails with EINVAL on physical hosts without nested virtualization —
+    # a host lottery, not an image or config issue: identical jobs pass and
+    # fail on identical sysctl profiles (smolvm-macos-repro, 2026-09-17:
+    # 21/21 pass vs 36/36 fail across macos-14/15, all disk configs, smolvm
+    # 1.14.5 and 1.16.1). The last working hosted bake was v0.29.6
+    # (2026-08-09); every run since drew incapable hosts.
     #
-    # Pinned to macos-14 deliberately, not macos-latest: macos-15 fails at
-    # `krun_start_enter -22 (EINVAL)` during VmCreate even with the TSI
-    # backend below, so the runner image is load-bearing here.
-    runs-on: macos-14
+    # The aarch64 golden is a linux/arm64 guest — it does not need a macOS
+    # host at all. preloop-cpane is ARM64 Linux with native /dev/kvm, so
+    # libkrun runs the guest directly with no nested-virt requirement.
+    runs-on: [self-hosted, preloop-cpane]
     timeout-minutes: 180
-    env:
-      # GitHub's hosted macOS guests reject libkrun's virtio-net device under
-      # their virtualization boundary (krun_start_enter EINVAL). TSI keeps
-      # outbound access inside libkrun and is sufficient for this one-shot
-      # image build; job VMs still default to policy-enforced virtio-net.
-      PRELOOP_SMOLVM_NET_BACKEND: tsi
     permissions:
       contents: write
       id-token: write
@@ -431,13 +429,28 @@ jobs:
         with:
           persist-credentials: false
 
+      - name: Verify ARM64 host with KVM
+        run: |
+          set -euo pipefail
+          uname -a
+          test "$(uname -m)" = "aarch64" || {
+            echo "this job must run on an ARM64 (aarch64) host; got $(uname -m)" >&2
+            exit 1
+          }
+          test -e /dev/kvm || {
+            echo "/dev/kvm missing — smolvm needs KVM on this host" >&2
+            exit 1
+          }
+          test -r /dev/kvm -a -w /dev/kvm || sudo chmod a+rw /dev/kvm
+          test -r /dev/kvm -a -w /dev/kvm
+
       - name: Resolve golden identity and base
         run: |
           set -euo pipefail
           echo "RUNNER_TARGET=aarch64-unknown-linux-gnu" >> "$GITHUB_ENV"
           echo "GOLDEN_ARCH=aarch64" >> "$GITHUB_ENV"
           echo "GOLDEN_PLATFORM=linux/arm64" >> "$GITHUB_ENV"
-           BASE_IMAGE="$(awk -F'"' '/^official_runner_image_base_arm64 = / { print $2; exit }' official-image.toml)"
+          BASE_IMAGE="$(awk -F'"' '/^official_runner_image_base_arm64 = / { print $2; exit }' official-image.toml)"
           test -n "$BASE_IMAGE"
           echo "BASE_IMAGE=$BASE_IMAGE" >> "$GITHUB_ENV"
 
@@ -447,83 +460,10 @@ jobs:
           toolchain: "1.97"
           targets: aarch64-unknown-linux-gnu
 
-      - name: Set up Zig cross toolchain
-        uses: goto-bus-stop/setup-zig@abea47f85e598557f500fa1fd2ab7464fcb39406 # v2.2.1
-        with:
-          version: 0.14.1
-
-      - name: Install cargo-zigbuild
-        uses: taiki-e/install-action@6c6fd71fe4fb72c3697d269963d0e15df8adedad # v2.85.10
-        with:
-          tool: cargo-zigbuild@0.23.0
-
-      - name: Build Preloop CLI
+      - name: Build Preloop binaries
         run: |
           cargo build --release -p preloop-cli -p preloop-runner-server
-
-      - name: Build Linux runner bundle
-        run: |
-          cargo zigbuild --release \
-            --target "$RUNNER_TARGET" \
-            -p preloop-runner
-
-      - name: Install compatible smolvm
-        run: |
-          set -euo pipefail
-          SMOLVM_VERSION="$(grep -E '^[[:space:]]*smolvm_golden_version[[:space:]]*=' versions.toml | cut -d'"' -f2 || true)"
-          [ -n "$SMOLVM_VERSION" ] || { echo "smolvm_golden_version missing from versions.toml" >&2; exit 1; }
-          ARCHIVE="smolvm-${SMOLVM_VERSION}-darwin-arm64.tar.gz"
-          BASE="https://github.com/smol-machines/smolvm/releases/download/v${SMOLVM_VERSION}"
-          curl -fsSL -o "$ARCHIVE" "$BASE/$ARCHIVE"
-          curl -fsSL -o checksums.sha256 "$BASE/checksums.sha256"
-          grep -F "$ARCHIVE" checksums.sha256 | shasum -a 256 -c -
-          tar -xzf "$ARCHIVE"
-          SRC="smolvm-${SMOLVM_VERSION}-darwin-arm64"
-          mkdir -p "$HOME/.smolvm"
-          rm -rf "$HOME/.smolvm/lib"
-          cp -R "$SRC/lib" "$HOME/.smolvm/lib"
-          rm -f "$HOME/.smolvm"/storage-template.ext4 "$HOME/.smolvm"/overlay-template.ext4 \
-            "$HOME/.smolvm"/storage-template.ext4.zst "$HOME/.smolvm"/overlay-template.ext4.zst
-          rm -f "$HOME/.smolvm/storage-template.ext4" \
-              "$HOME/.smolvm/overlay-template.ext4" \
-              "$HOME/.smolvm/storage-template.ext4.zst" \
-              "$HOME/.smolvm/overlay-template.ext4.zst"
-          for f in smolvm smolvm-bin storage-template.ext4 overlay-template.ext4 \
-              storage-template.ext4.zst overlay-template.ext4.zst; do
-            [ -f "$SRC/$f" ] && cp "$SRC/$f" "$HOME/.smolvm/"
-          done
-          echo "$SMOLVM_VERSION" > "$HOME/.smolvm/.version"
-          mkdir -p "$HOME/Library/Application Support/smolvm"
-          rm -rf "$HOME/Library/Application Support/smolvm/agent-rootfs"
-          cp -R "$SRC/agent-rootfs" "$HOME/Library/Application Support/smolvm/agent-rootfs"
-          mkdir -p "$HOME/.local/bin"
-          ln -sf "$HOME/.smolvm/smolvm" "$HOME/.local/bin/smolvm"
-          echo "$HOME/.local/bin" >> "$GITHUB_PATH"
-
-      - name: Install ext4 filesystem tools
-        run: |
-          brew install e2fsprogs
-          echo "$(brew --prefix e2fsprogs)/sbin" >> "$GITHUB_PATH"
-      - name: Prepare 120G disk templates
-        run: |
-          set -euo pipefail
-          # The bake requests 120G storage + overlay disks. The Linux twin
-          # builds those templates explicitly (truncate + mkfs.ext4); without
-          # them `smolvm create` must grow whatever the release archive ships,
-          # and release-golden #68/#69/#70 died at VmCreate with
-          # `krun_start_enter -22 (EINVAL)` — smolvm's own hint for "a
-          # disk/overlay that could not be opened". Feed it identical inputs.
-          df -h "$HOME"
-          rm -f "$HOME/.smolvm/storage-template.ext4" \
-            "$HOME/.smolvm/overlay-template.ext4"
-          truncate -s 120G "$HOME/.smolvm/storage-template.ext4"
-          mkfs.ext4 -F -q -O ^has_journal -b 4096 \
-            "$HOME/.smolvm/storage-template.ext4"
-          truncate -s 120G "$HOME/.smolvm/overlay-template.ext4"
-          mkfs.ext4 -F -q -O ^has_journal -b 4096 -L smolvm-overlay \
-            "$HOME/.smolvm/overlay-template.ext4"
-          ls -lh "$HOME/.smolvm/"*.ext4
-          df -h "$HOME"
+          cargo build --release -p preloop-runner --target "$RUNNER_TARGET"
 
       - name: Capture pinned base provenance
         run: |
@@ -539,34 +479,126 @@ jobs:
             --require-source-prefix \
               "https://github.com/preloopdev/runner-image-blobs/tree"
 
+      - name: Install configured smolvm
+        run: |
+          set -euo pipefail
+          SMOLVM_VERSION="$(grep -E '^[[:space:]]*smolvm_golden_version[[:space:]]*=' versions.toml | cut -d'"' -f2 || true)"
+          [ -n "$SMOLVM_VERSION" ] || { echo "smolvm_golden_version missing from versions.toml" >&2; exit 1; }
+          ARCHIVE="smolvm-${SMOLVM_VERSION}-linux-arm64.tar.gz"
+          BASE="https://github.com/smol-machines/smolvm/releases/download/v${SMOLVM_VERSION}"
+          curl -fsSL -o "$ARCHIVE" "$BASE/$ARCHIVE"
+          curl -fsSL -o checksums.sha256 "$BASE/checksums.sha256"
+          grep -F "$ARCHIVE" checksums.sha256 | sha256sum -c -
+          tar -xzf "$ARCHIVE"
+          SRC="smolvm-${SMOLVM_VERSION}-linux-arm64"
+          mkdir -p "$HOME/.smolvm"
+          rm -rf "$HOME/.smolvm/lib"
+          cp -R "$SRC/lib" "$HOME/.smolvm/lib"
+          rm -f "$HOME/.smolvm"/storage-template.ext4 "$HOME/.smolvm"/overlay-template.ext4 \
+            "$HOME/.smolvm"/storage-template.ext4.zst "$HOME/.smolvm"/overlay-template.ext4.zst
+          for f in smolvm smolvm-bin storage-template.ext4 overlay-template.ext4 \
+              storage-template.ext4.zst overlay-template.ext4.zst; do
+            [ -f "$SRC/$f" ] && cp "$SRC/$f" "$HOME/.smolvm/"
+          done
+          echo "$SMOLVM_VERSION" > "$HOME/.smolvm/.version"
+          DATA_DIR="${XDG_DATA_HOME:-$HOME/.local/share}/smolvm"
+          mkdir -p "$DATA_DIR"
+          rm -rf "$DATA_DIR/agent-rootfs"
+          cp -R "$SRC/agent-rootfs" "$DATA_DIR/agent-rootfs"
+          rm -f "$HOME/.smolvm/storage-template.ext4" "$HOME/.smolvm/overlay-template.ext4"
+          truncate -s 120G "$HOME/.smolvm/storage-template.ext4"
+          mkfs.ext4 -F -q -O ^has_journal -b 4096 "$HOME/.smolvm/storage-template.ext4"
+          truncate -s 120G "$HOME/.smolvm/overlay-template.ext4"
+          mkfs.ext4 -F -q -O ^has_journal -b 4096 -L smolvm-overlay "$HOME/.smolvm/overlay-template.ext4"
+          ln -sf /usr/sbin/resize2fs "$DATA_DIR/agent-rootfs/bin/resize2fs" || true
+          ln -sf /sbin/e2fsck "$DATA_DIR/agent-rootfs/bin/e2fsck" || true
+          ln -sf /usr/sbin/resize2fs "$DATA_DIR/agent-rootfs/usr/bin/resize2fs" || true
+          ln -sf /sbin/e2fsck "$DATA_DIR/agent-rootfs/usr/bin/e2fsck" || true
+          [ -f "$SRC/init.krun" ] && cp "$SRC/init.krun" "$DATA_DIR/init.krun"
+          mkdir -p "$HOME/.local/bin"
+          ln -sf "$HOME/.smolvm/smolvm" "$HOME/.local/bin/smolvm"
+          echo "$HOME/.local/bin" >> "$GITHUB_PATH"
+
+      - name: Reclaim runner disk for layer staging
+        run: |
+          set -euo pipefail
+          # `pack create` stages the extracted layers, the merged layer, the
+          # agent rootfs and an ext4 template next to the output — tens of
+          # GiB for a runner-scale base. release-golden #73 died there with
+          # `flushing extracted layers to disk failed (out of space?)`.
+          df -h /
+          sudo rm -rf /usr/share/dotnet /usr/local/lib/android /opt/ghc \
+            /usr/local/share/boost /usr/share/swift "$AGENT_TOOLSDIRECTORY" || true
+          sudo docker image prune --all --force >/dev/null 2>&1 || true
+          rm -rf target/release/deps target/release/build \
+            target/release/.fingerprint target/release/incremental \
+            "$HOME/.cargo/registry/cache" "$HOME/.cargo/registry/src" || true
+          sudo rm -rf /usr/lib/jvm /opt/google/chrome \
+            /usr/share/miniconda || true
+          df -h /
+        env:
+          AGENT_TOOLSDIRECTORY: ${{ env.AGENT_TOOLSDIRECTORY }}
+
       - name: Pack Golden MicroVM Artifact
         env:
-          GOLDEN_NAME: preloop-ubuntu-24.04-aarch64
+          GOLDEN_NAME: preloop-ubuntu-24.04-${{ env.GOLDEN_ARCH }}
           GODEBUG: http2client=0
         run: |
           set -euo pipefail
           mkdir -p dist
-          rm -f "dist/$GOLDEN_NAME"
+          # Wipe pack staging from any earlier attempt; keep the pinned
+          # base evidence captured above (the provenance manifest needs it).
+          clear_staging() {
+            for entry in dist/*; do
+              [ -e "$entry" ] || continue
+              case "$entry" in
+                *.base-provenance.json|*.base-sbom.spdx.json) ;;
+                *) rm -rf "$entry" ;;
+              esac
+            done
+          }
+          clear_staging
+          # Stream the base from the registry inside the bake VM. Do NOT go
+          # back to a host `docker save` tar: the 17 GiB export does not fit
+          # the hosted runner's disk (release-golden #66-rerun/#71: `docker
+          # save` dies with `no space left on device` after a successful
+          # pull). Streaming keeps every copy off the host filesystem.
           export PRELOOP_REQUIRE_BASE_DIGEST=1
           export PRELOOP_RUNNER_BASE_IMAGE="$BASE_IMAGE"
           export PRELOOP_RUNNER_STORAGE_GB=200
           export PRELOOP_RUNNER_OVERLAY_GB=200
-          # The runner-large image exceeds smolvm's default local archive
-          # limit; keep the registry path so smolvm streams it directly.
+          # The runner-large base archive is ~17 GiB uncompressed, over
+          # smolvm's 8 GiB default local-archive cap. Without this the bake
+          # fails every attempt at `smolvm create` before extracting a byte.
           export SMOLVM_MAX_IMAGE_BYTES=34359738368
+          # SmolVM machine names allow only ASCII alphanumerics and hyphens.
           export PRELOOP_GOLDEN_NAME_PREFIX="preloop-release-golden-${GITHUB_RUN_ID}-aarch64"
           builder="${PRELOOP_GOLDEN_NAME_PREFIX}-builder"
+          # Answer the guest directly instead of through the NAT DNS proxy
+          # (100.96.0.1), which has never resolved ghcr.io from a bake VM on
+          # a hosted runner: release-golden #68/#69/#70 burned 9/9 attempts
+          # on `crane manifest ... lookup ghcr.io ... i/o timeout`, and #73
+          # proved the same run pulls fine the moment this is set.
+          export PRELOOP_RUNNER_DNS=1.1.1.1
+          need_mib=6144
           attempts=3
+          headroom() { awk '/^MemAvailable:/ { print int($2 / 1024) }' /proc/meminfo; }
           for attempt in $(seq 1 "$attempts"); do
-            if [ "$attempt" -eq 1 ]; then
-              echo "attempt 1/${attempts}: default guest resolvers"
-            else
-              # Same NAT-DNS-proxy wall as the x86_64 twin (ghcr.io
-              # unresolvable from the bake VM); answer the guest directly.
-              export PRELOOP_RUNNER_DNS=1.1.1.1
-              echo "attempt ${attempt}/${attempts}: direct guest DNS (PRELOOP_RUNNER_DNS=$PRELOOP_RUNNER_DNS)"
+            echo "attempt ${attempt}/${attempts}: guest DNS $PRELOOP_RUNNER_DNS"
+            for _ in $(seq 1 45); do
+              waiting="$(headroom)"
+              if [ "$waiting" -ge "$need_mib" ]; then break; fi
+              echo "waiting for host headroom: ${waiting} MiB < ${need_mib} MiB"
+              sleep 60
+            done
+            available="$(headroom)"
+            if [ "$available" -lt "$need_mib" ]; then
+              echo "host never freed ${need_mib} MiB (last ${available} MiB)" >&2
+              exit 1
             fi
-            smolvm machine delete --name "$builder" --force --cascade >/dev/null 2>&1 || true
+            echo "attempt ${attempt}/${attempts} with ${available} MiB available"
+            smolvm machine delete --name "$builder" \
+              --force --cascade >/dev/null 2>&1 || true
             # A deleted VM's disks can stay open until its processes fully
             # exit; recreating immediately re-pins the same paths and fails
             # the create the same way. Let go, then confirm it is gone.
@@ -588,14 +620,15 @@ jobs:
             fi
             rm -f "dist/$GOLDEN_NAME"
             echo "build-golden failed; backing off before retry"
+            clear_staging
             sleep $((attempt * 120))
           done
           test -s "dist/$GOLDEN_NAME"
-          shasum -a 256 "dist/$GOLDEN_NAME" > "dist/$GOLDEN_NAME.sha256"
+          sha256sum "dist/$GOLDEN_NAME" > "dist/$GOLDEN_NAME.sha256"
 
       - name: Write golden provenance manifest
         env:
-          GOLDEN_NAME: preloop-ubuntu-24.04-aarch64
+          GOLDEN_NAME: preloop-ubuntu-24.04-${{ env.GOLDEN_ARCH }}
         run: |
           MAX_AGE_DAYS="$(grep -E '^[[:space:]]*apt_indices_max_age_days[[:space:]]*=' versions.toml | cut -d'"' -f2 || true)"
           test -n "$MAX_AGE_DAYS"
@@ -611,7 +644,7 @@ jobs:
 
       - name: Sign golden (cosign keyless)
         env:
-          GOLDEN_NAME: preloop-ubuntu-24.04-aarch64
+          GOLDEN_NAME: preloop-ubuntu-24.04-${{ env.GOLDEN_ARCH }}
         run: |
           set -euo pipefail
           cosign sign-blob --yes --bundle "dist/$GOLDEN_NAME.bundle" "dist/$GOLDEN_NAME"
@@ -626,10 +659,10 @@ jobs:
         uses: actions/attest-build-provenance@0f67c3f4856b2e3261c31976d6725780e5e4c373 # v4.1.1
         with:
           subject-path: |
-            dist/preloop-ubuntu-24.04-aarch64
-            dist/preloop-ubuntu-24.04-aarch64.base-provenance.json
-            dist/preloop-ubuntu-24.04-aarch64.base-sbom.spdx.json
-            dist/preloop-ubuntu-24.04-aarch64.provenance.json
+            dist/preloop-ubuntu-24.04-${{ env.GOLDEN_ARCH }}
+            dist/preloop-ubuntu-24.04-${{ env.GOLDEN_ARCH }}.base-provenance.json
+            dist/preloop-ubuntu-24.04-${{ env.GOLDEN_ARCH }}.base-sbom.spdx.json
+            dist/preloop-ubuntu-24.04-${{ env.GOLDEN_ARCH }}.provenance.json
 
       - name: Retain Golden Artifact
         uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
@@ -637,6 +670,8 @@ jobs:
           name: golden-${{ env.GOLDEN_ARCH }}
           path: |
             dist/preloop-ubuntu-24.04-${{ env.GOLDEN_ARCH }}
+            dist/preloop-ubuntu-24.04-${{ env.GOLDEN_ARCH }}.part.*
+            dist/preloop-ubuntu-24.04-${{ env.GOLDEN_ARCH }}.parts.sha256
             dist/preloop-ubuntu-24.04-${{ env.GOLDEN_ARCH }}.sha256
             dist/preloop-ubuntu-24.04-${{ env.GOLDEN_ARCH }}.bundle
             dist/preloop-ubuntu-24.04-${{ env.GOLDEN_ARCH }}.base-provenance.json
@@ -648,17 +683,28 @@ jobs:
       - name: Upload Golden Artifact to Release
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-          GOLDEN_NAME: preloop-ubuntu-24.04-aarch64
+          GOLDEN_NAME: preloop-ubuntu-24.04-${{ env.GOLDEN_ARCH }}
           REQUESTED_TAG: ${{ inputs.release_tag }}
           EVENT_TAG: ${{ github.event.release.tag_name }}
         run: |
+          set -euo pipefail
           TARGET_TAG="${EVENT_TAG:-$REQUESTED_TAG}"
           if [ -z "$TARGET_TAG" ]; then
             TARGET_TAG="$(gh release view --json tagName --jq .tagName)"
           fi
           gh release upload "$TARGET_TAG" \
-            "dist/$GOLDEN_NAME" "dist/$GOLDEN_NAME.sha256" \
+            "dist/$GOLDEN_NAME" \
+            "dist/$GOLDEN_NAME.sha256" \
             "dist/$GOLDEN_NAME.bundle" \
             "dist/$GOLDEN_NAME.base-provenance.json" \
             "dist/$GOLDEN_NAME.base-sbom.spdx.json" \
             "dist/$GOLDEN_NAME.provenance.json" --clobber
+
+      - name: Split golden for artifact retention
+        env:
+          GOLDEN_NAME: preloop-ubuntu-24.04-${{ env.GOLDEN_ARCH }}
+        run: |
+          set -euo pipefail
+          rm -f "dist/$GOLDEN_NAME.part."*
+          split -b 4G -d "dist/$GOLDEN_NAME" "dist/$GOLDEN_NAME.part."
+          sha256sum "dist/$GOLDEN_NAME.part."* > "dist/$GOLDEN_NAME.parts.sha256"
