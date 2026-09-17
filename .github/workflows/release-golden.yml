@@ -142,7 +142,7 @@ jobs:
           echo "RUNNER_TARGET=x86_64-unknown-linux-gnu" >> "$GITHUB_ENV"
           echo "GOLDEN_ARCH=x86_64" >> "$GITHUB_ENV"
           echo "GOLDEN_PLATFORM=linux/amd64" >> "$GITHUB_ENV"
-          BASE_IMAGE="$(awk -F'"' '/^official_runner_image_base_amd64 = / { print $2; exit }' versions.toml)"
+           BASE_IMAGE="$(awk -F'"' '/^official_runner_image_base_amd64 = / { print $2; exit }' official-image.toml)"
           test -n "$BASE_IMAGE"
           echo "BASE_IMAGE=$BASE_IMAGE" >> "$GITHUB_ENV"
 
@@ -417,7 +417,7 @@ jobs:
           echo "RUNNER_TARGET=aarch64-unknown-linux-gnu" >> "$GITHUB_ENV"
           echo "GOLDEN_ARCH=aarch64" >> "$GITHUB_ENV"
           echo "GOLDEN_PLATFORM=linux/arm64" >> "$GITHUB_ENV"
-          BASE_IMAGE="$(awk -F'"' '/^official_runner_image_base_arm64 = / { print $2; exit }' versions.toml)"
+           BASE_IMAGE="$(awk -F'"' '/^official_runner_image_base_arm64 = / { print $2; exit }' official-image.toml)"
           test -n "$BASE_IMAGE"
           echo "BASE_IMAGE=$BASE_IMAGE" >> "$GITHUB_ENV"
 
