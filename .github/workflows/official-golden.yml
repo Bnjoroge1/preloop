@@ -194,6 +194,15 @@ jobs:
           sudo rm -rf /usr/share/dotnet /usr/local/lib/android /opt/ghc \
             /usr/local/share/boost /usr/share/swift "$AGENT_TOOLSDIRECTORY" || true
           sudo docker image prune --all --force >/dev/null 2>&1 || true
+          # Release build finished above; build-golden only needs the
+          # binaries and the runner bundle. Drop rebuild cache and registry
+          # downloads: 35257438708 died writing flat-export.tmp (ENOSPC)
+          # with 105G free — pack staging needs every GiB.
+          rm -rf target/release/deps target/release/build \
+            target/release/.fingerprint target/release/incremental \
+            "$HOME/.cargo/registry/cache" "$HOME/.cargo/registry/src" || true
+          sudo rm -rf /usr/lib/jvm /opt/google/chrome \
+            /usr/share/miniconda || true
           df -h /
         env:
           AGENT_TOOLSDIRECTORY: ${{ env.AGENT_TOOLSDIRECTORY }}
@@ -205,7 +214,18 @@ jobs:
         run: |
           set -euo pipefail
           mkdir -p dist
-          rm -f "dist/$GOLDEN_NAME"
+          # Wipe pack staging from any earlier attempt; keep the pinned
+          # base evidence captured above (the provenance manifest needs it).
+          clear_staging() {
+            for entry in dist/*; do
+              [ -e "$entry" ] || continue
+              case "$entry" in
+                *.base-provenance.json|*.base-sbom.spdx.json) ;;
+                *) rm -rf "$entry" ;;
+              esac
+            done
+          }
+          clear_staging
           # Stream the base from the registry inside the bake VM. Do NOT go
           # back to a host `docker save` tar: the 17 GiB export does not fit
           # the hosted runner's disk (release-golden #66-rerun/#71: `docker
@@ -258,7 +278,7 @@ jobs:
               exit 1
             fi
             echo "build-golden failed; backing off before retry"
-            rm -f "dist/$GOLDEN_NAME"
+            clear_staging
             sleep $((attempt * 120))
           done
           test -s "dist/$GOLDEN_NAME"
@@ -268,7 +288,7 @@ jobs:
         env:
           GOLDEN_NAME: preloop-ubuntu-24.04-${{ env.GOLDEN_ARCH }}
         run: |
-          MAX_AGE_DAYS="$(grep '^apt_indices_max_age_days' versions.toml | cut -d'"' -f2)"
+          MAX_AGE_DAYS="$(grep -E '^[[:space:]]*apt_indices_max_age_days[[:space:]]*=' versions.toml | cut -d'"' -f2 || true)"
           test -n "$MAX_AGE_DAYS"
           python3 scripts/write-golden-provenance.py \
             --golden "dist/$GOLDEN_NAME" \
@@ -523,7 +543,7 @@ jobs:
         env:
           GOLDEN_NAME: preloop-ubuntu-24.04-aarch64
         run: |
-          MAX_AGE_DAYS="$(grep '^apt_indices_max_age_days' versions.toml | cut -d'"' -f2)"
+          MAX_AGE_DAYS="$(grep -E '^[[:space:]]*apt_indices_max_age_days[[:space:]]*=' versions.toml | cut -d'"' -f2 || true)"
           test -n "$MAX_AGE_DAYS"
           python3 scripts/write-golden-provenance.py \
             --golden "dist/$GOLDEN_NAME" \
