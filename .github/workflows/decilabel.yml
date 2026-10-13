@@ -1,4 +1,4 @@
-name: DeciLabel
+name: GitHub Action Issue and PR Labeler
 on:
   issues:
     types: [opened, edited, reopened]
